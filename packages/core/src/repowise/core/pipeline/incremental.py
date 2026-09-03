@@ -110,6 +110,7 @@ def build_repo_graph(
         _read_sources,
         _split_cached,
     )
+    from repowise.core.workspace.update import get_head_commit
 
     fi_and_bytes = _read_sources(file_infos, None)
     parse_cache, cached_hits, to_parse = _split_cached(Path(repo_path), fi_and_bytes, None)
@@ -121,6 +122,7 @@ def build_repo_graph(
         repo_path,
         exclude_patterns=exclude_patterns,
         centrality_cache_dir=Path(repo_path) / ".repowise",
+        head_commit=get_head_commit(Path(repo_path)),
         include_submodules=include_submodules,
         include_nested_repos=include_nested_repos,
     )
@@ -210,8 +212,13 @@ def build_repo_graph(
         graph_builder.add_dynamic_edges(dynamic_edges)
         if dynamic_edges:
             log(f"Dynamic hint edges added: [cyan]{len(dynamic_edges)}[/cyan]")
-    except Exception:
-        pass  # dynamic hints are best-effort, same as the init phase
+
+    except Exception as exc:
+        logger.warning("dynamic_hints_extraction_failed", error=str(exc))
+        log(
+            f"[yellow]Dynamic hint extraction failed: {exc}. Dynamic edges"
+            "will be missing from this update.[/yellow]"
+        )
 
     return parsed_files, source_map, graph_builder, repo_structure, len(file_infos)
 
@@ -268,6 +275,7 @@ async def rebuild_graph_and_git(
     try:
         from repowise.core.ingestion.git_indexer import GitIndexer
         from repowise.core.ingestion.git_indexer.tiers import GitIndexTier
+        from repowise.core.pipeline.phases.git import label_co_change_structure
 
         try:
             tier = GitIndexTier(git_tier) if git_tier else GitIndexTier.FULL
@@ -295,8 +303,14 @@ async def rebuild_graph_and_git(
             all_files=set(source_map.keys()),
             co_change_sink=co_change_full,
             idle_decay_sink=idle_decay_sink,
+            on_warning=log,
         )
         git_meta_map = {m["file_path"]: m for m in updated_meta}
+        label_co_change_structure(graph_builder, git_meta_map)
+        if idle_decay_sink:
+            # Idle rows carry the same column and are persisted on their own
+            # path, having been serialized before the graph existed.
+            label_co_change_structure(graph_builder, idle_decay_sink)
         if co_change_full:
             graph_builder.update_co_change_edges(
                 {
@@ -378,6 +392,70 @@ async def load_stored_git_meta(
         return None
 
 
+async def load_stored_performance_callers(
+    repo_path: Any,
+    changed_paths: set[str],
+    *,
+    log: LogFn | None = None,
+) -> set[str] | None:
+    """Load callers whose persisted performance paths touched changed files.
+
+    The current graph cannot retain an edge to a deleted or renamed symbol.
+    One bounded store read supplies that old-side reverse evidence so partial
+    analysis can remove stale caller findings. ``None`` means the store was
+    unavailable and therefore must not widen authoritative persistence scope.
+    """
+    log = log or _noop_log
+    if not changed_paths:
+        return set()
+    if not (Path(repo_path) / ".repowise" / "wiki.db").is_file():
+        return None
+    try:
+        import json
+
+        from sqlalchemy import select
+
+        from repowise.core.persistence import create_engine, get_session
+        from repowise.core.persistence.crud import get_repository_by_path
+        from repowise.core.persistence.database import (
+            create_session_factory,
+            resolve_db_url,
+        )
+        from repowise.core.persistence.models import HealthFinding
+
+        engine = create_engine(resolve_db_url(repo_path))
+        try:
+            async with get_session(create_session_factory(engine)) as session:
+                repo = await get_repository_by_path(session, str(repo_path))
+                if repo is None:
+                    return None
+                rows = (
+                    await session.execute(
+                        select(HealthFinding.file_path, HealthFinding.details_json).where(
+                            HealthFinding.repository_id == repo.id,
+                            HealthFinding.status == "open",
+                            HealthFinding.dimension == "performance",
+                        )
+                    )
+                ).all()
+        finally:
+            await engine.dispose()
+        callers: set[str] = set()
+        for file_path, details_json in rows:
+            try:
+                path = json.loads(details_json or "{}").get("path", ())
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if any(
+                isinstance(node, str) and node.split("::", 1)[0] in changed_paths for node in path
+            ):
+                callers.add(file_path)
+        return callers
+    except Exception as exc:
+        log(f"[yellow]Stored performance callers unavailable: {exc}[/yellow]")
+        return None
+
+
 async def load_stored_function_mod_p80(repo_path: Any, *, log: LogFn | None = None) -> int | None:
     """Load the repo-wide p80 of per-function modification counts.
 
@@ -428,6 +506,70 @@ async def load_stored_function_mod_p80(repo_path: Any, *, log: LogFn | None = No
         return None
 
 
+async def load_stored_coverage_map(
+    repo_path: Any, *, log: LogFn | None = None
+) -> dict[str, dict]:
+    """Load the persisted coverage map for health scoring on an incremental run.
+
+    The incremental health pass re-scores changed files only, but if it builds
+    its ``HealthAnalyzer`` without a ``coverage_map`` every re-analyzed file is
+    scored as if no coverage had ever been ingested — and the partial-health
+    writer then overwrites the stored ``line_coverage_pct`` with ``None`` for
+    exactly the files that just changed, eroding coverage one file per update
+    (issue #1739).
+
+    Returns ``{path: coverage-dict}`` by reloading the persisted ``CoverageFile``
+    rows, mirroring ``_coverage_for_rescore`` in the CLI update path. Empty dict
+    when no coverage is stored, the store is unreadable, or the repository row
+    is missing — the analyzer then scores without coverage, matching the
+    established safe default.
+    """
+    log = log or _noop_log
+    import json
+
+    if not (Path(repo_path) / ".repowise" / "wiki.db").is_file():
+        return {}
+    try:
+        from repowise.core.persistence import (
+            create_engine,
+            create_session_factory,
+            get_session,
+        )
+        from repowise.core.persistence.crud import (
+            get_repository_by_path,
+            load_coverage_for_repo,
+        )
+        from repowise.core.persistence.database import resolve_db_url
+
+        engine = create_engine(resolve_db_url(repo_path))
+        try:
+            async with get_session(create_session_factory(engine)) as session:
+                repo = await get_repository_by_path(session, str(repo_path))
+                if repo is None:
+                    return {}
+                rows = await load_coverage_for_repo(session, repo.id)
+        finally:
+            await engine.dispose()
+        coverage_map: dict[str, dict] = {}
+        for row in rows:
+            try:
+                covered = (
+                    json.loads(row.covered_lines_json) if row.covered_lines_json else []
+                )
+            except (ValueError, TypeError):
+                covered = []
+            coverage_map[row.file_path] = {
+                "line_coverage_pct": row.line_coverage_pct,
+                "branch_coverage_pct": row.branch_coverage_pct,
+                "covered_lines": covered,
+                "total_coverable_lines": row.total_coverable_lines or 0,
+            }
+        return coverage_map
+    except Exception as exc:
+        log(f"[yellow]Stored coverage unavailable: {exc}[/yellow]")
+        return {}
+
+
 def run_partial_analysis(
     repo_path: Any,
     graph_builder: Any,
@@ -437,7 +579,9 @@ def run_partial_analysis(
     *,
     source_map: dict[str, bytes] | None = None,
     stored_git_meta: dict[str, dict] | None = None,
+    stored_performance_callers: set[str] | None = None,
     repo_function_mod_p80: int | None = None,
+    coverage_map: dict[str, dict] | None = None,
     log: LogFn | None = None,
 ) -> tuple[Any, Any]:
     """Run partial code-health + repo-wide dead-code analysis.
@@ -448,15 +592,18 @@ def run_partial_analysis(
     *source_map* is ingestion's ``{path: raw bytes}`` for this rebuild; the
     dead-code prepasses read it instead of re-reading the repo from disk.
 
-    *stored_git_meta* is the persisted per-file git metadata, supplied to the
-    dead-code analyzer *only*. ``git_meta_map`` holds this run's freshly
+    *stored_git_meta* is the persisted per-file git metadata. ``git_meta_map`` holds this run's freshly
     indexed rows, which on an incremental update means the changed files and
     nothing else; every other file would otherwise be scored against an empty
     dict and land on the ``commit_count_90d == 0`` rung of the confidence
-    ladder at 0.7 / ``safe_to_delete=True``. It is deliberately NOT merged into
-    ``git_meta_map`` itself: the partial health analysis reads that map's
-    entries as a repo-wide aggregate, so widening it there would silently move
-    health scores (the same reason the idle-decay rows are kept out of it).
+    ladder at 0.7 / ``safe_to_delete=True``. It is supplied whole to dead-code
+    and to performance ranking, but deliberately not merged into health's
+    general ``git_meta_map``: widening that aggregate would silently move
+    nonperformance scores (the same reason idle-decay rows stay out of it).
+
+    *stored_performance_callers* is the old-side caller set recovered in one
+    store read. It keeps deletion and rename updates authoritative when the
+    rebuilt graph can no longer contain the removed execution edge.
 
     *repo_function_mod_p80* is the repo-wide 80th percentile of per-function
     modification counts, loaded from the persisted ``git_function_blame``
@@ -477,18 +624,35 @@ def run_partial_analysis(
     # but only files in ``changed_paths`` produce new findings/metrics.
     partial_health_report = None
     try:
+        # Performance is interprocedural. Recompute one bounded bidirectional
+        # execution closure so a changed caller can still see an unchanged sink
+        # and an unchanged caller can react to a changed sink. The index is
+        # built once; this is a multi-source walk, not one walk per finding.
+        from repowise.core.analysis.execution_graph import ExecutionGraphIndex
         from repowise.core.analysis.health import HealthAnalyzer
         from repowise.core.analysis.health.config import HealthConfig
 
+        _health_changed = {
+            fd.path for fd in file_diffs if fd.status in ("added", "modified", "renamed")
+        }
+        parsed_paths = {pf.file_info.path for pf in parsed_files}
+        execution_index = ExecutionGraphIndex(graph_builder.graph())
+        _performance_changed = execution_index.affected_files(_health_changed) & parsed_paths
+        if stored_performance_callers is not None:
+            historical_callers = stored_performance_callers & parsed_paths
+            _performance_changed |= (
+                execution_index.affected_files(historical_callers) & parsed_paths
+            )
+        _health_scope = _health_changed | _performance_changed
         _health_analyzer = HealthAnalyzer(
             graph_builder.graph(),
             git_meta_map=git_meta_map,
             parsed_files=parsed_files,
             duplication_cache_dir=Path(repo_path) / ".repowise",
             repo_root=repo_path,
+            coverage_map=coverage_map,
         )
-        _health_changed = {fd.path for fd in file_diffs if fd.status in ("added", "modified")}
-        if _health_changed:
+        if _health_scope:
             _hcfg = HealthConfig.load(repo_path)
             _analyzer_config = (
                 _hcfg.to_analyzer_config([pf.file_info.path for pf in parsed_files])
@@ -497,11 +661,38 @@ def run_partial_analysis(
             )
             partial_health_report = _health_analyzer.analyze(
                 _analyzer_config,
-                changed_files=_health_changed,
+                changed_files=_health_scope,
                 repo_function_mod_p80=repo_function_mod_p80,
             )
+            # The closure exists only to refresh interprocedural performance.
+            # Preserve the historical changed-file scope for every other
+            # dimension, metric, blame row, and refactoring detector.
+            partial_health_report.authoritative_paths = set(_health_changed)
+            partial_health_report.performance_authoritative_paths = set(_performance_changed)
+            partial_health_report.metrics = [
+                metric
+                for metric in partial_health_report.metrics
+                if metric.file_path in _health_changed
+            ]
+            partial_health_report.findings = [
+                finding
+                for finding in partial_health_report.findings
+                if finding.file_path in _health_changed or finding.dimension == "performance"
+            ]
+            partial_health_report.refactoring_suggestions = [
+                suggestion
+                for suggestion in partial_health_report.refactoring_suggestions
+                if suggestion.file_path in _health_changed
+                or suggestion.refactoring_type == "performance_fix"
+            ]
+            partial_health_report.function_blame_rows = [
+                row
+                for row in partial_health_report.function_blame_rows
+                if row.get("file_path") in _health_changed
+            ]
             log(
-                f"Health analysis (partial): [cyan]{len(_health_changed)} files[/cyan], "
+                f"Health analysis (partial): [cyan]{len(_health_changed)} changed[/cyan], "
+                f"[cyan]{len(_performance_changed)} performance-affected[/cyan], "
                 f"[yellow]{len(partial_health_report.findings)} findings[/yellow]"
             )
     except Exception as exc:
@@ -717,26 +908,6 @@ def _carry_forward_kg_enrichment(kg: Any, prior_kg: Any) -> None:
         kg.tour = prior_kg.tour
 
 
-async def _analyzed_commit(session: Any, repo_id: str) -> str | None:
-    """Live HEAD of the repo being updated, for stamping health rows.
-
-    Read off disk rather than from ``Repository.head_commit``: the health pass
-    just scored the working tree, and the stored column is written by a
-    different step whose ordering relative to this one is not guaranteed.
-    ``None`` on any failure — an unstamped row reads as "not recorded", which
-    is honest, while a wrong sha would not be.
-    """
-    from repowise.core.persistence.models import Repository
-    from repowise.core.workspace.update import get_head_commit
-
-    try:
-        repo = await session.get(Repository, repo_id)
-        local_path = getattr(repo, "local_path", None) if repo else None
-        return get_head_commit(Path(local_path)) if local_path else None
-    except Exception:
-        return None
-
-
 async def persist_partial_health(session: Any, repo_id: str, report: Any) -> None:
     """Upsert health findings + metrics for the changed-files subset.
 
@@ -746,32 +917,80 @@ async def persist_partial_health(session: Any, repo_id: str, report: Any) -> Non
     and metrics across an incremental ``repowise update``.
     """
     from repowise.core.persistence.crud import (
+        finalize_performance_opportunities,
+        finalize_refactoring_opportunities,
         upsert_health_findings,
         upsert_health_metrics,
         upsert_refactoring_suggestions,
     )
+    from repowise.core.pipeline.persist import _analyzed_commit
 
-    changed_paths = sorted({m.file_path for m in report.metrics or []})
-    if not changed_paths:
+    changed_paths = sorted(
+        set(getattr(report, "authoritative_paths", None) or ())
+        or {m.file_path for m in report.metrics or []}
+    )
+    performance_paths = sorted(
+        set(getattr(report, "performance_authoritative_paths", None) or ()) - set(changed_paths)
+    )
+    if not changed_paths and not performance_paths:
         return
-    await upsert_health_metrics(
-        session,
-        repo_id,
-        report.metrics or [],
-        analyzed_commit=await _analyzed_commit(session, repo_id),
-    )
-    await upsert_health_findings(
-        session, repo_id, list(report.findings or []), file_paths=changed_paths
-    )
-    # Refactoring suggestions for the changed files only (unchanged files keep
-    # theirs). Scoped delete-then-insert across the full changed-file set, so a
-    # file that became clean has its stale suggestions removed.
-    await upsert_refactoring_suggestions(
-        session,
-        repo_id,
-        list(getattr(report, "refactoring_suggestions", None) or []),
-        file_paths=changed_paths,
-    )
+    analyzed_commit = await _analyzed_commit(session, repo_id)
+    # One savepoint over the findings and everything derived from them. This
+    # writer's caller logs a failed step and carries on to commit the rest of
+    # the run, so without the savepoint a rebuild that failed halfway would
+    # leave the queue describing findings that were never stored.
+    async with session.begin_nested():
+        if changed_paths:
+            await upsert_health_metrics(
+                session,
+                repo_id,
+                report.metrics or [],
+                analyzed_commit=analyzed_commit,
+            )
+            await upsert_health_findings(
+                session, repo_id, list(report.findings or []), file_paths=changed_paths
+            )
+        if performance_paths:
+            await upsert_health_findings(
+                session,
+                repo_id,
+                list(report.findings or []),
+                file_paths=performance_paths,
+                dimension="performance",
+            )
+        # Refactoring suggestions for the changed files only (unchanged files
+        # keep theirs). Scoped reconciliation across the full changed-file set,
+        # so a file that became clean has its plans resolved rather than left
+        # standing, and a plan that survived the edit keeps its id.
+        if changed_paths:
+            await upsert_refactoring_suggestions(
+                session,
+                repo_id,
+                [
+                    suggestion
+                    for suggestion in (getattr(report, "refactoring_suggestions", None) or [])
+                    if suggestion.refactoring_type != "performance_fix"
+                ],
+                file_paths=changed_paths,
+            )
+        # A partial run sees a subset of the findings, so the plans and the
+        # queue it would derive are a subset too. Both are rebuilt here instead,
+        # from the merged stored rows, by the same writer the full path uses.
+        # That is what makes the two paths agree, and it retires the file-scoped
+        # plan bookkeeping that used to try to reach a shared intervention from
+        # its callers.
+        await finalize_performance_opportunities(
+            session,
+            repo_id,
+            analyzed_commit=analyzed_commit,
+            plan_policy=getattr(report, "performance_plan_policy", None),
+        )
+        # Repository-wide, like the queue above and for the same reason: an
+        # opportunity folds a file's plans, and a file this run did not touch
+        # can still lose one when a cross-file plan elsewhere resolves.
+        await finalize_refactoring_opportunities(
+            session, repo_id, analyzed_commit=analyzed_commit
+        )
     # Per-function blame rollup for the changed files (keeps git_function_blame
     # current between full indexes; FULL git tier only — empty otherwise).
     fn_blame_rows = getattr(report, "function_blame_rows", None)
@@ -1144,16 +1363,13 @@ async def refresh_external_systems(
     ]
 
     from repowise.core.persistence.crud import (
+        build_external_system_link_map,
         link_graph_nodes_to_external_systems,
         replace_external_systems,
     )
 
     id_map = await replace_external_systems(session, repo_id, systems)
-    # Collapse multi-manifest duplicates: any id for a given name works (the
-    # C4 renderer only needs name/category/ecosystem, stable across rows).
-    name_to_id: dict[str, int] = {}
-    for (name, _declared_in), sys_id in id_map.items():
-        name_to_id.setdefault(name, sys_id)
+    name_to_id = build_external_system_link_map(systems, id_map)
     await link_graph_nodes_to_external_systems(session, repo_id, name_to_id)
     log(f"External systems refreshed: [cyan]{len(systems)}[/cyan] deps")
     return True
@@ -1235,7 +1451,6 @@ async def persist_incremental_index(
             repo = await upsert_repository(session, name=repo_path.name, local_path=str(repo_path))
             repo_id = repo.id
 
-
             # Delete rows of pages retired since this index was built. This
             # path never regenerates a repo-wide page, so nothing else here
             # would ever visit one to notice it should be gone, and for a user
@@ -1252,9 +1467,7 @@ async def persist_incremental_index(
                 # regenerates a cycle page, so asking the rebuilt graph whether
                 # the cycle still exists is the only way a fixed cycle's page
                 # can ever be retired for a user who only runs `update`.
-                swept_page_ids += await sweep_absent_cycle_pages(
-                    session, repo_id, graph_builder
-                )
+                swept_page_ids += await sweep_absent_cycle_pages(session, repo_id, graph_builder)
             except Exception as exc:
                 _skip("Retired page sweep", exc)
 
@@ -1421,6 +1634,7 @@ async def persist_incremental_index(
             except Exception as exc:
                 _skip("Decision purge", exc)
 
+            pruned = 0
             # Drop file-scoped rows for files that have actually been deleted.
             # Without this an incremental update tombstones the deleted file's
             # page and leaves everything else: graph nodes, edges, metrics,
@@ -1475,6 +1689,35 @@ async def persist_incremental_index(
                         degraded.append(refusal)
             except Exception as exc:
                 _skip("Deleted-file prune", exc)
+
+            # The prune deletes the health findings of files that are gone, and
+            # the performance and refactoring queues are materialized from those
+            # findings. Without this they keep serving a cause whose evidence was
+            # removed a moment ago, on a file the store no longer claims exists.
+            # After the prune for the same reason the prune runs last: only now
+            # is the surviving finding set final.
+            if pruned:
+                try:
+                    from repowise.core.persistence.crud import (
+                        finalize_performance_opportunities,
+                        finalize_refactoring_opportunities,
+                    )
+                    from repowise.core.pipeline.persist import _analyzed_commit
+
+                    analyzed_commit = await _analyzed_commit(session, repo_id)
+                    await finalize_performance_opportunities(
+                        session,
+                        repo_id,
+                        analyzed_commit=analyzed_commit,
+                        plan_policy=getattr(
+                            partial_health_report, "performance_plan_policy", None
+                        ),
+                    )
+                    await finalize_refactoring_opportunities(
+                        session, repo_id, analyzed_commit=analyzed_commit
+                    )
+                except Exception as exc:
+                    _skip("Queue rebuild after prune", exc)
 
         # After the session closes: on SQLite the full-text index shares the
         # database file, so writing to it while the session holds a write lock

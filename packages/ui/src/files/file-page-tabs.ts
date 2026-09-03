@@ -31,7 +31,7 @@ export const FILE_TAB_LABEL: Record<FilePageTab, string> = {
   history: "History",
   decisions: "Decisions",
   graph: "Dependencies",
-  coverage: "Coverage",
+  coverage: "Tests",
 };
 
 /**
@@ -51,7 +51,8 @@ export const FILE_TAB_BLURB: Record<FilePageTab, string> = {
   history: "What git knows about this file — how often it changes, who changes it, and what moves with it.",
   decisions: "Architectural decisions recorded against this file.",
   graph: "Where this file sits in the indexed dependency graph.",
-  coverage: "Line coverage, once a test report has been ingested for this repository.",
+  coverage:
+    "Which tests reach this file, read from the dependency graph, plus the lines they executed once a coverage report has been ingested.",
 };
 
 export interface FileTabDef {
@@ -99,6 +100,18 @@ export function fileTabsFor(data: FileDetailResponse): FileTabDef[] {
       ...(badge !== undefined ? { badge } : {}),
     };
   });
+}
+
+/** Narrow a `?tab=` string to a tab this page actually renders.
+ *
+ *  Lives here rather than beside `FilePage`: that module is `"use client"`, so
+ *  every export of it is a client reference, and a server component that
+ *  imported this one got "it's not possible to invoke a client function from
+ *  the server" instead of a tab id. */
+export function asFilePageTab(value: string | undefined): FilePageTab | undefined {
+  return value && (FILE_PAGE_TABS as readonly string[]).includes(value)
+    ? (value as FilePageTab)
+    : undefined;
 }
 
 /** The tab a `?tab=` value resolves to, given what this file actually has.

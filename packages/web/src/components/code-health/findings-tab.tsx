@@ -2,27 +2,28 @@
 
 /**
  * Findings host — binds the shared {@link FindingsView} (the fix-next queue,
- * performance risks, and function-level panels) to web's `/api` client,
+ * and function-level panels) to web's `/api` client,
  * `/repos/:id` routing, and the file-detail drawer. The composition itself
  * lives in `@repowise-dev/ui/health`; this file only injects the app-specific
  * pieces so web and hosted render the same view.
  */
 
 import { useRouter } from "next/navigation";
-import {
-  FindingsView,
-  type CodeHealthAdapter,
-} from "@repowise-dev/ui/health";
+import { FindingsView, type CodeHealthAdapter } from "@repowise-dev/ui/health";
 import { fileEntityPath, symbolEntityPath } from "@repowise-dev/ui/shared/entity";
 import {
   getHealthOverview,
-  getRefactoringTargets,
+  getHealthWorkQueue,
   listHealthFiles,
   listHealthFindings,
   getHealthCoverage,
   updateFindingStatus,
 } from "@/lib/api/code-health";
 import { HealthFileDrawerHost } from "@/components/health/health-file-drawer-host";
+import {
+  getFileOpportunity,
+  refactoringOpportunityHref,
+} from "@/lib/api/file-opportunity";
 
 export function FindingsTab({ repoId: id }: { repoId: string }) {
   const router = useRouter();
@@ -32,8 +33,11 @@ export function FindingsTab({ repoId: id }: { repoId: string }) {
     cacheKey: id,
     getOverview: (limit) => getHealthOverview(id, limit),
     listFindings: (opts) => listHealthFindings(id, opts),
+    getFileOpportunity: (filePath) => getFileOpportunity(id, filePath),
+    refactoringOpportunityHref: (opportunityId) =>
+      refactoringOpportunityHref(id, opportunityId),
     listFiles: (opts) => listHealthFiles(id, opts),
-    getRefactoringTargets: (opts) => getRefactoringTargets(id, opts),
+    getHealthWorkQueue: (opts) => getHealthWorkQueue(id, opts),
     updateFindingStatus: (findingId, status) =>
       updateFindingStatus(id, findingId, status),
     getCoverage: (opts) => getHealthCoverage(id, opts),

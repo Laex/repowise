@@ -2,6 +2,64 @@
 
 All notable changes to the Repowise Claude Code plugin are documented here.
 
+## 0.48.0
+
+### Changed
+- Version bump only. No command, skill or doc change this cycle: the CLI flags
+  each command names are unchanged, `hooks.json` still mirrors
+  `claude_config.py`, and every tool named in a command or skill is one the
+  server lists. `generate_refactoring_code` is live and deliberately unreferenced.
+
+## 0.47.0
+
+### Changed
+- The `change-review` skill leads with `get_change_risk`'s `directive` and
+  `health_delta` — what the change made worse — before the percentile and the
+  diff-shape drivers, matching the reordered response (#1980). It also names
+  `directive.status: unknown` alongside `warning` as the "matched no files"
+  signal, and distinguishes the per-change directive from `get_risk`'s per-file
+  one.
+- No hook change this cycle: `hooks.json` still mirrors `claude_config.py`, and
+  every tool named in a command or skill is one the server lists.
+
+## 0.46.0
+
+### Changed
+- The `change-review` skill reads `directive.may_break` and
+  `directive.may_break_tests`. `get_risk` renamed both fields: the old names
+  asserted a certainty the structural heuristic behind them does not have
+  (#1892).
+- `/repowise:risk`, `/repowise:impacted-tests`, `/repowise:security` and the
+  plugin README state the public risk scale the way the tool now reports it,
+  and describe fix density as ranked against commits rather than against
+  individual files (#1891, #1914).
+- No hook change this cycle: `hooks.json` still mirrors `claude_config.py`, and
+  every tool named in a command or skill is one the server lists.
+
+## 0.45.0
+
+### Changed
+- `/repowise:impacted-tests` and the `change-review` skill describe the map as
+  it now works: with no coverage ingested the candidates come from the call
+  graph, with the import graph filling in only where it is silent, and every
+  candidate carries the `via` marker saying which tier answered. Only
+  `via: coverage` proves a test executed the change (#1749, #1755, #1757).
+- `/repowise:init` and `/repowise:reindex` list the embedders the CLI actually
+  accepts - `gemini`, `openai`, `openrouter`, `ollama`, `edenai` - rather than
+  the three-name set they had drifted to, and name the keys that resolve them
+  (#705, #1820).
+- No hook or MCP tool surface change this cycle: `hooks.json` still mirrors
+  `claude_config.py` and every tool named in a command or skill is one the
+  server lists.
+
+## 0.44.0
+
+### Changed
+- Version bump to track the 0.44.0 release. No command, skill, hook or MCP tool
+  surface changed this cycle: the live `list_tools()` set is unchanged, no
+  `@click.option` moved on any documented command, and `hooks.json` still
+  mirrors `claude_config.py`.
+
 ## 0.43.0
 
 ### Changed

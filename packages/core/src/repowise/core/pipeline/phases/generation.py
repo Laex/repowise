@@ -16,7 +16,7 @@ from repowise.core.cost_estimator.estimator import STRUCTURAL_PAGE_TYPES
 from repowise.core.generation.models import count_stub_fallbacks
 from repowise.core.pipeline.progress import ProgressCallback
 
-from ._common import _phase_done
+from ._common import TEST_RUN_FILE_LIMIT, _phase_done, limit_to_top_pagerank
 
 logger = structlog.get_logger(__name__)
 
@@ -52,6 +52,7 @@ async def run_generation(
     kg_data: dict | None = None,
     only_page_ids: set[str] | None = None,
     preserved_page_ids: set[str] | None = None,
+    test_run: bool = False,
 ) -> list[Any]:
     """Run LLM-powered page generation.
 
@@ -68,6 +69,10 @@ async def run_generation(
     ``preserved_page_ids`` is an out-parameter filled by a ``resume`` run with
     the ids it skipped because a prior run already wrote them. Persistence
     needs it to keep those pages out of the stale sweep.
+
+    ``test_run`` limits generation to the top 10 files by PageRank, so a quick
+    validation run can exercise the whole generation path without paying for a
+    full index's worth of pages.
     """
     from repowise.core.generation import (
         ContextAssembler,
@@ -88,7 +93,19 @@ async def run_generation(
     # Falls back to defaults when the pipeline entry point did not thread one through.
     base_config = generation_config if generation_config is not None else GenerationConfig()
     config = replace(base_config, max_concurrency=concurrency)
-    assembler = ContextAssembler(config)
+    assembler = ContextAssembler(config, repo_path=repo_path)
+
+    # Test-run: limit to top 10 files by PageRank for a fast validation run.
+    # Applied here rather than only in the orchestrator so it works whether the
+    # pipeline ran with generate_docs=True or generation happened in a later,
+    # separate phase (init's generate_docs=False flow) — the flag's documented
+    # purpose is to cap the *generation* work, and this is where that happens.
+    if test_run:
+        parsed_files = limit_to_top_pagerank(
+            parsed_files, graph_builder, n=TEST_RUN_FILE_LIMIT
+        )
+        if progress:
+            progress.on_message("warning", f"Test run: limiting to {len(parsed_files)} files")
 
     # Resolve embedder and vector store
     embedder_impl = embedder if embedder is not None else KeylessEmbedder()
@@ -162,6 +179,9 @@ async def run_generation(
         repo_path=repo_path,
     )
 
+    # The recorder carries the run's shared totals table; generation's own
+    # sub-spans write into it so they sit beside the top-level phases rather
+    # than in a second table nothing reads.
     generated_pages = await generator.generate_all(
         parsed_files,
         source_map,
@@ -183,6 +203,7 @@ async def run_generation(
         kg_data=kg_data,
         only_page_ids=only_page_ids,
         preserved_page_ids=preserved_page_ids,
+        timings=getattr(progress, "table", None),
     )
 
     # Onboarding summary — count generated slots and surface which ones

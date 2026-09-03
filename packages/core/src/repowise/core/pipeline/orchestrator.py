@@ -33,14 +33,18 @@ from repowise.core.pipeline.progress import (
 )
 from repowise.core.registry import HookProgressCallback
 
-from .phases._common import _phase_done
+from .phases._common import TEST_RUN_FILE_LIMIT, _phase_done, limit_to_top_pagerank
 from .phases.analysis import (
     _run_dead_code_analysis,
     _run_decision_extraction,
     _run_health_analysis,
 )
 from .phases.generation import run_generation
-from .phases.git import _run_git_indexing, drop_transient_git_signals
+from .phases.git import (
+    _run_git_indexing,
+    drop_transient_git_signals,
+    label_co_change_structure,
+)
 from .phases.ingestion import _run_ingestion, reparse_for_resume
 from .resume import ResumePhase
 from .resume.controller import ResumeController
@@ -345,6 +349,9 @@ async def run_pipeline(
                 derive_environment_facts=derive_environment_facts,
             )
             traversal_stats = None
+            # Rehydrated rows can predate the structural label, and nothing
+            # else on this path recomputes it.
+            label_co_change_structure(graph_builder, git_meta_map)
             git_metadata_list = list(git_meta_map.values())
         except Exception as exc:
             logger.warning("resume_rehydrate_failed_recomputing", error=str(exc))
@@ -370,6 +377,7 @@ async def run_pipeline(
 
         # Add co-change edges to the graph (rehydrated graphs already carry them)
         if git_meta_map:
+            label_co_change_structure(graph_builder, git_meta_map)
             graph_builder.add_co_change_edges(git_meta_map)
 
     # ---- External systems (C4 L1) ------------------------------------------
@@ -447,19 +455,12 @@ async def run_pipeline(
                 f"→ Git: {git_summary.files_indexed:,} files indexed{_hotspot_msg}",
             )
 
-    # Test-run: limit to top 10 files by PageRank
+    # Test-run: limit to top 10 files by PageRank (shared helper with
+    # ``run_generation`` so the two paths cannot drift).
     if test_run and generate_docs:
-        try:
-            import networkx as nx
-
-            ranks = nx.pagerank(graph_builder.graph())
-        except Exception:
-            ranks = {}
-        parsed_files = sorted(
-            parsed_files,
-            key=lambda pf: ranks.get(pf.file_info.path, 0),
-            reverse=True,
-        )[:10]
+        parsed_files = limit_to_top_pagerank(
+            parsed_files, graph_builder, n=TEST_RUN_FILE_LIMIT
+        )
         if progress:
             progress.on_message("warning", f"Test run: limiting to {len(parsed_files)} files")
 

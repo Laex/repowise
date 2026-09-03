@@ -18,7 +18,7 @@ import type { CoverageFileRow, CoverageSummary } from "@repowise-dev/types/healt
 
 import { PageLede } from "../shared/page-lede";
 import { StatRibbon, type RibbonStat } from "../stats/stat-ribbon";
-import { formatNumber } from "../lib/format";
+import { formatDate, formatDateTime, formatNumber } from "../lib/format";
 import { coverageBand } from "./tokens";
 
 export interface CoverageLedeProps {
@@ -96,7 +96,7 @@ export function CoverageLede({
       label: "Report format",
       value: (summary.source_format ?? "").toUpperCase(),
       ...(summary.ingested_at
-        ? { sub: `ingested ${new Date(summary.ingested_at).toLocaleDateString()}` }
+        ? { sub: `ingested ${formatDate(summary.ingested_at)}` }
         : {}),
     },
   ];
@@ -120,9 +120,10 @@ export function CoverageLede({
           </strong>{" "}
           across {formatNumber(summary.file_count)} instrumented files
           {moduleCount > 0 ? ` in ${formatNumber(moduleCount)} directories` : ""}.
-          {band ? ` We rate that ${band.label.toLowerCase()}.` : ""} Coverage is read
-          from your own test run, not inferred: nothing here is a guess about which
-          lines a test would have touched.
+          {band ? ` We rate that ${band.label.toLowerCase()}.` : ""} These are the
+          lines your own test run executed, so every figure on this tab is
+          line-level and exact. Without a report we can still name which tests
+          reach which files, but not how much of a file they run.
         </p>
 
         <p className="mt-2.5">
@@ -143,7 +144,7 @@ export function CoverageLede({
             </span>{" "}
             output
             {summary.ingested_at
-              ? `, ingested ${new Date(summary.ingested_at).toLocaleString()}`
+              ? `, ingested ${formatDateTime(summary.ingested_at)}`
               : ""}
             {summary.ingested_commit_sha
               ? ` at ${summary.ingested_commit_sha.slice(0, 8)}`

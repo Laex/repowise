@@ -16,6 +16,7 @@
  */
 
 import type { C4IoKind } from "./external-systems.js";
+import type { Paginated } from "./pagination.js";
 
 /** Finding severity used across the health surface. */
 export type HealthSeverity = "low" | "medium" | "high" | "critical";
@@ -194,6 +195,24 @@ export interface HealthFileMetric {
    */
   performance_analyzed?: boolean | null;
   /**
+   * Open causal opportunities on this file, and the observations behind them.
+   * The map's performance lens sizes its pressure ring by the opportunity
+   * count, because an opportunity is one thing a reader could go and do while
+   * an observation is one place a detector looked. Absent on payloads from a
+   * server that serves no materialized read model, which the lens renders as
+   * an unknown state rather than as zero.
+   */
+  performance_opportunities?: number | null;
+  performance_observations?: number | null;
+  /**
+   * Best available next step on this file: a stored plan outranks an advisory
+   * intervention, which outranks an investigation. `null` when the file
+   * carries no open opportunity. Never a claim about runtime magnitude.
+   */
+  performance_actionability?: PerformanceActionabilityState | null;
+  /** Best (lowest) queue rank position among this file's opportunities. */
+  performance_rank?: number | null;
+  /**
    * Dominant-cause lead: the biomarker + reason of this file's worst finding, so
    * a low file can headline "the one reason" instead of a wall of markers. Null
    * when the row carries no findings or the payload predates this field.
@@ -231,6 +250,208 @@ export interface HealthFinding {
   dimension?: HealthDimension;
 }
 
+export type PerformanceExecutionContext = "production" | "tooling" | "test" | "unknown";
+export type PerformanceOpportunityConfidence = "high" | "medium" | "low";
+
+export interface PerformanceOpportunityFix {
+  strategy: string;
+  safety: "proven" | "advisory";
+  rationale: string;
+}
+
+export interface PerformanceOpportunityEvidence {
+  finding_id: string;
+  file_path: string;
+  biomarker_type: string;
+  function_name: string | null;
+  line_start: number | null;
+  line_end: number | null;
+  reason: string;
+  path: string[];
+  provenance: string;
+}
+
+export type PerformanceActionabilityState = "plan_ready" | "advisory" | "investigate";
+export type PerformancePlanStatus = "available" | "no_safe_plan" | "not_persisted";
+
+/** One rank term, the input it read, and the points it contributed. */
+export interface PerformanceWhyRanked {
+  factor: string;
+  value: string | number | boolean | null;
+  points: number;
+}
+
+/**
+ * The facets that are not published anywhere else on the row.
+ * `confidence` stays evidence confidence and `fix.safety` stays fix safety,
+ * so no value appears twice.
+ */
+export interface PerformanceOpportunityFacets {
+  actionability_confidence: PerformanceOpportunityConfidence;
+  exposure: string;
+  amplification: string;
+  leverage: string;
+  change_risk: string;
+}
+
+export interface PerformanceOpportunity {
+  opportunity_id: string;
+  /** Ids are stable within a model version and never translated across one. */
+  performance_model_version: number;
+  biomarker_type: string;
+  biomarker_types: string[];
+  boundary_kind: C4IoKind | null;
+  execution_context: PerformanceExecutionContext;
+  terminal_sink: string | null;
+  shared_path_suffix: string[];
+  intervention_symbol: string | null;
+  /** The file holding the symbol worth editing. */
+  file_path: string;
+  resource_fingerprints: string[];
+  affected_call_sites_total: number;
+  affected_files_total: number;
+  observations_total: number;
+  evidence: PerformanceOpportunityEvidence[];
+  evidence_truncated: boolean;
+  evidence_total: number;
+  evidence_emitted: number;
+  /** Offset for the next evidence page, absent once the last one is emitted. */
+  evidence_next_cursor?: number;
+  reliable_entry_reachability: boolean | null;
+  provenance: string;
+  /** Evidence confidence: how reliably the call path resolved. */
+  confidence: PerformanceOpportunityConfidence;
+  facets: PerformanceOpportunityFacets;
+  actionability_state: PerformanceActionabilityState;
+  actionability_reason: string;
+  prerequisites: string[];
+  rank_score: number;
+  rank_position: number;
+  rank_factors: Record<string, number>;
+  why_ranked: PerformanceWhyRanked[];
+  fix: PerformanceOpportunityFix | null;
+  /** Exact stored match. Never inferred from file, marker, or rank. */
+  plan_id: string | null;
+  plan_status: PerformancePlanStatus;
+  plan_reason: string;
+}
+
+/** Whether a quoted id still names something this index can resolve. */
+export interface PerformanceModelState {
+  state: "current" | "stale_model" | "unrecognized";
+  opportunity_id: string;
+  requested_model_version: number | null;
+  performance_model_version: number;
+  refresh_required: boolean;
+}
+
+/**
+ * One opportunity by id. An unresolved id still answers, with the model state
+ * and what to do about it, rather than reading as "nothing to fix here".
+ */
+export type PerformanceOpportunityDetail =
+  | ({
+      resolved: true;
+      lifecycle_status: "open" | "resolved";
+      analyzed_commit: string | null;
+      model_state: PerformanceModelState;
+      evidence_total: number;
+      evidence_emitted: number;
+      evidence_next_cursor?: number;
+    } & PerformanceOpportunity)
+  | {
+      resolved: false;
+      opportunity_id: string;
+      model_state: PerformanceModelState;
+      detail: string;
+    };
+
+/**
+ * Counts per value for one filter, computed from the base result rather than
+ * the filtered one, so selecting a value never erases its own alternatives.
+ * A value with no rows is absent rather than reported as zero.
+ */
+export interface PerformanceFacetCount {
+  value: string;
+  total: number;
+}
+
+/**
+ * The filters the server owns. Every key except `plan_state` is also a query
+ * parameter; plan state is counted per value but is not something the queue
+ * narrows by.
+ */
+export type PerformanceFacetKey =
+  | "context"
+  | "boundary"
+  | "confidence"
+  | "actionability"
+  | "plan_state";
+
+export type PerformanceFacets = Partial<Record<PerformanceFacetKey, PerformanceFacetCount[]>>;
+
+/** `all` widens the context filter; the four contexts stay separate under it. */
+export type PerformanceContextFilter = PerformanceExecutionContext | "all";
+
+/**
+ * The query the server answers, shared by the REST client and the views.
+ * An alias rather than an interface so a client can hand it to a generic
+ * query-parameter helper without restating every field.
+ */
+export type PerformanceOpportunityQuery = {
+  /**
+   * Canonical contexts. `production_tooling` is a retired spelling an older
+   * server still answers as Production+Tooling. It is never returned as a
+   * context, so only a legacy-compatibility path should send it.
+   */
+  context?: PerformanceContextFilter | "production_tooling";
+  boundary?: string;
+  /** Evidence confidence, requested apart from fix safety and actionability. */
+  confidence?: PerformanceOpportunityConfidence;
+  actionability?: PerformanceActionabilityState;
+  /** `summary` drops the explanatory fields and keeps identity and counts. */
+  view?: "detail" | "summary";
+  sort?: "rank" | "leverage" | "observations";
+  /**
+   * Scope to the opportunities whose intervention lives in these files. This
+   * is how a file-scoped surface asks the queue about one file instead of
+   * filtering a page it already narrowed.
+   */
+  file_paths?: string[];
+  limit?: number;
+  offset?: number;
+};
+
+export interface PerformanceOpportunitySummary {
+  /** `current` once materialized, `stale_model` after a model bump, or
+   * `unavailable` when this index has not been analyzed yet. */
+  status: "current" | "stale_model" | "unavailable";
+  /** Causes in the selected context. Equal to `repository_total` under `all`. */
+  total: number;
+  /** Causes in every context, so a scoped headline never hides the census.
+   * Absent from a server that predates context scoping, whose `total` is
+   * already the repository-wide count. */
+  repository_total?: number;
+  performance_model_version?: number;
+  /** The model the stored rows were written by, when it trails the current one. */
+  materialized_model_version?: number;
+  analyzed_commit?: string | null;
+  actionability?: Partial<Record<PerformanceActionabilityState, number>>;
+  context?: Partial<Record<PerformanceExecutionContext, number>>;
+  boundary?: Record<string, number>;
+  with_plan_total: number;
+  /** Why the queue is not current, when it is not. */
+  reason?: string;
+  detail?: string;
+}
+
+export interface PerformanceOpportunityPage extends Paginated<PerformanceOpportunity> {
+  summary: PerformanceOpportunitySummary;
+  facets: PerformanceFacets;
+  /** Filter values the server did not recognize, named rather than dropped. */
+  ignored_arguments?: Record<string, string>;
+}
+
 export interface HealthModuleRow {
   module: string;
   file_count: number;
@@ -260,7 +481,12 @@ export interface HealthOverviewSummary {
   worst_performer_path: string | null;
   worst_performer_score: number | null;
   open_findings: number;
-  severity_breakdown?: { critical: number; high: number; medium: number; low: number };
+  severity_breakdown?: {
+    critical: number;
+    high: number;
+    medium: number;
+    low: number;
+  };
   /** Repo-level band derived from `average_health` (added in the band/distribution layer). */
   band?: HealthBand;
   /**
@@ -336,6 +562,93 @@ export interface HealthFilesQuery {
    * row parses as one; ask for `"full"` (the default) if you print any of them.
    */
   fields?: "full" | "summary";
+}
+
+/* ------------------------------------------------------------------ *
+ * Map feed
+ * ------------------------------------------------------------------ */
+
+/**
+ * How the server chose the drawn field.
+ *
+ * `active_then_performance_then_nloc`: the caller's guaranteed paths first,
+ * then the files carrying open performance opportunities in rank order, then
+ * lines-of-code descending for whatever capacity is left. Ranking the whole
+ * repository by size alone is a defensible sample for the health lens and the
+ * wrong one for performance, because a small file can hold the worst cause.
+ */
+export type HealthMapSelectionBasis = "active_then_performance_then_nloc";
+
+export interface HealthMapSelection {
+  basis: HealthMapSelectionBasis;
+  /** Paths the caller asked to pin, in the order they were asked for. */
+  active_requested: string[];
+  active_shown: string[];
+  /** Requested paths with no drawable metric row, so nothing pretends they are there. */
+  active_missing: string[];
+  performance_shown: number;
+  performance_eligible: number;
+  nloc_shown: number;
+}
+
+/** What the cap pushed out, in the units a reader would ask about. */
+export interface HealthMapOmissions {
+  files: number;
+  performance_files: number;
+  opportunities: number;
+  observations: number;
+}
+
+export interface HealthMapModuleRollup {
+  module: string;
+  files_shown: number;
+  opportunities: number;
+  observations: number;
+  plan_ready: number;
+  /** Best queue rank in the module, or `null` when it carries no opportunity. */
+  best_rank: number | null;
+}
+
+/** Repository-wide performance state the lens needs to describe itself. */
+export interface HealthMapPerformance {
+  files_with_opportunities: number;
+  files_with_opportunities_eligible: number;
+  opportunities_total: number;
+  observations_total: number;
+  actionability: {
+    plan_ready: number;
+    advisory: number;
+    investigate: number;
+  };
+  model_version: number | null;
+  analyzed_commit: string | null;
+}
+
+/**
+ * The bounded field the map draws, plus the exact scope of what it leaves out.
+ *
+ * The rendered set and the counts describing it come from one response, so a
+ * caption can never disagree with the field beside it.
+ */
+export interface HealthMapFeed {
+  files: HealthFileMetric[];
+  cap: number;
+  shown: number;
+  /** Files that could be drawn at all: a zero-NLOC file cannot be sized. */
+  eligible_total: number;
+  repository_total: number;
+  selection: HealthMapSelection;
+  omitted: HealthMapOmissions;
+  recovery: Record<string, string>;
+  modules: HealthMapModuleRollup[];
+  /** `null` when this index has never materialized the performance read model. */
+  performance: HealthMapPerformance | null;
+}
+
+export interface HealthMapQuery {
+  cap?: number;
+  /** Paths guaranteed a node, admitted before any other band. */
+  active?: string[];
 }
 
 /* ------------------------------------------------------------------ *
@@ -488,7 +801,12 @@ export interface HealthTrendResponse {
     message: string;
   }>;
   /** Largest movements first, in either direction, capped server-side. */
-  file_deltas: Array<{ file_path: string; before: number; after: number; delta: number }>;
+  file_deltas: Array<{
+    file_path: string;
+    before: number;
+    after: number;
+    delta: number;
+  }>;
   /**
    * How many files moved in total, before the cap. Optional: the hosted
    * backend does not send it, so consumers fall back to `file_deltas.length`.
@@ -533,6 +851,83 @@ export interface CoverageSummary {
   ingested_commit_sha: string | null;
 }
 
+/**
+ * Which signal answered "is this tested". `measured` is a coverage report: it
+ * records the lines a test really executed. `inferred` is the dependency graph:
+ * a test whose calls reach this file, which says control *can* flow there, not
+ * that a run did. `none` is the honest unknown.
+ *
+ * The two are never merged and never averaged. They are different claims, and a
+ * reader who cannot tell them apart cannot tell a measured test from a guessed
+ * one. `basis` says which one answered; nothing blends them.
+ */
+export type CoverageBasis = "measured" | "inferred" | "none";
+
+/**
+ * Which tier of the graph found a test. `call-graph` means a test's calls reach
+ * the file, the stronger claim; `import-graph` means it only imports it.
+ */
+export type ReachedVia = "call-graph" | "import-graph";
+
+/**
+ * One file on the inferred basis. `reached` is the whole of what this basis
+ * knows about it: there is no percentage here and there never can be, because
+ * reaching is a file-level fact with no line attribution behind it.
+ *
+ * Which tests reach it is a separate, per-file request — attributing every file
+ * at once costs a walk per file, and the list is only ever read one row at a
+ * time. See `TestsReachingFile`.
+ */
+export interface ReachedFileRow {
+  file_path: string;
+  reached: boolean;
+  health_score?: number;
+  nloc?: number;
+}
+
+/**
+ * The graph-inferred test map: counts, never a ratio. `files_reached` and
+ * `files_not_reached` are deliberately two counts rather than one fraction —
+ * a fraction invites a progress bar, and a progress bar is the coverage
+ * percentage this basis is not allowed to claim.
+ *
+ * `files_total` is the full count whatever `files` carries, so a trimmed list is
+ * never read as the whole repo.
+ */
+export interface InferredTestMap {
+  files: ReachedFileRow[];
+  files_total: number;
+  files_reached: number;
+  files_not_reached: number;
+  test_file_count: number;
+  /**
+   * Present only when `basis` is `measured` (the hybrid shape): how many files
+   * carry a measured coverage row. On that shape `inferred` is scoped to the
+   * files *without* a measured row, so this lets the UI state the split
+   * (measured vs graph-answered) honestly. Absent on the pure-inferred shape.
+   */
+  measured_file_count?: number;
+}
+
+/** Which tests reach one file, and which tier found them. */
+export interface TestsReachingFile {
+  file_path: string;
+  basis: CoverageBasis;
+  reached: boolean;
+  /**
+   * Empty when `reached` is false, and capped server-side. Render `total`
+   * beside it, never `tests.length` on its own: the cut is alphabetical, so a
+   * trimmed list states a cap as if it were the answer.
+   */
+  tests: string[];
+  /** Null when `reached` is false. */
+  via: ReachedVia | null;
+  /** How many tests the walk found, before the cap trimmed `tests`. */
+  total?: number;
+  /** Whether `tests` is a trimmed slice of `total`. */
+  truncated?: boolean;
+}
+
 export interface HealthCoverageResponse {
   summary: CoverageSummary;
   files: CoverageFileRow[];
@@ -544,13 +939,31 @@ export interface HealthCoverageResponse {
    * hosted backend does not send it yet.
    */
   modules_total?: number;
+  /**
+   * Which signal answered, when the response determined one. Absent means it did
+   * not: an older backend that predates the field, or a caller that passed
+   * `include_inferred=false` and so never consulted the graph. That is why a
+   * declined response omits it rather than reporting `"none"` — not consulted
+   * and nothing to say are different states.
+   */
+  basis?: CoverageBasis;
+  /**
+   * Present only when `basis` is `inferred` (pure-inferred shape: `summary`,
+   * `files` and `modules` are empty so no consumer renders one through the
+   * other's code path) OR when `basis` is `measured` and the repo has files
+   * with no measured row (hybrid shape: the measured fields are populated, and
+   * `inferred` holds the graph answer for exactly the non-measured files).
+   * On the hybrid shape `measured_file_count` states the split. In both shapes
+   * the inferred map carries counts only — never a percentage.
+   */
+  inferred?: InferredTestMap;
 }
 
 /* ------------------------------------------------------------------ *
- * Refactoring targets
+ * Health work queue (legacy route: /health/refactoring-targets)
  * ------------------------------------------------------------------ */
 
-export interface RefactoringTarget {
+export interface HealthWorkItem {
   file_path: string;
   score: number;
   nloc: number;
@@ -586,12 +999,12 @@ export interface RefactoringTarget {
   }>;
 }
 
-export interface RefactoringTargetsResponse {
-  targets: RefactoringTarget[];
+export interface HealthWorkQueueResponse {
+  targets: HealthWorkItem[];
   total: number;
 }
 
-export interface RefactoringQuery {
+export interface HealthWorkQueueQuery {
   limit?: number;
   module?: string;
   biomarker?: string;
@@ -599,6 +1012,13 @@ export interface RefactoringQuery {
   max_effort?: string;
   sort?: "impact_per_effort" | "total_impact" | "score" | "finding_count";
 }
+
+/** @deprecated Use HealthWorkItem; this is a file triage row, not a plan. */
+export type RefactoringTarget = HealthWorkItem;
+/** @deprecated Use HealthWorkQueueResponse. */
+export type RefactoringTargetsResponse = HealthWorkQueueResponse;
+/** @deprecated Use HealthWorkQueueQuery. */
+export type RefactoringQuery = HealthWorkQueueQuery;
 
 /* ------------------------------------------------------------------ *
  * Churn x complexity quadrant (the "hotspot anatomy" view)

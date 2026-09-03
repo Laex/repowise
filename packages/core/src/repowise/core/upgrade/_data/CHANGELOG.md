@@ -9,7 +9,397 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [0.48.0] — 2026-09-02
+
+Architectural decisions stop being a passive record and become a review queue. A decision is captured under one policy, keyed by the identity it dedupes on, and acceptance is the only thing that grants it authority — recorded as an event, on a tracked manifest, so every read can say who vouched for what. On top of that sits a queue that leads with the work you can actually finish. The other change you will see first is the repo overview: the front page described a file tree because a file tree was all it was given, and it now reads like a description of a product. Elsewhere: `doctor` stops trusting config files and launches the MCP server for real, the keyless and degraded paths report why they degraded, and a cycle of persistence and generation performance work.
+
+### Added
+
+- **Decisions are a review queue, not a log.** Capture runs under one policy with acceptance as the only authority (#2067), acceptance is a recorded event against a tracked manifest (#2069), and discovery is one broad grounded call per update instead of many narrow ones (#2068). Reads carry review lanes and a single vocabulary, with authority stated on every read (#2070). A decision's id is derived from the identity it dedupes on, so the same decision found twice is the same row (#2071). `decision` reports what capture actually did and reviews a backlog in one command (#2072), and the queue leads with work that can be finished now (#2073).
+- **The repo overview reads like a product, not a directory.** The front page every reader opens described a file tree: `assemble_repo_overview` handed the model pagerank, communities, package file counts and entry-point paths with no natural-language input at all, so a page of paths was the specified output. The context gains one bounded prose keyhole — a README digest capped at 2,500 characters — and the page has a fixed shape: what this is, how the parts fit, then five to seven named concepts. Prose supplies vocabulary and framing; structure stays the sole authority on paths, counts and package names (#2078).
+- **`doctor` launches the MCP server** rather than reading its config and assuming (#2065). A config that looks right and a server that will not start are different problems, and only one of them was previously detectable.
+- **Failure and degradation are reportable.** `init` failures carry a reason code (#2057), and telemetry reports the degrade reason, the keyless case and every crash leaf (#2056).
+- **Five more JS/TS security patterns** in the registry (#2047).
+- **`augment` takes `--verbose`**, wired through `configure_cli_logging` (#2033).
+- The TypeScript HTTP contract is generated from the FastAPI schema rather than hand-maintained (#2035).
+- `tech_stack` detects bun as the script runner (#1940).
+
+### Changed
+
+- **`HEALTH_ANALYZER_VERSION` is 8.** Paired-test detection had `test_<stem>.py` hardcoded, so the prefix layout only ever matched Python; it now follows the file's own suffix, and `<stem>_spec` joins the suffix forms (#1841). Files wrongly counted untested become tested, which moves untested-hotspot findings and the scores carrying them. An existing index re-scores on its next update; it does not force a re-index. `STORE_FORMAT_VERSION` and `PARSER_SCHEMA_VERSION` are unchanged.
+- **Indexing and persistence are faster.** Betweenness is reused inside a churn budget instead of rescored (#2066), the full-text index is written in one transaction (#2052), job checkpoints are buffered behind a bounded atomic flush (#2053), and the generation and persistence tail is timed (#2050).
+- **Repository-scale native memory is bounded** during indexing (#1778).
+- Every MCP tool shares one response-budget contract (#2051).
+- `get_answer` grades a degraded answer's confidence from retrieval quality instead of pinning it low (#2055).
+- `init --resume` is documented, with expanded help text (#113, #2030).
+
+### Fixed
+
+- **Dry runs are read-only.** `update --full --dry-run` could create locks and mutate the index; it now reports the persisted upgrade plan instead (#2005). `init --dry-run` had the same shape and was worse: only the branch that prices a model honoured the flag, so a keyless or `--no-prose` dry run rendered the whole template wiki and persisted it. Against a repo that already had a model-written wiki that rewrote every page from templates and downgraded `docs_mode`, on the one command whose promise is that it does not act (#2075). It also no longer passes an LLM client, so a dry run cannot bill.
+- **The configured embedder is the one `init` uses.** `resolve_embedder` auto-detected from environment variables and fell through to `mock`, never reading the `embedder` field in `~/.repowise/config.yaml` — the field `repowise serve`'s prompt writes. A machine configured only there indexed with keyless vectors, pinned `mock`, and got no semantic search, with nothing to say so (#2074).
+- **Persistence**: symbol names are stored as `Text` rather than `VARCHAR(255)` (#1705), the WAL switch no longer kills a read against a live writer (#2064), page snapshots are swept when a repository is deleted (#1945), and stale pages take one `UPDATE` rather than two copies (#1199).
+- **Embedder**: `--embedder auto` resolves through the repo pin rather than the environment, so a pinned backend is the one that queries the table it wrote (#2032).
+- **Health and risk**: `analyzed_commit` is stamped by every remaining metric writer (#1864, #2034), and `get_risk` normalizes the `git_metadata` target path (#1849).
+- **Ingestion**: a package language tie resolves by name rather than walk order (#2028).
+- **CLI and server**: the page listing is no longer capped at 10,000 (#2061), git logs work in worktrees (#2045), `doctor` explains stale pages and why `--repair` cannot clear them (#1710, #1956), and workspace contract links in `CLAUDE.md` are ranked by confidence before the cap (#1588, #1957).
+- **The provenance footer on structural pages is a horizontal rule again.** It rendered as `---*Built from the code's structure...`, with the rule and the text joined, which is a paragraph beginning with three dashes rather than a rule (#2080).
+- **UI**: performance filter counts are clarified (#2044) and the context "all" badge is scoped (#2042).
+- Plugin: the `change-review` skill renders from its shared source (#2023).
+
+---
+
+## [0.47.0] — 2026-08-30
+
+The headline this cycle is that Code Health stops handing you observations and starts handing you work. Performance findings compose into per-file opportunities with a real lifecycle, served from a materialized read model so the web page, the CLI and the agent surface cannot disagree about what one opportunity is. Alongside it, a contextual chat dock that can read the indexed repository and keep its artifacts, coupling that says whether two files *should* change together rather than just that they did, and an architecture view that finally does something useful with external dependencies.
+
+### Added
+
+- **Contextual repository chat.** Ask a question about the repo from a persistent dock that follows you across pages, with a conversation lifecycle and a durable artifact workspace so the things a conversation produces outlive it (#1949, #1951, #1960, #1964). The dock can be dismissed and brought back from settings (#2017).
+- **Refactoring opportunities are composed, not listed.** The Refactoring board showed detector outputs, so a file with fifteen of them filled the screen fifteen times and the reader reassembled "this file needs work". Board rows, the structural field, the drawer, the CLI and the VS Code list now read one composed opportunity per file: its steps in dependency-safe order, how many are mechanical, and whether they address what is actually costing the file most (#1988, #1998). Plans gained a versioned identity and a lifecycle, and triage is one request (#1986).
+- **The Performance tab is a queue of causes**, not a list of observations: what to change, why it ranks there, and the evidence behind it, projected from a materialized read model with server-side filters, counts, ordering and paging (#1981, #1985). Production, Tooling, Test and Unclassified stay separate, each with its own count including zero, and the performance lens joined the one Galaxy view (#1987).
+- **Coupling says whether files *should* change together.** A co-change pair is now graded by whether the graph can explain it, filterable by that verdict, and openable as a pair with the matching `edge_type` shown, so "explained" says whether an import or a framework binding accounts for it (#1972, #1973, #1975).
+- **External dependencies are a real view.** Bounded per-package summaries, a dependency explorer, and focused package relationships in the architecture view (#1942, #1943, #1946).
+- **Local OpenAI-compatible gateways** are supported as a provider, for LM Studio, vLLM and friends (#1822).
+
+### Changed
+
+- **`get_change_risk` leads with what the change made worse.** The response now opens with a `directive` (status, headline, reasons, next actions) and a `health_delta` of the findings the change introduced or resolved, ahead of the percentile and the diff-shape drivers (#1980). Every previous field is still there; the ordering and the lede changed. The Claude Code plugin's `change-review` skill is updated to match.
+- **A repeated-cost cause is named by the caller that repeats the work**, not only the sink that pays for it, so a shared infrastructure helper no longer merges unrelated workflows, and execution context gained `unknown` instead of defaulting an unclassifiable file to production (#1978). The opportunity queue defaults to production context (#2003).
+- **`HEALTH_ANALYZER_VERSION` is 7.** An existing index re-scores health on its next update rather than waiting out the decay timer; it does not force a re-index. `STORE_FORMAT_VERSION` and `PARSER_SCHEMA_VERSION` are unchanged.
+- **`repowise` starts faster.** The per-call CLI startup floor is cut (#1833), and an update walks the repo once rather than once per worker (#1926).
+- **A refactoring plan the gates cannot prove behaviour-preserving is suppressed** rather than offered (#1984).
+- Loading motion moved from the box to the region, the sidebar's scale and rhythm were reworked, the AI prompt modal uses hairlines instead of a filled well, and model work has its own accent instead of borrowing orange and green (#1993, #1994, #1995, #2015, #2016).
+
+### Fixed
+
+- **Performance analysis**: the loop-carried must-def analysis is solved to a fixpoint rather than to one pass (#2009), and the hot-path gate requires centrality before it fires (#2007).
+- **Dead code**: JSX prop-guard dead code is detected (#1570), and unused-export confidence is clamped when a dynamic use cannot be resolved (#1959).
+- **Ingestion**: three-part qualified calls resolve (#1920), C++ export-macro forward declarations parse (#1913), and Pascal dead-code false positives are resolved with type kinds disambiguated (#1675).
+- **MCP**: `get_why` trims its lanes before dropping them and names what the answer rests on (#1954, #1963), guided tour steps are renumbered after dedup (#1889), path search supports trailing globs (#1881), and a workspace query prefers the most-specific repo (#1865).
+- **Security scanning** no longer reports `RegExp.exec`, and catches the constant secret form it was missing (#1947).
+- **Coverage**: the Tests tab answers for files a partial report never named (#1805), and severe path-mapping loss is flagged instead of being treated as success (#1955).
+- **Health persistence**: a full index is stamped with its commit and composed after governance (#2001), and the derived queues are rebuilt whenever the findings are replaced (#2000).
+- **Config and workspace**: broken repo config is surfaced instead of silently falling back to defaults (#1958), workspace updates are single-flight (#1834), DB identity resolves on delegated worktree updates (#841), and `codex_cli` is in the server's provider catalog (#1953).
+- **Chat**: GPT-5.6 function tools work against OpenAI (#1950).
+- The coupling tab no longer crashes the page and names files unambiguously (#1965), the workspace health score is banded on the same ladder the repo pages use (#2012), the chat dock lifts only where the graph controls are actually under it (#2013), the dark overlay plane and its nested wells settle (#2014), the opportunity row columns align below the `lg` breakpoint (#2010), a refactoring step whose plan falls outside the limit renders (#2004), and the coverage migration has its own revision id (#2019).
+
+### Documentation
+
+- The security scan is documented, floor and all (#1948).
+
+---
+
+## [0.46.0] — 2026-08-27
+
+The headline this cycle is cross-repo contracts becoming a surface you can use rather than a graph the indexer knew about. A workspace now recognises routes once and serves them to both producers and consumers, binds each contract to a real symbol id, reads request schemas off handler signatures, and gives the whole thing a front door in the UI and over REST. Alongside it the MCP tool surface got a shared response ceiling with recoverable pagination, so no tool can silently truncate an answer with no way back, and the C++, Rust, Java and TypeScript call graphs each lost a class of wrong edge.
+
+### Added
+
+- **Cross-repo contracts have a front door.** A workspace's contracts are browsable, open from the table into what they link to, and carry the line, symbol and schema over REST (#1890, #1899). One route recogniser now serves Go, Laravel and Axum, with Django, JAX-RS, Next.js and the Hono router DSL alongside them (#1867, #1860), and a library's public API counts as a contract in its own right.
+- **Python HTTP consumers resolve through their client bindings**, so a call made through a session or a generated client still names the path and verb it actually reaches.
+- **A shared response ceiling across the MCP tools.** The five uncapped tools now answer within a canonical budget enforced at delivery, and every cap is recoverable: relationship, history and truncated test lists all carry a way back to the rows they dropped (#1924, #1930).
+- **Canonical references that round-trip.** A reference emitted by one tool can be passed to another, and `get_why` returns evidence references pointing at what it read (#1927, #1932).
+- **`claude_cli` provider**, for indexing against a Claude Code subscription instead of an API key (#1514).
+- **The knowledge graph says what it is not showing** (#1847), its arrows mean execution rather than mere reference (#1832), and a folder card is named after the module page documenting it (#1828).
+
+### Changed
+
+- **BREAKING (MCP): `get_risk`'s `will_break` field is now `may_break`** (#1892). The old name asserted a certainty the structural heuristic behind it does not have. Any client reading `will_break` must be updated.
+- **`get_overview`'s onboarding blocks are opt-in**, and `get_answer` and `get_overview` return leaner payloads for the same content.
+- **Retrieval precision improved** for `get_answer`, which can now see the call graph when expanding a question (#1933).
+- **`HEALTH_ANALYZER_VERSION` is 6 and `PARSER_SCHEMA_VERSION` is 2.** Both are picked up automatically: an existing index re-scores health on its next update rather than waiting out the decay timer, and the parse cache re-parses once so the call-graph fixes below actually apply. Neither forces a re-index.
+
+### Fixed
+
+- **C++ call resolution**: scoped `Ns::f()` calls resolve against their qualifier rather than falling to a bare name (#1915), chained calls are constrained by the inner callee's return type (#1782), in-class method declarations and receivers typed from declarations are extracted, types used only inside their own translation unit are rescued, types behind export macros parse, and an overload set resolves instead of being refused.
+- **A Rust macro invocation is no longer counted as a function call** (#1885), a Java chain rooted at an external type is no longer read as a bare-name call, and the repo-wide receiver tier no longer answers for foreign types.
+- **Health scoring inputs**: Python `match` arms count toward cyclomatic complexity (#1795), Pascal else-if chains flatten instead of nesting each arm (#1679), a comment inside a parameter list is no longer counted as a parameter (#1796), and two test-detection gaps closed, one a pairing the name heuristic could not see (#1707) and one Delphi's `Test<Stem>.dpr` convention (#1706).
+- **`is_hotspot` is emitted by the backend** rather than re-derived in the client (#1797), fix density ranks against commits rather than individual files, and `tests_to_run` ranks by files reached rather than alphabetically.
+- **`coverage add` exits non-zero when it stores nothing** (#1751), and config errors that cannot self-heal no longer promise a retry.
+- **The file page renders again**: a pure `?tab=` helper had been exported from a client module and called from the server (#1936).
+- **API timestamps render as UTC** (#1835), `CLAUDE.md` is stamped with the indexed commit rather than live `HEAD`, and a `SELECT INTO` target is no longer flagged as a cartesian join.
+
+### Documentation
+
+- The benchmarks pages lead each section with its result, pair precision with recall so neither reads alone, and state both cost denominators (#1928).
+- The MCP tool table's drifted rows and the README's tool-count claims are corrected and asserted by a test.
+
+---
+
+## [0.45.0] — 2026-08-21
+
+The headline this cycle is test intelligence that needs no coverage report. 0.44.0 made the call graph good enough to lead with; this release walks it to answer which tests reach a file, serves that through the API, and turns the Coverage tab into a Tests tab that says something useful on a repository that has never ingested a report. Around it, Code Health's performance findings become bounded opportunities that open the matching refactoring plan, Eden AI joins as an EU-hosted provider and embedder, and pinning BLAS threads before numpy loads halves peak memory on a cold index.
+
+### Added
+
+- **A test-to-code map that needs no coverage report.** The per-test map only
+  ever existed if you ingested a coverage report with contexts, so on most
+  repositories `tests_to_run` was empty, `impacted_tests` said "run the full
+  suite", and `untested_hotspot` fell back to matching filenames. The call graph
+  already records which test can execute into which source file, and that
+  relation now answers when the measured one cannot. It is labelled `inferred`
+  everywhere, never blended with measured coverage, and never turned into a
+  percentage. Nothing is stored: it is a bounded walk over rows already indexed,
+  measured at 63 ms once per health run on a 3,700-file repository.
+
+  The call graph is the primary signal and the import graph the weaker fallback,
+  which is a measured choice rather than a preference. Dogfooded against a real
+  `coverage run --contexts=test` over a slice where per-test attribution is
+  complete, with both sides seeing the same 37 test files: walking imports one
+  hop scored 72.1% precision at 19.5% recall, walking calls three hops scored
+  91.7% at 27.7%, and dropping the one call-resolution strategy that only
+  matches a name repo-wide (`global_unique`) took that to 95.7% at no cost to
+  recall. Unioning the two is worse than either lead, so the import tier is
+  spent only on the files the call graph says nothing about, where it answers
+  one more of them at no loss of precision.
+
+  New fields: `tests_to_run_basis` on `get_risk`'s directive
+  (`measured` / `inferred` / `none`), `basis` and a `status: "inferred"` on
+  `get_change_risk`'s `impacted_tests`, and a `via` marker on every
+  `repowise impacted-tests` candidate saying which tier answered.
+
+- **Code Health performance opportunities now lead into the existing
+  Refactoring workflow.** A dedicated Performance tab groups raw findings into
+  bounded causal opportunities with production/tooling versus test context,
+  affected-call-site totals, confidence, provenance paths, and raw-evidence
+  paging. Exact stable opportunity ids open matching `performance_fix` plans;
+  opportunities without a safe plan say so instead of selecting a nearby one.
+  The Refactoring page adds a Performance filter and shared priority,
+  validation, path, and pagination renderers. Its new server-owned page endpoint
+  bounds initial payloads while preserving the legacy unpaged route. VS Code
+  consumes the same contracts and renders priority and validation without web
+  dependencies; older missing optional fields remain supported.
+
+- **`/health/tests-reaching?file_path=`** answers which tests reach one file,
+  with `via` separating a test whose calls run into it from one that only imports
+  it, and `/health/coverage` falls back to the inferred map under
+  `basis: "inferred"` when no report was ingested. The two bases never share a
+  field, so a consumer cannot render derived data through the measured code path
+  by accident. `include_inferred=false` declines the fallback for a caller that
+  only wants the cheap badge number. (#1757)
+
+- **Eden AI is a first-class LLM provider and embedder.** An EU-headquartered
+  gateway exposing 700+ models behind an OpenAI-compatible endpoint, so it reuses
+  the existing `openai` dependency with a custom base URL and adds no new one.
+  `EDENAI_API_KEY`, `EDENAI_BASE_URL` for the EU endpoint, and an embedder
+  defaulting to a 1024-dimension EU model. It is appended to the autodetect order
+  rather than inserted, so an unrelated key in the environment cannot move anyone
+  off the provider they were already resolving to. (#705)
+
+### Changed
+
+- **The Coverage tab is now a Tests tab, and it answers without a report.** The
+  URL stays `/coverage` and "coverage" keeps meaning the measured thing inside
+  the tab; what changed is that the empty state no longer tells you to go
+  ingest a report while claiming nothing is inferred. On the inferred basis the
+  chart collapses to two positions rather than a 0-100 continuum, which is the
+  honest statement about the evidence, and nothing is rendered as a percentage
+  or a bar. The file page names the tests that reach it, with `via` separating a
+  test whose calls run into the file from one that only imports it. (#1758)
+
+- **OpenAI-compatible local gateways expose their models.** Custom endpoints
+  configured with `OPENAI_BASE_URL` can now return namespaced model ids such as
+  9router's `ag/...` and `ds/...` entries; loopback requests also bypass proxy
+  environment parsing so a standard IPv6 `NO_PROXY` entry cannot block them.
+
+- **Custom OpenAI-compatible setup is a first-class init flow.** The provider
+  menu separates official OpenAI from custom/local gateways, validates the
+  endpoint, hides and optionally saves the key, verifies `/models`, supports
+  model search plus exact-id fallback, and offers retry/manual/back recovery.
+  `--no-save-key` persists the non-secret endpoint without persisting the key;
+  CI, `--yes`, and non-TTY runs remain non-interactive.
+
+- **`untested_hotspot` stops accusing files that the tests run.** With no
+  coverage ingested it fired on any hotspot without a *paired test file*, which
+  is a filename convention, so a suite that names its tests for behaviour
+  satisfied nothing. A test whose calls reach the file now suppresses it too. On
+  this repository five of the six worst bug-magnet files had no test named for
+  them and read as untested; the sixth, `analysis/health/engine.py`, was called
+  tested because the convention matched `distill/test_engine.py` on basename
+  alone. The same floor now runs under `get_risk`'s `missing_tests`, which had
+  two separate filename heuristics that disagreed.
+
+  Measured on repowise's own index, against the 80 standing `untested_hotspot`
+  findings the filename convention leaves behind: the call graph clears 32 of
+  them, 22 graded high and 3 critical, where a one-hop import walk clears 11.
+  The persisted `has_test_file` widens to match, so the file table stops
+  labelling those same files "untested" while the biomarker says nothing.
+
+  Both stored values are wrong on an index built before this, so
+  `HEALTH_ANALYZER_VERSION` moves to 3 and the next `repowise update` with
+  changed files re-scores health rather than waiting out the decay timer.
+
+- **`repowise impacted-tests --format json` renames `guessed_tests` to
+  `inferred_tests`.** The bucket no longer holds only filename guesses, so the
+  old name described the wrong thing; each entry carries `via` (`call-graph`,
+  `import-graph` or `filename-pattern`) to say which tier answered.
+
+- **Refactoring recommendations have one contract.** REST, MCP and the CLI each
+  rebuilt their own ranking and payload shape, and the TypeScript contract was
+  duplicated in the UI package. The wire contract moves to
+  `@repowise-dev/types` and the Python side gets a single read model owning
+  rehydration, enrichment, ranking, validation and serialization for every
+  surface. Blast radius now raises cost and risk rather than benefit, so a wide
+  change ranks as expensive instead of valuable. (#1784)
+
+- **The semantic leg of search gets a budget the cold path can clear.** The first
+  vector query in a process pays for the store open, the first embed and the
+  first ANN probe. That was measured at 6.3s and 13.4s on a cold Windows index
+  where a warm query takes 0.19s, against a hardcoded 8s bound inside a
+  suppressed exception. The budget is now one shared 30s default, capped at 120s and
+  overridable with `REPOWISE_VECTOR_SEARCH_TIMEOUT_S`, and a timeout logs a
+  warning naming the knob instead of silently degrading to full-text with
+  nothing said. (#1678, #1685)
+
+- **Plugin**: `/repowise:impacted-tests` and the `change-review` skill describe
+  the inferred map as the call graph with an import-graph fallback, and `init` /
+  `reindex` list the embedders the CLI actually accepts.
+
+- **Execution-graph analysis is unified** behind one code path in health, with
+  the legacy call fallback restricted rather than left answering alongside it.
+  (#1773)
+
+### Fixed
+
+- **An incremental update stopped erasing ingested coverage.** The incremental
+  pipeline built its analyzer without a coverage map, so every changed file was
+  re-scored as if no report had ever been ingested and the partial-health writer
+  upserted `line_coverage_pct` back to NULL, eroding coverage one file per
+  update, starting with the files under active development. Both callers now load
+  and supply the persisted map. (#1739, #1806)
+- **`repowise init` no longer crashes in a git worktree.** `.git` is a file
+  there, not a directory, so building `.git/hooks` by hand raised
+  `NotADirectoryError` and took the whole command down. The hooks directory is
+  resolved with `git rev-parse --git-path hooks`, which answers correctly for a
+  worktree and a normal clone alike. (#1609, #1808)
+- **The CLI and the MCP server resolve the same embedder key.** The server never
+  consulted the process environment, so on a machine with an exported provider
+  key different from the repository's `.repowise/.env`, semantic search degraded
+  through the CLI while the MCP tool answered. The server now reads the env tier
+  first, matching the CLI's "an exported key is an explicit override" contract.
+  (#1711, #1810)
+- **`edenai` is selectable everywhere it is documented**: `init --embedder`,
+  `reindex --embedder`, both interactive prompts, `EDENAI_API_KEY` autodetection
+  and the server's embedder build, four lists that were left on the older
+  five-backend set. (#1815, #1820)
+- **`repowise reindex` exits non-zero when every embed failed**, so an automated
+  pipeline cannot treat an empty vector index as a successful build. An empty
+  wiki still exits 0. (#1495, #1732)
+- **The file page states how many tests reach a file, not how many it listed.**
+  The list is capped at 50 and the page rendered that cap as the measurement; it
+  now leads with the true count and says what it is showing. (#1764)
+- **A generated-file banner has to be a banner.** The marker is required within
+  the first two lines instead of substring-matched across the whole header, which
+  fixes the class of prose false positives across all six markers. (#1519, #1731)
+- **Python resolution**: `from pkg import submodule` pinned the binding at the
+  package `__init__.py`, so a later `submodule.symbol()` call resolved against a
+  file declaring nothing and dead code called the symbol safe to delete (#1193,
+  #1733); aliased submodule bindings are pinned properly (#1255, #1785).
+- **Go**: a call through a field (`a.b.Method()`) matched no pattern and was
+  missing from the graph entirely rather than present and unresolved (#1727), and
+  an embed of `io.Reader` keeps its package qualifier instead of binding to
+  whatever repo-local `Reader` shares the short name, which made the type
+  inherit from itself when the enclosing type had that name (#1726).
+- **TypeScript**: `#private` class members produce a symbol and a call site
+  (#1715, #1721), a return type no longer renders with a stray colon
+  (`-> : string`) (#1695, #1719), and a relative import probes `index.tsx` and
+  `index.jsx` (#1725).
+- **Java and C# method return types are preserved** in signatures (#1713).
+- **The bare-name tier stops answering for the standard library** (#1708), and
+  barrel-file definitions are aligned with `file_reachability` (#1491, #1557).
+- **The paired-test filename heuristic is shared** rather than reimplemented per
+  surface (#1750).
+- **Security scanning**: `replace_findings` no longer loses rows on a duplicate
+  key (#1523), and a multi-line `subprocess.*(... shell=True)` call is flagged
+  (#1522).
+- **Agent CLIs no longer load the target repository's instruction files** when
+  invoked for generation (#1100).
+- **`workspace init --dry-run` writes nothing** (#1526), and `init --test-run`
+  actually limits generation to the top 10 files (#1525).
+- **`share_of_repo_gap_pct` uses the gross gap as its denominator** (#1452), and
+  history fetches avoid the partial-clone path (#1608).
+- **The `get_risk` artifact renders in chat.** The renderer mapped over a list
+  and read `path` / `churn_percentile`, but the tool returns a path-keyed dict of
+  `hotspot_score` / `file_path`, so opening the artifact threw or showed blank
+  rows. Both shapes are normalized, and the 0-1 score is scaled for display
+  rather than printed as though it were already a percentage. (#1480)
+
+### Performance
+
+- **Peak memory on a cold index is roughly halved.** Importing numpy brings up a
+  BLAS runtime that commits a private per-thread workspace sized to the host's
+  core count: 746 MB on a 32-core machine for the import alone, committed once,
+  never returned, and invisible to `tracemalloc` because no Python object owns
+  it. The pipeline's only numpy work is PageRank over a sparse graph, which runs
+  single-threaded in well under a second, so the thread count is pinned before
+  numpy is imported. A cold `init --no-prose` on an 876-file repository went from
+  1,547 MB to 818 MB at no wall-clock cost. `OMP_NUM_THREADS` is deliberately
+  left alone: igraph community detection really is OpenMP-parallel, and pinning
+  it cost 18% wall clock for no further saving. (#1394, #1776)
+
+### Documentation
+
+- **A roadmap, an enterprise section, and a benchmarks page that leads with its
+  results.** `ROADMAP.md` is new and states plainly that language support is
+  never gated behind the licence; the README gains a real enterprise section
+  covering deployment, data boundary, compliance and contract; `BENCHMARKS.md`
+  goes from 777 visible lines to 456 with every caveat and every losing row
+  preserved behind folds. Language support is now stated the same way in every
+  document: 19 parsed to a full AST, 35 on the ladder. Source control beyond git
+  (Perforce, Subversion, and the mainframe promotion hierarchies) is scoped to
+  the one history-derived layer that actually needs it. (#1766)
+- **The graph precision result is published**, judged by a compiler across five
+  tools (#1738), and `COMMERCIAL.md`'s tool count matches the way the document
+  counts (#1771).
+
+---
+
+## [0.44.0] — 2026-08-18
+
+The theme this cycle is the call graph knowing who the receiver is. A call written `user.save()` only becomes an edge if something can say what `user` is, and for most languages nothing could: the resolver matched the bare name against every symbol in the repo and guessed. Receiver typing now runs for Go, Kotlin, Swift, C#, Java, Python, PHP and Luau, and resolution follows re-export chains. On microdot, a small pure-Python repo with none of the languages that gained most, call edges went from 876 to 1,371. Dead code got the matching precision pass, and updates now carry both onto an index built by an older version, which they previously did not. Expect the first `repowise update` after upgrading to run long, once.
+
+### Added
+
+- **Receiver typing across eight languages.** A call's receiver is typed from its declaration in Go (#1674), Kotlin (#1687), Swift (#1688) and C# (#1680), from the enclosing class for a bare call plus PHP and Luau receivers (#1630), from a field's declaring class (#1642), from a local's declaration (#1639), from assignments in a Python function body (#1643), from a Java call on its own field (#1658), and from a framework decorator that retyped it (#1684). Three more receiver shapes a bare-name match had been guessing at are now captured directly (#1686).
+- **Resolution follows re-exports.** A call resolves through the name a module publishes (#1682), a method on a type imported through a re-export (#1664), and a namespace member through the whole re-export chain (#1672).
+- **`dispatches_to` edges** link a base method to the implementations that answer for it (#1649), and a framework-wired symbol to the symbol it is wired to (#1654).
+- **Every call edge records the strategy that resolved it** (#1628), and the web UI says how each edge got into the graph (#1652). An execution flow now says why it stopped instead of just stopping (#1650).
+- **Security findings carry a verified line and a commit date** (#1668).
+- **Pascal is registered in the complexity, duplication and dataflow dialects**, so health scores it like the other 18 languages (#1629).
+
+### Changed
+
+- **The file detail page is ported onto the design language** (#1621) and gained inbound and outbound navigation (#1622).
+- **The workspace System Map moves its chrome off the canvas**, and the per-repo view works (#1616).
+- **Dead code surfaces staleness on the web** and drops the package column (#1669).
+- **`this.method()` self-dispatch is recorded in six languages** (#1617).
+- **Export aliases are read from the parser** rather than a second scan of the file (#1683).
+
+### Fixed
+
+- **An extraction change now reaches unchanged files.** An incremental update rewrote only the git-changed files' rows in `graph_edges`, which is right for a content change and wrong for a parser change: the latter alters every file's edges at once. The build that wrote a repo's edges is now recorded, and a mismatch widens the reconcile to the whole parsed set once before re-stamping. Without this, none of this release's graph work would reach an existing index short of a full re-index. (#1619)
+- **Dead-code analysis no longer skips itself on update.** Stored commit timestamps came back without a timezone while freshly read ones carried one, so ageing a package raised `TypeError`, a broad catch turned it into a one-line warning, and every finding silently kept its previous verdict. Present since 0.40.0. (#1702)
+- **Symbols reached by a framework or a container** (#1673), **wired in by a registration decorator** (#1681), or **named by a docs build or an API dump** (#1677) are no longer reported as dead.
+- **Every use of a private symbol counts**, not only a call (#1662). Only genuinely narrow scopes stay in the uncalled-symbol pool (#1646), and a top-tier confidence means the checks behind it ran (#1666).
+- **C and C++**: a forward-declared type is not an unused export (#1700), nor is a template forward declaration (#1703); a call edge attaches to the definition rather than the header declaration (#1626); a function named but never called counts as a use (#1627); `.inl` / `.ipp` / `.tpp` (#1625) and `.hh` are recognised as C++, and `.inc` is reassigned from Pascal (#1693).
+- **Every language gives one answer for a type's bare name** (#1634). A struct field is not callable, so the bare-name tier no longer offers one (#1692), and Rust type positions are filed as `type_use` rather than calls (#1690).
+- **Inheritance is emitted for JavaScript classes** (#1636) and Go interface embedding (#1641). C# resolves inherited calls again (#1651), captures generic method calls (#1637), and records the visibility a declaration actually has (#1644).
+- **A third-party JVM import no longer takes a same-named repo class** (#1659). A Go method whose receiver is unexported is typed (#1676). A workspace package that publishes only from a build directory binds correctly (#1670).
+- **A method passed as a value is separated from a method called** (#1661).
+- **MCP**: four tools answered a bad argument with a reassuring negative instead of an error (#1671); `get_context` counted a subclass and a fixture as callers (#1663); raw doubles and two different scales shipped under one key (#1631). The symbol page made the same subclass mistake (#1660).
+- **A failed framework pass is reported** rather than swallowed (#1645).
+- **`repowise update --full` runs under the single-flight lock** (#1529), and the incremental hotspot gate reuses the persisted function-modification p80 (#1532).
+- **ADR discovery no longer mines paths git cannot see** (#1614), the security history scanner actually scans (#1667), and fix history ignores the shallow-clone boundary (#1633).
+
+### Performance
+
+- **Graph build stops re-reading the repository** (#1648), and each language gets a call-strategy seam that rejects unresolvable names first (#1632).
+- **The file page stops reading the whole repo to render one file** (#1618).
+- **Workspace `.csproj` scanning walks each repo once** (#1615).
+
+### Documentation
+
+- The language-support pages are rewritten, a graph layer page is added, and the claims that pointed at them are corrected (#1689).
 
 ---
 

@@ -256,6 +256,7 @@ export type ResolutionOrigin =
   | "crate_root"
   | "receiver_import"
   | "import_merged"
+  | "scoped_name"
   | "same_target"
   | "receiver_global"
   | "global_unique"
@@ -271,6 +272,10 @@ export type ResolutionOrigin =
   | "receiver_framework_same_package"
   | "receiver_framework_import"
   | "receiver_framework_global"
+  | "return_type_same_file"
+  | "return_type_same_package"
+  | "return_type_import"
+  | "return_type_global"
   | "self_inherited"
   | "enclosing_inherited";
 
@@ -371,6 +376,8 @@ export interface GraphMetrics {
   pagerank_percentile: number;
   betweenness: number;
   betweenness_percentile: number;
+  /** False when the node appeared after the last exact centrality scoring. */
+  betweenness_scored?: boolean;
   community_id: number;
   community_label: string | null;
   is_entry_point: boolean;

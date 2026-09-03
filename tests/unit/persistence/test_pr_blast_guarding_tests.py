@@ -106,7 +106,12 @@ async def test_guarding_tests_map_empty_is_honest_unknown(async_session):
     result = await analyzer._guarding_tests(["src/math.py"])
 
     # No map -> "unknown", never an empty-because-untested claim.
-    assert result == {"map_present": False, "tests_to_run": [], "by_file": {}}
+    assert result["map_present"] is False
+    assert result["basis"] == "none"
+    assert result["tests_to_run"] == []
+    assert result["by_file"] == {}
+    assert result["coverage"]["status"] == "unavailable"
+    assert result["analysis"]["partial"] is True
 
 
 async def test_guarding_tests_file_with_no_rows_omitted_but_map_present(async_session):
@@ -134,4 +139,107 @@ async def test_guarding_tests_empty_changed_set(async_session):
     analyzer = PRBlastRadiusAnalyzer(async_session, repo.id)
     result = await analyzer._guarding_tests([])
 
-    assert result == {"map_present": False, "tests_to_run": [], "by_file": {}}
+    assert result["map_present"] is False
+    assert result["basis"] == "none"
+    assert result["tests_to_run"] == []
+    assert result["by_file"] == {}
+    assert result["coverage"]["reason"] == "no_changed_files"
+
+
+# ---------------------------------------------------------------------------
+# The graph fallback: what happens on the repos with no coverage report at all
+# ---------------------------------------------------------------------------
+
+
+def _graph(session, repo_id, nodes, edges):
+    from repowise.core.persistence.models import GraphEdge, GraphNode
+
+    for path, is_test in nodes:
+        session.add(
+            GraphNode(repository_id=repo_id, node_id=path, node_type="file", is_test=is_test)
+        )
+    for src, dst in edges:
+        session.add(
+            GraphEdge(
+                repository_id=repo_id,
+                source_node_id=src,
+                target_node_id=dst,
+                edge_type="imports",
+            )
+        )
+
+
+async def test_no_map_falls_back_to_the_graph_and_says_so(async_session):
+    repo = await insert_repo(async_session)
+    _graph(
+        async_session,
+        repo.id,
+        [("tests/test_math.py", True), ("src/math.py", False)],
+        [("tests/test_math.py", "src/math.py")],
+    )
+    await async_session.commit()
+
+    result = await PRBlastRadiusAnalyzer(async_session, repo.id)._guarding_tests(["src/math.py"])
+
+    # map_present stays the measured-map flag it always was; basis is what tells
+    # a caller which of the two answered, and the two are never merged.
+    assert result["map_present"] is False
+    assert result["basis"] == "inferred"
+    assert result["tests_to_run"] == ["tests/test_math.py"]
+    assert result["by_file"] == {"src/math.py": ["tests/test_math.py"]}
+
+
+async def test_measured_and_inferred_rows_remain_distinguishable(async_session):
+    """Both sources may answer, but the inferred row is never called measured."""
+    repo = await insert_repo(async_session)
+    await _seed_map(async_session, repo.id)
+    _graph(
+        async_session,
+        repo.id,
+        [("tests/test_unrelated.py", True), ("src/math.py", False)],
+        [("tests/test_unrelated.py", "src/math.py")],
+    )
+    await async_session.commit()
+
+    analyzer = PRBlastRadiusAnalyzer(async_session, repo.id)
+    result = await analyzer._guarding_tests(["src/math.py"])
+    typed = await analyzer._test_impact(["src/math.py"])
+
+    assert result["basis"] == "measured"
+    rows = {row["test_id"]: row for row in result["tests_to_run_with_basis"]}
+    assert rows["tests/test_math.py::test_add"]["basis"] == "measured"
+    assert rows["tests/test_math.py::test_sub"]["basis"] == "measured"
+    assert "tests/test_unrelated.py" not in rows
+    typed_rows = {row["test_id"]: row for row in typed["recommendations"]}
+    assert typed_rows["tests/test_unrelated.py"]["basis"] == "inferred"
+    assert typed_rows["tests/test_unrelated.py"]["bases"] == ["inferred"]
+
+
+async def test_a_map_that_is_silent_about_this_file_still_asks_the_graph(async_session):
+    """The map exists but knows nothing here - better than an empty list."""
+    repo = await insert_repo(async_session)
+    await _seed_map(async_session, repo.id)
+    _graph(
+        async_session,
+        repo.id,
+        [("tests/test_new.py", True), ("src/new.py", False)],
+        [("tests/test_new.py", "src/new.py")],
+    )
+    await async_session.commit()
+
+    result = await PRBlastRadiusAnalyzer(async_session, repo.id)._guarding_tests(["src/new.py"])
+
+    assert result["map_present"] is True
+    assert result["basis"] == "inferred"
+    assert result["tests_to_run"] == ["tests/test_new.py"]
+
+
+async def test_nothing_anywhere_stays_an_honest_unknown(async_session):
+    repo = await insert_repo(async_session)
+    _graph(async_session, repo.id, [("src/lonely.py", False)], [])
+    await async_session.commit()
+
+    result = await PRBlastRadiusAnalyzer(async_session, repo.id)._guarding_tests(["src/lonely.py"])
+
+    assert result["basis"] == "none"
+    assert result["tests_to_run"] == []

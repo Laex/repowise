@@ -25,6 +25,8 @@ import type {
   CoverageFileRow,
   HealthCoverageResponse,
   HealthFinding,
+  InferredTestMap,
+  ReachedFileRow,
 } from "@repowise-dev/types/health";
 
 import { Skeleton } from "../ui/skeleton";
@@ -42,6 +44,7 @@ import {
   type UntestedHotspotEntry,
 } from "./untested-hotspot-warning";
 import { RiskCoverageScatter } from "./risk-coverage-scatter";
+import { InferredTestsView } from "./inferred-tests-view";
 import {
   buildCoverageAiPrompt,
   type CoverageFilePromptInput,
@@ -81,9 +84,24 @@ export function CoverageView({ adapter }: { adapter: CodeHealthAdapter }) {
           title="Couldn't load coverage data"
           description="The coverage endpoint returned an error. Try refreshing, or re-run the health pass."
         />
+      ) : data?.basis === "inferred" && data.inferred ? (
+        // No report was ever ingested, and the graph can answer anyway. This
+        // branch never renders a measured field: the two bases are separate
+        // objects in the payload precisely so one cannot leak into the other's
+        // code path.
+        <InferredTestsView
+          data={data}
+          untestedFindings={untestedFindings ?? []}
+          onOpenFile={openFilePage}
+        />
       ) : !data || data.summary.file_count === 0 ? (
         <NoCoverageState />
       ) : (
+        // A report was ingested. `data.inferred` may also be present: when the
+        // report never mentioned some files, the graph answers for exactly
+        // those, and a separate section renders it. The measured body and the
+        // inferred gap stay apart — no percentage is ever derived from the
+        // inferred map.
         <CoverageBody
           data={data}
           untestedFindings={untestedFindings ?? []}
@@ -347,7 +365,7 @@ function CoverageBody({
             });
           }}
           title="Generate AI test prompt for this file"
-          className="inline-flex items-center justify-center rounded-md p-1 text-[var(--color-text-tertiary)] hover:text-[var(--color-success)] hover:bg-[var(--color-success)]/10 transition-colors"
+          className="inline-flex items-center justify-center rounded-md p-1 text-[var(--color-text-tertiary)] hover:text-[var(--color-model)] hover:bg-[var(--color-model-muted)] transition-colors"
         >
           <Sparkles className="h-3.5 w-3.5" />
         </button>
@@ -366,7 +384,7 @@ function CoverageBody({
 
       <OverviewSection
         title="Health against coverage"
-        description="Every instrumented file placed by its defect-risk score and its line coverage, sized by lines of code. The bottom-left quadrant is the one that costs money: code we score as weak, with no test watching it. Click a file to open its line-level heatmap."
+        description="Every instrumented file placed by its 0–10 defect-health score (higher is healthier) and its line coverage, sized by lines of code. The bottom-left quadrant is the one that costs money: code we score as weak, with no test watching it. Click a file to open its line-level heatmap."
       >
         <RiskCoverageScatter
           points={scatterPoints}
@@ -442,26 +460,142 @@ function CoverageBody({
           </p>
         ) : null}
       </OverviewSection>
+
+      {data.inferred ? <CoverageGap data={data} onOpenFile={onOpenFile} /> : null}
     </div>
   );
 }
 
 /**
- * Says what will fill the page, not that something is missing. The two commands
- * are the whole setup, so they are the content rather than a footnote under a
- * dashed placeholder box.
+ * The files the ingested coverage report never mentioned, answered by the graph.
+ *
+ * This is the hybrid shape: a report exists (so `basis` is `measured` and the
+ * measured body above renders it), but the report's lcov source covered only a
+ * subset of the repo. Every other file was invisible on the Tests tab — not
+ * unindexed and not untested, just never named by the report. The graph knows
+ * whether a test reaches those files, and this section says that.
+ *
+ * It honours the same rules as the pure-inferred view: counts only, no bar and
+ * no percentage (reaching is a file-level fact with no line attribution), and
+ * no health-band colour. `files_total` here is the count of non-measured files,
+ * stated beside `measured_file_count` so the split is explicit.
+ */
+function CoverageGap({
+  data,
+  onOpenFile,
+}: {
+  data: HealthCoverageResponse;
+  onOpenFile: (path: string) => void;
+}) {
+  const map = data.inferred as InferredTestMap;
+  const measured = map.measured_file_count ?? 0;
+  const unreached = map.files.filter((f) => !f.reached);
+
+  return (
+    <OverviewSection
+      title="Files the report didn't cover"
+      description={
+        map.files_total > 0
+          ? `Your coverage report named ${measured.toLocaleString()} files. The dependency graph answers for the other ${map.files_total.toLocaleString()}: ${map.files_reached.toLocaleString()} are reached by a test, ${map.files_not_reached.toLocaleString()} are not. Reaching is not executing, so treat it as a floor, not a measurement.`
+          : "The dependency graph could not answer for the files the coverage report left out."
+      }
+    >
+      <div className="border-t border-[var(--color-border-default)]">
+        <ResponsiveTable
+          columns={gapColumns}
+          rows={unreached.slice(0, 50)}
+          rowKey={(f) => f.file_path}
+          onRowClick={(f) => onOpenFile(f.file_path)}
+          stacked="sm"
+          bare
+          empty={
+            <EmptyState
+              title="Every file is reached"
+              description="The graph found a test that reaches every file the coverage report didn't name."
+            />
+          }
+        />
+      </div>
+    </OverviewSection>
+  );
+}
+
+const gapColumns: ResponsiveColumn<ReachedFileRow>[] = [
+  {
+    key: "file_path",
+    header: "File",
+    priority: 1,
+    render: (f) => (
+      <span
+        className="block truncate font-mono text-xs text-[var(--color-text-primary)]"
+        title={f.file_path}
+      >
+        {f.file_path}
+      </span>
+    ),
+  },
+  {
+    key: "reached",
+    header: "Reached",
+    priority: 1,
+    render: (f) => (
+      <span className="text-xs text-[var(--color-text-secondary)]">
+        {f.reached ? "yes" : "no"}
+      </span>
+    ),
+  },
+  {
+    key: "nloc",
+    header: "Lines",
+    priority: 3,
+    align: "right",
+    render: (f) => (
+      <span className="tabular-nums text-[var(--color-text-tertiary)]">
+        {f.nloc ?? "—"}
+      </span>
+    ),
+  },
+  {
+    key: "health_score",
+    header: "Health",
+    priority: 2,
+    align: "right",
+    render: (f) =>
+      f.health_score == null ? (
+        <span className="text-[var(--color-text-tertiary)]">—</span>
+      ) : (
+        <span
+          className={`inline-block rounded px-1.5 py-0.5 text-xs font-semibold ${scoreBadgeClass(f.health_score)}`}
+        >
+          {f.health_score.toFixed(1)}
+        </span>
+      ),
+  },
+];
+
+/**
+ * The last resort: no report, and the graph had nothing to say either — an
+ * unindexed repository, or one with no test files at all. When the graph *can*
+ * answer, `InferredTestsView` renders instead and the reader never reaches here.
+ *
+ * It used to be the only thing behind "no coverage", and it claimed "Nothing is
+ * inferred: we read the lines your tests really executed" — which stopped being
+ * true once the graph could answer, and turned a solved question into a wall.
+ * What is left is the honest version: this is genuinely unknown, and here is
+ * what would fill it.
  */
 function NoCoverageState() {
   return (
     <div className="flex max-w-[62ch] flex-col gap-3">
       <h2 className="text-base font-semibold text-[var(--color-text-primary)]">
-        No coverage report ingested yet
+        Nothing here can say whether your code is tested
       </h2>
       <p className="text-[13px] leading-relaxed text-[var(--color-text-secondary)] [text-wrap:pretty]">
-        Run your test suite with coverage on and hand us the report. This tab then
-        plots every file by health against coverage, names the files where a gap
-        actually costs something, and rolls the numbers up per directory. Nothing is
-        inferred: we read the lines your tests really executed.
+        No coverage report has been ingested, and the dependency graph found no
+        test files to trace either. Either would fill this tab: a report gives the
+        lines your tests executed, and the graph alone can name which tests reach
+        which files with no setup at all. Run your suite with coverage on and hand
+        us the report.
       </p>
       <pre className="w-fit overflow-x-auto rounded-md bg-[var(--color-bg-inset)] px-3 py-2 font-mono text-xs text-[var(--color-text-primary)]">
         pytest --cov --cov-report=lcov{"\n"}

@@ -1,4 +1,8 @@
-"""Refactoring-target ranking route (impact / effort)."""
+"""Health work/triage queue (impact / effort).
+
+The legacy URL is retained for compatibility; these file-level findings are
+not structured refactoring plans.
+"""
 
 from __future__ import annotations
 
@@ -7,12 +11,13 @@ from typing import Any
 from fastapi import Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from repowise.core.analysis.health.models import primary_finding
 from repowise.core.analysis.health.suggestions import suggestion_for as _suggestion_for
 from repowise.core.persistence import crud
 from repowise.server.deps import get_db_session
+from repowise.server.schemas import HealthWorkQueueResponse
 
 from ._router import router
-from .aggregation import _clean_module
 
 _SEVERITY_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 
@@ -46,8 +51,11 @@ def _effort_for_nloc(nloc: int) -> str:
     return "XL"
 
 
-@router.get("/api/repos/{repo_id}/health/refactoring-targets")
-async def refactoring_targets(
+@router.get(
+    "/api/repos/{repo_id}/health/refactoring-targets",
+    response_model=HealthWorkQueueResponse,
+)
+async def health_work_queue(
     repo_id: str,
     limit: int = Query(200, ge=1, le=500),
     module: str | None = Query(None, description="Filter to files in this module path"),
@@ -59,7 +67,7 @@ async def refactoring_targets(
     ),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict:
-    """Refactoring candidates ranked by impact / effort.
+    """Health work items ranked by impact / effort.
 
     A target carries its *primary* finding plus ``finding_count``, not the
     findings themselves. Serializing every file's full finding list here cost
@@ -97,7 +105,7 @@ async def refactoring_targets(
         m = metric_by_path.get(file_path)
         nloc = m.nloc if m is not None else 0
         score = m.score if m is not None else 10.0
-        primary = max(fs, key=lambda x: x.health_impact)
+        primary = primary_finding(fs)
         total_impact = round(sum(x.health_impact for x in fs), 3)
         effort_bucket = _effort_for_nloc(nloc)
         if effort_rank[effort_bucket] > max_effort_rank:
@@ -109,7 +117,7 @@ async def refactoring_targets(
                 "file_path": file_path,
                 "score": round(score, 2),
                 "nloc": nloc,
-                "module": _clean_module(m.module) if (m and m.module) else None,
+                "module": m.module if (m and m.module) else None,
                 "primary_biomarker": primary.biomarker_type,
                 "primary_severity": primary.severity,
                 "primary_reason": primary.reason,
