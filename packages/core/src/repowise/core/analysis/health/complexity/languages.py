@@ -806,33 +806,30 @@ _PASCAL = LanguageNodeMap(
 )
 
 
-_ELIXIR = LanguageNodeMap(
-    function_kinds=frozenset({"call"}),
-    lambda_kinds=frozenset(),
-    branch_kinds=frozenset(),
-    loop_kinds=frozenset(),
-    try_kinds=frozenset(),
-    catch_kinds=frozenset(),
-    switch_kinds=frozenset(),
-    case_kinds=frozenset(),
-    boolean_operator_kinds=frozenset(),
-    class_kinds=frozenset(),
-    self_identifiers=frozenset(),
-    member_access_kinds=frozenset(),
-    assert_call_kinds=frozenset({"call"}),
-    call_kinds=frozenset({"call"}),
-)
+# Elixir has no entry on purpose. tree-sitter-elixir gives ``defmodule``,
+# ``def``, ``defp`` and an ordinary call the same ``call`` node, told apart
+# only by the target's identifier text, which a set of node types cannot
+# express. Mapping ``call`` reports the module as the file's only function, so
+# until function kinds can carry a text predicate, no entry and no rows.
 
 
+# Known undercount, in the walker rather than this map: ``walk_file`` walks the
+# body node's children, so a body that IS one expression loses it and
+# ``let f x = if x > 0 then 1 else 2`` scores 1.
 _FSHARP = LanguageNodeMap(
     function_kinds=frozenset({"function_or_value_defn", "member_defn"}),
     lambda_kinds=frozenset(),
     branch_kinds=frozenset({"if_expression"}),
     loop_kinds=frozenset({"for_expression", "while_expression"}),
     try_kinds=frozenset({"try_expression"}),
+    # A ``with`` handler and a ``match`` arm are the same node types here, so
+    # one field has to serve both. ``case_kinds`` names ``rules``, the wrapper,
+    # which counts the dispatch once; naming ``rule``, the arm, would score a
+    # flat three-arm match 4 against Rust's 2. So a multi-handler ``with``
+    # counts 1 rather than one per clause.
     catch_kinds=frozenset(),
     switch_kinds=frozenset({"match_expression"}),
-    case_kinds=frozenset(),
+    case_kinds=frozenset({"rules"}),
     boolean_operator_kinds=frozenset(),
     class_kinds=frozenset({"anon_type_defn", "record_type_defn", "union_type_defn", "enum_type_defn"}),
     self_identifiers=frozenset(),
@@ -844,12 +841,21 @@ _FSHARP = LanguageNodeMap(
 
 
 _OBJC = LanguageNodeMap(
-    function_kinds=frozenset({"function_definition", "method_definition", "declaration"}),
-    lambda_kinds=frozenset(),
+    # ``declaration`` covers every file-scope global and prototype here, so it
+    # is a local decl rather than a function kind, as in ``_C``. It is also a
+    # recursion boundary: as a function kind it stopped the walker descending
+    # into a declaration, so a ternary in an initialiser counted nothing.
+    function_kinds=frozenset({"function_definition", "method_definition"}),
+    # A file-scope block is a ``declaration``, so name the block itself to keep
+    # its complexity now that ``declaration`` is not a function kind.
+    lambda_kinds=frozenset({"block_literal"}),
     branch_kinds=frozenset({"if_statement", "conditional_expression"}),
-    loop_kinds=frozenset({"for_statement", "while_statement", "do_statement", "for_in_statement"}),
+    # Fast enumeration parses as ``for_statement``; there is no
+    # ``for_in_statement`` node in this grammar.
+    loop_kinds=frozenset({"for_statement", "while_statement", "do_statement"}),
     try_kinds=frozenset({"try_statement"}),
-    catch_kinds=frozenset(),
+    # TRY only opens a nesting level; CATCH is what adds to CCN.
+    catch_kinds=frozenset({"catch_clause"}),
     switch_kinds=frozenset({"switch_statement"}),
     case_kinds=frozenset({"case_statement"}),
     boolean_operator_kinds=frozenset(),
@@ -896,7 +902,7 @@ LANGUAGE_MAPS: dict[str, LanguageNodeMap] = {
     "ruby": _RUBY,
     "shell": _SHELL,
     "pascal": _PASCAL,
-    "elixir": _ELIXIR,
+    # No "elixir" entry on purpose. See the note above ``_FSHARP``.
     "fsharp": _FSHARP,
     "objectivec": _OBJC,
 }
