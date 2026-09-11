@@ -806,6 +806,70 @@ _PASCAL = LanguageNodeMap(
 )
 
 
+_ELIXIR = LanguageNodeMap(
+    function_kinds=frozenset({"call"}),
+    lambda_kinds=frozenset(),
+    branch_kinds=frozenset(),
+    loop_kinds=frozenset(),
+    try_kinds=frozenset(),
+    catch_kinds=frozenset(),
+    switch_kinds=frozenset(),
+    case_kinds=frozenset(),
+    boolean_operator_kinds=frozenset(),
+    class_kinds=frozenset(),
+    self_identifiers=frozenset(),
+    member_access_kinds=frozenset(),
+    assert_call_kinds=frozenset({"call"}),
+    call_kinds=frozenset({"call"}),
+)
+
+
+_FSHARP = LanguageNodeMap(
+    function_kinds=frozenset({"function_or_value_defn", "member_defn"}),
+    lambda_kinds=frozenset(),
+    branch_kinds=frozenset({"if_expression"}),
+    loop_kinds=frozenset({"for_expression", "while_expression"}),
+    try_kinds=frozenset({"try_expression"}),
+    catch_kinds=frozenset(),
+    switch_kinds=frozenset({"match_expression"}),
+    case_kinds=frozenset(),
+    boolean_operator_kinds=frozenset(),
+    class_kinds=frozenset({"anon_type_defn", "record_type_defn", "union_type_defn", "enum_type_defn"}),
+    self_identifiers=frozenset(),
+    member_access_kinds=frozenset(),
+    assert_call_kinds=frozenset({"application_expression"}),
+    call_kinds=frozenset({"application_expression"}),
+    if_kinds=frozenset({"if_expression"}),
+)
+
+
+_OBJC = LanguageNodeMap(
+    function_kinds=frozenset({"function_definition", "method_definition", "declaration"}),
+    lambda_kinds=frozenset(),
+    branch_kinds=frozenset({"if_statement", "conditional_expression"}),
+    loop_kinds=frozenset({"for_statement", "while_statement", "do_statement", "for_in_statement"}),
+    try_kinds=frozenset({"try_statement"}),
+    catch_kinds=frozenset(),
+    switch_kinds=frozenset({"switch_statement"}),
+    case_kinds=frozenset({"case_statement"}),
+    boolean_operator_kinds=frozenset(),
+    boolean_operator_text_kinds=frozenset({"binary_expression"}),
+    class_kinds=frozenset({"class_interface", "class_implementation", "protocol_declaration"}),
+    self_identifiers=frozenset({"self"}),
+    member_access_kinds=frozenset(),
+    assert_call_kinds=frozenset({"message_expression", "call_expression"}),
+    call_kinds=frozenset({"message_expression", "call_expression"}),
+    assignment_kinds=frozenset({"assignment_expression"}),
+    local_decl_kinds=frozenset({"declaration"}),
+    if_kinds=frozenset({"if_statement"}),
+    block_kinds=frozenset({"compound_statement"}),
+    return_kinds=frozenset({"return_statement"}),
+    raise_kinds=frozenset(),
+    break_kinds=frozenset({"break_statement"}),
+    continue_kinds=frozenset({"continue_statement"}),
+)
+
+
 LANGUAGE_MAPS: dict[str, LanguageNodeMap] = {
     "python": _PY,
     "typescript": _TS,
@@ -832,6 +896,9 @@ LANGUAGE_MAPS: dict[str, LanguageNodeMap] = {
     "ruby": _RUBY,
     "shell": _SHELL,
     "pascal": _PASCAL,
+    "elixir": _ELIXIR,
+    "fsharp": _FSHARP,
+    "objectivec": _OBJC,
 }
 
 
