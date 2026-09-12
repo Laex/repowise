@@ -2,7 +2,7 @@
 
 Complete reference for all `repowise` commands. For a guided introduction, see the [Quickstart](../start/QUICKSTART.md).
 
-Command list (in registration order): `augment`, `init`, `delete`, `generate-claude-md`, `costs`, `update`, `generate`, `dead-code`, `health`, `risk`, `decision`, `coverage`, `impacted-tests`, `search`, `ask`, `context`, `symbol`, `why`, `distill`, `expand`, `saved`, `security`, `corrections`, `export`, `hook`, `agents`, `uninstall`, `status`, `doctor`, `watch`, `serve`, `mcp`, `reindex`, `restyle`, `wiki-styles`, `whats-new`, `telemetry`, `login`, `logout`, `whoami`, `workspace`. Two more ship as separate console scripts, not subcommands: `repowise-augment`, `repowise-rewrite` (both hook entry points, not meant to be run by hand).
+Command list (in registration order): `augment`, `init`, `delete`, `generate-claude-md`, `costs`, `update`, `generate`, `dead-code`, `health`, `risk`, `overlap`, `decision`, `coverage`, `impacted-tests`, `search`, `ask`, `context`, `symbol`, `why`, `distill`, `expand`, `saved`, `security`, `corrections`, `export`, `hook`, `agents`, `uninstall`, `status`, `doctor`, `watch`, `serve`, `mcp`, `reindex`, `restyle`, `wiki-styles`, `whats-new`, `telemetry`, `login`, `logout`, `whoami`, `workspace`. Two more ship as separate console scripts, not subcommands: `repowise-augment`, `repowise-rewrite` (both hook entry points, not meant to be run by hand).
 
 **Do you need an LLM key?** Most commands are pure index/analysis and never call an LLM. `init` never requires a key: without one it renders the wiki from structure. It calls an LLM only when a provider is resolvable or `--prose` is passed. The exceptions: `update` (unless `--index-only` or `--no-docs`), `generate`, `restyle`, `watch` (when it regenerates a page), `health --generate-code`, and `workspace add --docs`. Everything else, `search`, `dead-code`, `health`, `risk`, `impacted-tests`, `decision`, `coverage`, `security`, `export`, `mcp`, `reindex`, `doctor`, and so on, works index-only, with no provider configured.
 
@@ -31,6 +31,7 @@ Grouped by what you're trying to do, not alphabetically. `PATH` and flag details
 **Health and risk**
 [`health`](#repowise-health-path) ·
 [`risk`](#repowise-risk-revspec) ·
+[`overlap`](#repowise-overlap) ·
 [`dead-code`](#repowise-dead-code-path) ·
 [`security`](#repowise-security) ·
 [`impacted-tests`](#repowise-impacted-tests-revspec) ·
@@ -171,7 +172,8 @@ All three reach the indexing knobs; the LLM-only knobs appear only when model-wr
 | `--agents` / `--no-agents` | Generate or skip managed `AGENTS.md` for Codex. Persists the preference. |
 | `--codex` / `--no-codex` | Generate or skip project-local Codex MCP/hooks setup. Interactive runs prompt when Codex CLI is installed and logged in; non-interactive runs require `--codex`. |
 | `--distill-hook` / `--no-distill-hook` | Install or skip the Distill command-rewrite hook (Claude Code PreToolUse). Strictly opt-in: interactive runs prompt (default No); `--no-distill-hook` also gates the repo off in config so a globally installed hook stays inert here. In workspace mode the verdict applies to every selected repo. See [DISTILL.md](../agent/DISTILL.md). |
-| `--editor-setup` / `--no-editor-setup` | Wire repowise into your editors, both halves at once. Machine-wide: the Claude Code (`~/.claude/settings.json`) and Claude Desktop MCP server entry, plus the Claude Code PostToolUse/SessionStart hooks. Project-local: `.mcp.json`, `.claude/CLAUDE.md`, `.vscode/mcp.json`, `.vscode/extensions.json`. Default: on. `--no-editor-setup` indexes the repo writing nothing into it and nothing outside it — only `.repowise/` is touched — which is what you want for a scratch checkout, a throwaway venv, a git worktree, or a CI run: each config holds a single `repowise` MCP key, so a second `init` repoints it at the newest repo instead of adding a second entry. `repowise mcp .` still prints the config to connect a client by hand. It also skips the `--distill-hook` offer, which installs a user-level hook; `--no-distill-hook`, `--no-claude-md` and `--no-agents-md` still record their opt-outs in this repo's config, because those flags mean "never", not "not this run". `REPOWISE_SKIP_EDITOR_SETUP=1` is the same switch for CI and sandboxes, and it wins: with it set, an explicit `--editor-setup` does not turn setup back on. |
+| `--hook` / `--no-hook` | Install or skip the post-commit hook that runs `repowise update` after each commit. Default: on. Interactive runs ask; `--yes` and non-interactive runs install it and print how to undo it (`repowise hook uninstall`). `--no-editor-setup` skips it too, since a git hook is a write outside `.repowise/`. In workspace mode the choice applies to every selected repo. |
+| `--editor-setup` / `--no-editor-setup` | Wire repowise into your editors, both halves at once. Machine-wide: the Claude Code (`~/.claude/settings.json`) and Claude Desktop MCP server entry, plus the Claude Code PostToolUse/SessionStart hooks. Project-local: `.mcp.json`, `.claude/CLAUDE.md`, `.vscode/mcp.json`, `.vscode/extensions.json`. Default: on. `--no-editor-setup` indexes the repo writing nothing into it and nothing outside it — only `.repowise/` is touched — which is what you want for a scratch checkout, a throwaway venv, a git worktree, or a CI run: each config holds a single `repowise` MCP key, so a second `init` repoints it at the newest repo instead of adding a second entry. `repowise mcp .` still prints the config to connect a client by hand. It also skips the post-commit auto-sync hook (a write into the git hooks directory) and the `--distill-hook` offer, which installs a user-level hook; `--no-distill-hook`, `--no-claude-md` and `--no-agents-md` still record their opt-outs in this repo's config, because those flags mean "never", not "not this run". `REPOWISE_SKIP_EDITOR_SETUP=1` is the same switch for CI and sandboxes, and it wins: with it set, an explicit `--editor-setup` does not turn setup back on. |
 | `--save-key` / `--no-save-key` | Save the provider API key this run authenticated with into `.repowise/.env` (git-ignored, owner-only). Default: on, because a scripted `init` that succeeds must leave a repo whose MCP server can actually answer, and a key supplied through the environment would otherwise vanish with the shell that set it. The file is what `repowise mcp`, `serve` and `update` read back; without it `get_answer` degrades to `no-llm-provider` and returns retrieval-only output. Use `--no-save-key` when the key is injected per-process (CI secrets, a shared machine) and must not reach disk; `REPOWISE_NO_SAVE_KEY=1` is the same switch for CI and sandboxes. Answering No to the interactive key prompt also wins over the default. Note this writes one line to the repo's `.gitignore`, so pair it with `--no-save-key` when you need `--no-editor-setup`'s "nothing written into the repo" guarantee. |
 | `--seed-from` | Seed the index from an explicit base checkout instead of the auto-detected one. Rarely needed: inside a linked git worktree the base is detected and seeded automatically. See [WORKTREES.md](../scale/WORKTREES.md). |
 | `--no-seed` | Disable worktree auto-seeding and run a full init even inside a linked worktree. |
@@ -779,7 +781,55 @@ repowise risk -t src/auth.py --changed-file src/auth.py  # PR mode + directive
 Note `--path` on this command already means "the git repository", which is why
 the files are named with `--target`.
 
+**Independent changes.** When the index can be read, the command also prints
+whether the diff is one change or several: the changed files grouped by what
+connects them, which is the links the index holds (imports, calls, type
+references, stored co-change pairs) plus, for a `base..head` range, the files each
+commit touched, since putting two files in one commit is the author's own
+statement that they belong together. Only indexed, non-test source files a
+resolver can link are grouped; docs, config, data and tests are always printed
+under `Left out of the grouping:`, never as a change of their own, and only the
+first ten names are listed. Each group prints its files and the files that alone
+hold it together, where moving one out would split the group. A closing `Basis:`
+line says what was checked, naming a shared commit only when there were commits to
+read. It is silent when the diff is one change, and it carries no score.
+`--format json` puts the same object under `independent_changes`. See
+[Independent changes](../layers/CHANGE_RISK.md#independent-changes).
+
 See [`docs/layers/CHANGE_RISK.md`](../layers/CHANGE_RISK.md) for the scoring model.
+
+---
+
+### `repowise overlap`
+
+Which other open branches edit the files this change edits. Pure git for the
+answer, so it works in a fresh clone with no index; when an index is readable it
+orders the shared files and adds the files history pairs with them. Every row
+states its basis in words, `same file` or `co-change pair, N of M commits`, and
+there is no score anywhere in the output.
+
+Branches stacked on the current one (and the ones it is stacked on) are skipped,
+as are noise paths and dependency manifests, which every branch touches. A branch
+that shares no file produces no row. The scan is bounded to the newest branches by
+committer date and reports how many it scanned of how many exist.
+
+**Options:**
+
+| Flag | Description |
+|------|-------------|
+| `--base` | Base ref to diff both sides against (default: the repository's trunk, from `origin/HEAD`, else `main` or `master`) |
+| `--branch` | The change to compare (default: `HEAD`) |
+| `--path` | Path to the git repository (default: current directory) |
+| `--limit` | How many branches to diff, newest committer date first (default 50) |
+| `--format` | Output format: `table` (default) or `json` |
+
+```bash
+repowise overlap                             # who else is editing what you are editing
+repowise overlap --base main --limit 100     # a wider scan against an explicit base
+```
+
+When nothing overlaps, the command prints one line saying so with the scan
+counts. See [Branch overlap](../layers/CHANGE_RISK.md#branch-overlap).
 
 ---
 
@@ -876,6 +926,8 @@ Compute per-file code-health scores from 49 deterministic detectors (McCabe comp
 |------|-------------|
 | `--file <path>` | Deep-dive a single file (relative path) |
 | `--module <prefix>` | Restrict the report to files whose path starts with this prefix |
+| `--scope` | `all` (default) or `production`. Which files every figure describes. Tests score higher than production code, so narrowing lowers the number without a defect being found. |
+| `--counts` | `everything` (default) or `code_shape`. `code_shape` drops the git-derived half of the deduction, which rises as a file is worked on — the reading that answers whether the code itself is improving. |
 | `--refactoring-targets` | Print structured, graph-aware refactoring plans (Extract Class / Helper / Move Method / Break Cycle), ranked `impact × centrality × blast radius`. See [REFACTORING.md](../layers/REFACTORING.md) |
 | `--generate-code <selector>` | Generate an actual refactoring patch for one target. The only `health` flag that calls an LLM; needs a configured provider. |
 | `--trend` | Print the last 10 health snapshots + any active alerts (declining / predicted decline) |
@@ -892,6 +944,7 @@ repowise health --module packages/server              # restrict to a directory
 repowise health --refactoring-targets                 # ranked by impact / effort
 repowise health --generate-code packages/server/app.py::handler   # LLM patch for one target
 repowise health --trend                               # snapshot history + alerts
+repowise health --counts code_shape                   # ignore the git-derived half
 repowise coverage add coverage.lcov   # ingest coverage, then:
 repowise health
 repowise health --format json | jq .kpis              # machine-readable
@@ -948,7 +1001,7 @@ repowise decision llm --on|--off [PATH]           # all decision-extraction mode
 | `--reason TEXT` | On `dismiss`: why it was tombstoned. |
 | `--superseded-by ID` | On `deprecate`: writes an explicit lineage edge and keeps the retired id resolving. |
 | `--state STATE` | On `candidates`: `open` (default), `accepted`, `merged`, `needs_split`, `dismissed`, `all`. |
-| `--lane NAME` | On `candidates`: only candidates raised by that extraction lane (`pr`, `session`, `session_discovery`, `comment`, `git_archaeology`, `adr`, `inline_marker`, `cli`). Unrelated to the review lanes the Decisions page splits on. |
+| `--lane NAME` | On `candidates`: only candidates raised by that extraction lane (`pr`, `session`, `session_discovery`, `comment`, `git_archaeology`, `adr`, `inline_marker`, `conventions`, `cli`). Unrelated to the review lanes the Decisions page splits on. |
 | `--apply` | On `migrate`: write the plan. Without it the command reports and writes nothing. |
 | `--dry-run` | On `import`: report and write nothing. |
 
@@ -1049,7 +1102,7 @@ typo from a successful transition. `dismiss` skips its confirmation prompt under
 | Flag | Description |
 |------|-------------|
 | `--status` | `active`, `proposed`, `deprecated`, `superseded`, `dismissed`, `all` |
-| `--source` | `adr`, `cli`, `comment`, `commit`, `git_archaeology`, `inline_marker`, `llm_inferred`, `pr`, `session`, `all` |
+| `--source` | `adr`, `cli`, `comment`, `commit`, `conventions`, `git_archaeology`, `inline_marker`, `llm_inferred`, `pr`, `session`, `all` |
 | `--proposed` | Shortcut for `--status proposed` |
 | `--stale-only` | Only stale decisions |
 | `--format` | `table` (default) or `json` |

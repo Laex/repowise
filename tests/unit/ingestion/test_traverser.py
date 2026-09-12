@@ -93,6 +93,39 @@ class TestLanguageDetection:
     def test_cpp_extension(self, tmp_path: Path) -> None:
         assert _detect_language(tmp_path / "calc.cpp") == "cpp"
 
+    def test_objectivec_header_is_routed_by_content(self, tmp_path: Path) -> None:
+        # One extension maps to one language repo-wide and ``.h`` belongs to
+        # C++, so an Objective-C header can only be told apart by what is in
+        # it: an @interface / @implementation / @protocol opening a line
+        # outside a comment is not valid C or C++.
+        f = tmp_path / "Widget.h"
+        f.write_text('#import <Foundation/Foundation.h>\n@interface Widget\n@end\n')
+        assert _detect_language(f) == "objectivec"
+
+    def test_a_protocol_declaration_is_enough(self, tmp_path: Path) -> None:
+        f = tmp_path / "Feeder.h"
+        f.write_text('@protocol Feeder <NSObject>\n- (void)feed;\n@end\n')
+        assert _detect_language(f) == "objectivec"
+
+    def test_a_doxygen_comment_does_not_route_a_cpp_header(self, tmp_path: Path) -> None:
+        # ``@interface`` and ``@class`` are also Doxygen commands, so an
+        # anywhere-in-the-file token match sent documented C++ headers to the
+        # Objective-C grammar.
+        f = tmp_path / "widget.h"
+        f.write_text(
+            '/**\n * @interface Widget\n * @class Widget\n */\n'
+            '// #import "legacy.h"\nclass Widget { int add(int a); };\n'
+        )
+        assert _detect_language(f) == "cpp"
+
+    def test_a_plain_c_header_stays_cpp(self, tmp_path: Path) -> None:
+        f = tmp_path / "calc.h"
+        f.write_text('#include <stdio.h>\nint add(int a, int b);\n')
+        assert _detect_language(f) == "cpp"
+
+    def test_a_dot_m_needs_no_sniff(self, tmp_path: Path) -> None:
+        assert _detect_language(tmp_path / "Widget.m") == "objectivec"
+
     def test_special_dockerfile(self, tmp_path: Path) -> None:
         assert _detect_language(tmp_path / "Dockerfile") == "dockerfile"
 
@@ -156,6 +189,35 @@ class TestFileTraverser:
         assert "Assets/Scripts/Game.cs" in paths
         assert not any(p.startswith("Library/") for p in paths)
         assert not any(p.startswith("Temp/") for p in paths)
+
+    def test_traverses_e2e_specs(self, tmp_path: Path) -> None:
+        """e2e spec files are indexed so they can get a file_page (#1497).
+
+        They used to be silently dropped via ``_BLOCKED_DIRS``, which left
+        the wiki unable to answer any test-infrastructure question with no
+        signal a whole area was missing. They are now indexed like other
+        tests and tagged ``is_test=True`` so they stay filterable.
+        """
+        (tmp_path / "apps" / "console" / "e2e" / "helpers").mkdir(parents=True)
+        (tmp_path / "apps" / "console" / "e2e" / "helpers" / "hydration.ts").write_text(
+            "export function hydrate() {}\n"
+        )
+        (tmp_path / "apps" / "console" / "e2e" / "fixtures.ts").write_text(
+            "export const fixtures = {};\n"
+        )
+        (tmp_path / "apps" / "console" / "e2e" / "login.spec.ts").write_text(
+            "it('works', () => {});\n"
+        )
+
+        traverser = FileTraverser(tmp_path)
+        infos = {f.path: f for f in traverser.traverse()}
+
+        assert "apps/console/e2e/helpers/hydration.ts" in infos
+        assert "apps/console/e2e/fixtures.ts" in infos
+        assert "apps/console/e2e/login.spec.ts" in infos
+        # Tagged as test material so consumers (skip_tests, scoring) can
+        # filter them without dropping them silently.
+        assert all(info.is_test for info in infos.values())
 
     def test_skips_unity_asset_extensions_before_binary_detection(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
