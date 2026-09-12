@@ -763,10 +763,43 @@ async def _persist_full_update_async(
             # detector computed decay_only all along but it was never
             # persisted.
             try:
-                from repowise.core.pipeline.persist import mark_stale_pages
+                from repowise.core.generation import GenerationConfig
+                from repowise.core.generation.cascade import expand_cascade
+                from repowise.core.generation.models import compute_page_id
+                from repowise.core.generation.scope import (
+                    build_dependencies,
+                    load_page_records,
+                )
+                from repowise.core.pipeline.persist import mark_page_ids_stale
+                from repowise.core.pipeline.scoped_generation import (
+                    _load_page_rows,
+                    load_kg_context,
+                )
+                from repowise.core.repo_config import load_repo_config
 
                 with timed(timings, "persist.stale_pages"):
-                    await mark_stale_pages(session, repo_id, decay_paths or [])
+                    if decay_paths:
+                        repo_cfg = load_repo_config(repo_path)
+                        generation_config = GenerationConfig.from_repo_config(repo_cfg)
+                        records = load_page_records(await _load_page_rows(session, repo_id))
+                        deps = build_dependencies(
+                            parsed_files=parsed_files or [],
+                            graph_builder=graph_builder,
+                            config=generation_config,
+                            kg_ctx=load_kg_context(Path(repo_path)),
+                            records=records,
+                            repo_name=repo_name,
+                        )
+                        seed_ids = {compute_page_id("file_page", path) for path in decay_paths}
+                        # mode="none": mark dependents stale, do not regenerate
+                        # them. "dependents" would regenerate every module/SCC/
+                        # repo-wide container touched by this commit, spending
+                        # model budget on every `update`, the exact cost
+                        # AUTO_SYNC.md promises sync never incurs. Marking is
+                        # free; the operator opts into the spend explicitly via
+                        # `generate --stale`.
+                        cascade = expand_cascade(seed_ids, "none", deps)
+                        await mark_page_ids_stale(session, repo_id, cascade.stale_ids | seed_ids)
             except Exception as exc:
                 _skip("Stale-page decay", exc)
 
