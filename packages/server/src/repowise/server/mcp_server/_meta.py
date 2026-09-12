@@ -348,6 +348,7 @@ def build_meta(
     if repository is not None:
         out.update(freshness_from_repo(repository, targets=targets))
     out.update(_embedder_meta())
+    out.update(_release_meta())
     if extra:
         out.update(extra)
     return out
@@ -484,6 +485,32 @@ def _embedder_meta() -> dict[str, Any]:
     return out
 
 
+def _release_meta() -> dict[str, Any]:
+    """Name a newer repowise release once per process, in the first response
+    after the lifespan's poller sees it.
+
+    The stdio server never re-checks its own currency otherwise, and a client
+    that spawned it weeks ago keeps talking to that version until something
+    says so. One key, one time: repeating it on every call would charge the
+    caller's token budget for a fact it already has. A newer version seen
+    later in the same process is announced again, once.
+    """
+    from repowise.server.mcp_server import _state
+
+    check = getattr(_state, "_release_check", None)
+    if check is None or not check.update_available or not check.latest_version:
+        return {}
+    if check.latest_version == _state._release_announced:
+        return {}
+    _state._release_announced = check.latest_version
+    return {
+        "newer_release": (
+            f"repowise {check.latest_version} is available, this server runs "
+            f"{check.current_version}; upgrade and restart the MCP server"
+        )
+    }
+
+
 def context_hint(targets: list[str], compact: bool, include: set[str] | None = None) -> str | None:
     """Hint for `get_context` callers.
 
@@ -519,6 +546,35 @@ EXHAUSTIVE_SWEEP_HINT = (
     "For an exhaustive sweep of every literal usage — before a rename, say — "
     "Grep the name; that is the one job this surface does not do."
 )
+
+# Appended to a get_answer hint when the answer graded low and the index is
+# behind live HEAD; the one place holding both signals says what to do.
+INDEX_BEHIND_LOW_CONFIDENCE_HINT = (
+    "The index is behind HEAD, so run `repowise update` and ask again before "
+    "trusting a low-confidence answer."
+)
+
+
+def completeness_line(*, bodies: int = 0, files: int = 0) -> str | None:
+    """One sentence naming the whole units this response already served.
+
+    Only ever counts complete units. A sliced body or a partial range is not a
+    unit, so the callers filter before they count and this returns ``None`` when
+    nothing whole was served.
+    """
+    bodies = max(0, int(bodies))
+    files = max(0, int(files))
+    if not bodies and not files:
+        return None
+    parts: list[str] = []
+    if bodies:
+        noun = "symbol body" if bodies == 1 else "symbol bodies"
+        parts.append(f"{bodies} {noun} served whole from live source")
+    if files:
+        noun = "file" if files == 1 else "files"
+        parts.append(f"{files} {noun} served whole")
+    closing = "do not re-open it." if bodies + files == 1 else "do not re-open them."
+    return f"Complete: {' and '.join(parts)}; {closing}"
 
 
 def answer_hint(

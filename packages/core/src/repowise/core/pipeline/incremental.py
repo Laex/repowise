@@ -26,6 +26,8 @@ from typing import Any
 
 import structlog
 
+from repowise.core.pipeline.phase_timing import PhaseTimings, timed
+
 logger = structlog.get_logger(__name__)
 
 LogFn = Callable[[str], None]
@@ -54,6 +56,7 @@ def build_repo_graph(
     include_submodules: bool = False,
     include_nested_repos: bool = False,
     log: LogFn | None = None,
+    timings: PhaseTimings | None = None,
 ) -> tuple[list, dict[str, bytes], Any, Any, int]:
     """Traverse + parse the repo and build the graph (+ framework-aware edges).
 
@@ -64,6 +67,9 @@ def build_repo_graph(
     Files that fail to read/parse are skipped and reported as a count rather than
     swallowed silently. ``source_map`` is populated only when ``collect_sources``
     is set (the re-score path doesn't need the raw bytes).
+
+    ``timings`` is the run's shared :class:`PhaseTimings` table; each step
+    below records into it under a ``rebuild.*`` name. ``None`` records nothing.
 
     Returns ``(parsed_files, source_map, graph_builder, repo_structure,
     file_count)``.
@@ -85,12 +91,13 @@ def build_repo_graph(
     # A serial traverse() pays per-file I/O latency sequentially; on a cold
     # OS file cache that was ~50s of every PowerToys-scale update. Passing
     # the file_infos into get_repo_structure also avoids its re-walk.
-    all_paths = list(traverser._walk())
-    io_workers = min(32, max(4, (os.cpu_count() or 4) * 2))
-    with ThreadPoolExecutor(max_workers=io_workers) as io_pool:
-        maybe_infos = list(io_pool.map(traverser._build_file_info, all_paths))
-    file_infos = [fi for fi in maybe_infos if fi is not None]
-    repo_structure = traverser.get_repo_structure(file_infos)
+    with timed(timings, "rebuild.traverse"):
+        all_paths = list(traverser._walk())
+        io_workers = min(32, max(4, (os.cpu_count() or 4) * 2))
+        with ThreadPoolExecutor(max_workers=io_workers) as io_pool:
+            maybe_infos = list(io_pool.map(traverser._build_file_info, all_paths))
+        file_infos = [fi for fi in maybe_infos if fi is not None]
+        repo_structure = traverser.get_repo_structure(file_infos)
 
     # Structural episodes, minus the formatter check: this path is the hot one
     # (every update, plus the config-triggered re-score), so it derives only
@@ -112,8 +119,9 @@ def build_repo_graph(
     )
     from repowise.core.workspace.update import get_head_commit
 
-    fi_and_bytes = _read_sources(file_infos, None)
-    parse_cache, cached_hits, to_parse = _split_cached(Path(repo_path), fi_and_bytes, None)
+    with timed(timings, "rebuild.read"):
+        fi_and_bytes = _read_sources(file_infos, None)
+        parse_cache, cached_hits, to_parse = _split_cached(Path(repo_path), fi_and_bytes, None)
 
     parser: Any = None  # constructed lazily — every-file-cached updates skip query compilation
     parsed_files: list = []
@@ -136,18 +144,23 @@ def build_repo_graph(
     # core; routing large miss counts through init's process pool would lift
     # it, at the cost of Windows spawn overhead on every routine update.)
     merged: dict[int, Any] = dict(cached_hits)
-    for idx, (fi, source), content_hash in to_parse:
-        try:
-            if parser is None:
-                parser = ASTParser()
-            parsed = parser.parse_file(fi, source)
-        except Exception:
-            continue
-        merged[idx] = parsed
-        if content_hash:
-            _cache_parsed(parse_cache, parsed, content_hash)
+    with timed(timings, "rebuild.parse"):
+        for idx, (fi, source), content_hash in to_parse:
+            try:
+                if parser is None:
+                    parser = ASTParser()
+                parsed = parser.parse_file(fi, source)
+            except Exception:
+                continue
+            merged[idx] = parsed
+            if content_hash:
+                _cache_parsed(parse_cache, parsed, content_hash)
 
     skipped = len(file_infos) - len(fi_and_bytes)  # unreadable files
+    # Opened here and closed after build(): graph construction is the add_file
+    # loop plus the resolver, and the tsconfig wiring sits between them.
+    if timings is not None:
+        timings.start("rebuild.graph")
     for idx, (fi, source) in enumerate(fi_and_bytes):
         parsed = merged.get(idx)
         if parsed is None:
@@ -173,8 +186,11 @@ def build_repo_graph(
     )
     graph_builder.set_source_map(source_map)
     graph_builder.build()
+    if timings is not None:
+        timings.stop("rebuild.graph")
     if parse_cache is not None:
-        parse_cache.save()
+        with timed(timings, "rebuild.cache_save"):
+            parse_cache.save()
 
     if skipped:
         log(f"[yellow]Skipped {skipped} file(s) that failed to parse.[/yellow]")
@@ -186,8 +202,9 @@ def build_repo_graph(
     try:
         from repowise.core.generation.editor_files.tech_stack import detect_tech_stack
 
-        tech_items = detect_tech_stack(repo_path)
-        fw_count = graph_builder.add_framework_edges([item.name for item in tech_items])
+        with timed(timings, "rebuild.framework"):
+            tech_items = detect_tech_stack(repo_path)
+            fw_count = graph_builder.add_framework_edges([item.name for item in tech_items])
         if fw_count:
             log(f"Framework edges added: [cyan]{fw_count}[/cyan]")
     except Exception as fw_exc:
@@ -204,12 +221,13 @@ def build_repo_graph(
     try:
         from repowise.core.ingestion.dynamic_hints import HintRegistry
 
-        dynamic_edges = HintRegistry().extract_all(
-            Path(repo_path),
-            dotnet_index=graph_builder.dotnet_index,
-            file_paths=[fi.path for fi in file_infos],
-        )
-        graph_builder.add_dynamic_edges(dynamic_edges)
+        with timed(timings, "rebuild.dynamic_hints"):
+            dynamic_edges = HintRegistry().extract_all(
+                Path(repo_path),
+                dotnet_index=graph_builder.dotnet_index,
+                file_paths=[fi.path for fi in file_infos],
+            )
+            graph_builder.add_dynamic_edges(dynamic_edges)
         if dynamic_edges:
             log(f"Dynamic hint edges added: [cyan]{len(dynamic_edges)}[/cyan]")
 
@@ -234,9 +252,13 @@ async def rebuild_graph_and_git(
     include_nested_repos: bool = False,
     idle_decay_sink: dict[str, dict] | None = None,
     log: LogFn | None = None,
+    timings: PhaseTimings | None = None,
 ) -> tuple[list, dict[str, bytes], Any, Any, int, dict[str, dict]]:
     """Re-traverse + parse the repo, rebuild the graph (+ framework edges), and
     re-index git metadata for the changed files.
+
+    ``timings`` records the whole step as ``rebuild`` plus one ``rebuild.*``
+    row per sub-step, so a slow update names the stage that made it slow.
 
     ``idle_decay_sink``, when provided, is filled with a decay-only partial
     metadata row for every idle (unchanged) file whose time-decayed history
@@ -259,6 +281,8 @@ async def rebuild_graph_and_git(
     file_count, git_meta_map)``.
     """
     log = log or _noop_log
+    if timings is not None:
+        timings.start("rebuild")
 
     # Full re-ingest for graph (needed for cascade analysis)
     parsed_files, source_map, graph_builder, repo_structure, file_count = build_repo_graph(
@@ -268,10 +292,13 @@ async def rebuild_graph_and_git(
         include_submodules=include_submodules,
         include_nested_repos=include_nested_repos,
         log=log,
+        timings=timings,
     )
 
     # Re-index git metadata for changed files
     git_meta_map: dict[str, dict] = {}
+    if timings is not None:
+        timings.start("rebuild.git")
     try:
         from repowise.core.ingestion.git_indexer import GitIndexer
         from repowise.core.ingestion.git_indexer.tiers import GitIndexTier
@@ -304,6 +331,7 @@ async def rebuild_graph_and_git(
             co_change_sink=co_change_full,
             idle_decay_sink=idle_decay_sink,
             on_warning=log,
+            timings=timings,
         )
         git_meta_map = {m["file_path"]: m for m in updated_meta}
         label_co_change_structure(graph_builder, git_meta_map)
@@ -322,6 +350,9 @@ async def rebuild_graph_and_git(
             graph_builder.update_co_change_edges(git_meta_map)
     except Exception as exc:
         log(f"[yellow]Git re-index skipped: {exc}[/yellow]")
+    finally:
+        if timings is not None:
+            timings.stop("rebuild.git")
 
     # Pre-compute centrality/community metrics with the init path's fan-out
     # parallelism. Without this, persist_graph_nodes computes the same
@@ -329,10 +360,13 @@ async def rebuild_graph_and_git(
     # the cached subgraphs reflect the final structure. Best-effort: every
     # metric still falls back to lazy computation.
     try:
-        await graph_builder.compute_metrics_parallel()
+        with timed(timings, "rebuild.metrics"):
+            await graph_builder.compute_metrics_parallel()
     except Exception as exc:
         log(f"[yellow]Metric pre-computation skipped: {exc}[/yellow]")
 
+    if timings is not None:
+        timings.stop("rebuild")
     return parsed_files, source_map, graph_builder, repo_structure, file_count, git_meta_map
 
 
@@ -570,6 +604,31 @@ async def load_stored_coverage_map(
         return {}
 
 
+def _performance_only_config(config: dict | None, performance_only: set[str]) -> dict | None:
+    """Disable every non-performance detector on the closure's files.
+
+    The closure adds files whose call paths reach a changed sink. Only their
+    performance findings survive the filter below; every other detector's
+    output for them is computed and discarded, and on a central helper the
+    closure runs to hundreds of files. The walk still covers them, because the
+    performance detectors read it.
+    """
+    if not performance_only:
+        return config
+    from repowise.core.analysis.health.biomarkers import registered_biomarkers
+    from repowise.core.analysis.health.scoring import dimensions_for
+
+    non_performance = {
+        b.name for b in registered_biomarkers() if "performance" not in dimensions_for(b.name)
+    }
+    out = dict(config or {})
+    per_file = {k: set(v) for k, v in (out.get("per_file_disabled") or {}).items()}
+    for path in performance_only:
+        per_file[path] = per_file.get(path, set()) | non_performance
+    out["per_file_disabled"] = per_file
+    return out
+
+
 def run_partial_analysis(
     repo_path: Any,
     graph_builder: Any,
@@ -583,6 +642,7 @@ def run_partial_analysis(
     repo_function_mod_p80: int | None = None,
     coverage_map: dict[str, dict] | None = None,
     log: LogFn | None = None,
+    timings: PhaseTimings | None = None,
 ) -> tuple[Any, Any]:
     """Run partial code-health + repo-wide dead-code analysis.
 
@@ -615,6 +675,10 @@ def run_partial_analysis(
     ``None`` means the store could not be read, which is different from an
     empty mapping and narrows what the resulting report is allowed to
     overwrite. See ``load_stored_git_meta``.
+
+    ``timings`` records the two analyses as ``analysis.health`` and
+    ``analysis.dead_code``. Their costs move independently with the edit, so
+    they are never folded into one row.
     """
     log = log or _noop_log
 
@@ -623,6 +687,8 @@ def run_partial_analysis(
     # The full file-list is needed because duplication is cross-file —
     # but only files in ``changed_paths`` produce new findings/metrics.
     partial_health_report = None
+    if timings is not None:
+        timings.start("analysis.health")
     try:
         # Performance is interprocedural. Recompute one bounded bidirectional
         # execution closure so a changed caller can still see an unchanged sink
@@ -659,10 +725,15 @@ def run_partial_analysis(
                 if _hcfg.has_overrides()
                 else None
             )
+            _analyzer_config = _performance_only_config(
+                _analyzer_config, _performance_changed - _health_changed
+            )
             partial_health_report = _health_analyzer.analyze(
                 _analyzer_config,
                 changed_files=_health_scope,
                 repo_function_mod_p80=repo_function_mod_p80,
+                timings=timings,
+                duplication_files=_health_changed,
             )
             # The closure exists only to refresh interprocedural performance.
             # Preserve the historical changed-file scope for every other
@@ -697,12 +768,17 @@ def run_partial_analysis(
             )
     except Exception as exc:
         log(f"[yellow]Health analysis skipped: {exc}[/yellow]")
+    finally:
+        if timings is not None:
+            timings.stop("analysis.health")
 
     # Run dead-code analysis up front so both branches can persist its
     # results. Previously this sat below the ``if index_only``
     # short-circuit, which left the closure's reference to
     # ``dead_code_report`` unbound and crashed every ``--index-only`` run.
     dead_code_report = None
+    if timings is not None:
+        timings.start("analysis.dead_code")
     try:
         from repowise.core.analysis.dead_code import DeadCodeAnalyzer
 
@@ -755,10 +831,11 @@ def run_partial_analysis(
         #
         # When the read FAILED, this run knows strictly less than the index it
         # would be overwriting: every file outside the change set would be
-        # scored against an empty dict, which reads as "no commits" and stores
-        # 0.7 with ``safe_to_delete=True`` however active the file is. So it
-        # speaks only for the files it re-indexed this run, which is the
-        # behavior this path had before it was widened.
+        # scored with no git row, which the analyzer holds below the
+        # deletion-ready threshold, so a verdict a full index scored at 1.0
+        # would be written back as an unscored 0.5. So it speaks only for the
+        # files it re-indexed this run, which is the behavior this path had
+        # before it was widened.
         dead_code_report.authoritative_paths = (
             None if stored_git_meta is not None else frozenset(git_meta_map)
         )
@@ -772,6 +849,9 @@ def run_partial_analysis(
             log(f"Dead code findings: [yellow]{dead_code_report.total_findings}[/yellow]")
     except Exception as exc:
         log(f"[yellow]Dead code analysis skipped: {exc}[/yellow]")
+    finally:
+        if timings is not None:
+            timings.stop("analysis.dead_code")
 
     return partial_health_report, dead_code_report
 
@@ -908,7 +988,170 @@ def _carry_forward_kg_enrichment(kg: Any, prior_kg: Any) -> None:
         kg.tour = prior_kg.tour
 
 
-async def persist_partial_health(session: Any, repo_id: str, report: Any) -> None:
+async def refresh_unchanged_history(
+    session: Any, repo_id: str, repo_path: Any, *, skip_paths: set[str]
+) -> int:
+    """Re-score the git-derived markers on files this run did not walk.
+
+    The update refreshes git metadata for the whole repository, so a file the
+    change set never touched can still have moved in every way history
+    measures — new co-change partners, a fix that landed elsewhere in the same
+    commit, an owner who left. Only those markers are re-evaluated; each file
+    keeps the structural findings its last parse produced, so nothing here
+    needs the source.
+
+    Returns the number of files rewritten. Best-effort: the update is not worth
+    failing over a refresh.
+    """
+    from repowise.core.analysis.health.config import HealthConfig
+    from repowise.core.analysis.health.history_refresh import (
+        REFRESHABLE_MARKERS,
+        active_contributors,
+        git_meta_rows_to_map,
+        refresh_history,
+    )
+    from repowise.core.persistence.crud import (
+        get_all_git_metadata,
+        get_file_language_map,
+        get_health_findings,
+        get_health_metrics,
+        upsert_health_findings,
+        upsert_health_metrics,
+    )
+
+    stored = {
+        m.file_path: m
+        for m in await get_health_metrics(session, repo_id)
+        if m.file_path not in skip_paths
+    }
+    if not stored:
+        return 0
+    git_meta = git_meta_rows_to_map((await get_all_git_metadata(session, repo_id)).values())
+    if not git_meta:
+        return 0
+
+    findings_by_path: dict[str, list[Any]] = {}
+    for finding in await get_health_findings(session, repo_id):
+        findings_by_path.setdefault(finding.file_path, []).append(finding)
+
+    cfg = HealthConfig.load(repo_path)
+    refreshed = refresh_history(
+        metrics=list(stored.values()),
+        findings_by_path=findings_by_path,
+        git_meta_by_path=git_meta,
+        languages=await get_file_language_map(session, repo_id),
+        repo_active_contributors_90d=active_contributors(git_meta),
+        severity_overrides=cfg.severity_overrides or None,
+    )
+    if not refreshed:
+        return 0
+
+    # The two writes are scoped separately on purpose. A metric row is cheap to
+    # rewrite and carries no identity, but rewriting findings deletes and
+    # re-inserts them, which means new ids and a reset ``created_at`` — so that
+    # only happens for a file whose history findings actually changed, not for
+    # every file whose stored split was merely never recorded.
+    metric_writes = [
+        _refreshed_metric(r, stored[r.file_path])
+        for r in refreshed
+        if _numbers_moved(r, stored[r.file_path])
+    ]
+    finding_writes = [
+        r for r in refreshed if _history_findings_moved(r, findings_by_path.get(r.file_path, []))
+    ]
+    if not metric_writes and not finding_writes:
+        return 0
+
+    # One savepoint over both: a file whose findings were rewritten but whose
+    # score was not would report a deduction its own findings cannot account
+    # for, and the caller logs this step and carries on to commit the rest.
+    async with session.begin_nested():
+        if finding_writes:
+            await upsert_health_findings(
+                session,
+                repo_id,
+                [f for r in finding_writes for f in r.findings],
+                file_paths=[r.file_path for r in finding_writes],
+            )
+        if metric_writes:
+            await upsert_health_metrics(session, repo_id, metric_writes)
+    logger.debug(
+        "health_history_refreshed",
+        repo_id=repo_id,
+        metric_rows=len(metric_writes),
+        finding_rows=len(finding_writes),
+        markers=len(REFRESHABLE_MARKERS),
+    )
+    return len(finding_writes)
+
+
+def _numbers_moved(refreshed: Any, stored: Any) -> bool:
+    """Whether the stored row's numbers differ from the re-scored ones.
+
+    Includes a row whose split was never recorded, so the first update after
+    the split ships backfills it without touching any finding.
+    """
+    return (
+        round(refreshed.score, 2) != round(float(stored.score), 2)
+        or stored.structure_deduction is None
+        or stored.history_deduction is None
+        or round(refreshed.structure_deduction, 3) != round(float(stored.structure_deduction), 3)
+        or round(refreshed.history_deduction, 3) != round(float(stored.history_deduction), 3)
+    )
+
+
+def _history_findings_moved(refreshed: Any, stored_findings: list[Any]) -> bool:
+    """Whether the git-derived findings themselves changed.
+
+    Compared on what a reader sees — which markers fired, where, and how
+    severely — so a file keeps its finding ids and their ages across an update
+    that re-derived the same history.
+    """
+
+    def key(findings: Any) -> set:
+        return {
+            (
+                getattr(f, "biomarker_type", ""),
+                str(getattr(f, "severity", "")),
+                getattr(f, "function_name", None),
+                round(float(getattr(f, "health_impact", 0.0) or 0.0), 3),
+            )
+            for f in findings
+        }
+
+    return key(refreshed.findings) != key(stored_findings)
+
+
+def _refreshed_metric(refreshed: Any, stored: Any) -> dict:
+    """The stored metric row with the rescored numbers written over it.
+
+    A dict rather than a dataclass so the fields this pass cannot know — the
+    complexity and coverage columns, which need a parse — keep their stored
+    values instead of being reset to a default.
+    """
+    return {
+        "file_path": refreshed.file_path,
+        "score": refreshed.score,
+        "max_ccn": stored.max_ccn,
+        "max_nesting": stored.max_nesting,
+        "nloc": stored.nloc,
+        "duplication_pct": stored.duplication_pct,
+        "has_test_file": stored.has_test_file,
+        "line_coverage_pct": stored.line_coverage_pct,
+        "branch_coverage_pct": stored.branch_coverage_pct,
+        "module": stored.module,
+        "defect_score": refreshed.defect_score,
+        "maintainability_score": refreshed.maintainability_score,
+        "performance_score": refreshed.performance_score,
+        "structure_deduction": refreshed.structure_deduction,
+        "history_deduction": refreshed.history_deduction,
+        "is_test": stored.is_test,
+    }
+
+
+async def persist_partial_health(
+    session: Any, repo_id: str, report: Any, repo_path: Any = None
+) -> None:
     """Upsert health findings + metrics for the changed-files subset.
 
     Unlike ``persist_pipeline_result`` (which delete-then-inserts the
@@ -998,9 +1241,37 @@ async def persist_partial_health(session: Any, repo_id: str, report: Any) -> Non
         from repowise.core.persistence.crud import upsert_git_function_blame_bulk
 
         await upsert_git_function_blame_bulk(session, repo_id, fn_blame_rows)
+    # Only a full index rewrites the whole population, so rows an older version
+    # scored for prose or configuration go here rather than lingering in the
+    # average, and rows written before ``is_test`` existed get it from their
+    # path. Both before the refresh, which should not re-score a row that is
+    # about to be deleted.
+    from repowise.core.persistence.crud import backfill_is_test, prune_unscored_health_rows
+
+    await prune_unscored_health_rows(session, repo_id)
+    await backfill_is_test(session, repo_id)
+    # Then the files this run did not walk, whose git-derived markers the fresh
+    # metadata may have moved. Before the snapshot, or the trend would describe
+    # the store as it stood one update ago.
+    if repo_path is not None:
+        try:
+            await refresh_unchanged_history(
+                session, repo_id, repo_path, skip_paths=set(changed_paths)
+            )
+        except Exception as exc:
+            # Never fails the run: the next update re-derives the whole thing
+            # from the stored git metadata, so nothing is stranded behind.
+            logger.debug("health_history_refresh_skipped", repo_id=repo_id, error=str(exc))
+    # The store now holds the merged repository, so the snapshot describes the
+    # whole of it, not this run's changed files.
+    from repowise.core.pipeline.persist import snapshot_health_from_store
+
+    await snapshot_health_from_store(session, repo_id)
 
 
-async def persist_incremental_commits(session: Any, repo_id: str, repo_path: Any) -> None:
+async def persist_incremental_commits(
+    session: Any, repo_id: str, repo_path: Any, *, timings: PhaseTimings | None = None
+) -> None:
     """Capture + upsert ``git_commits`` rows for commits new since the last index.
 
     Foundation 1 only populated the per-commit table on the full orchestrator
@@ -1038,14 +1309,17 @@ async def persist_incremental_commits(session: Any, repo_id: str, repo_path: Any
 
         dt = newest if newest.tzinfo is not None else newest.replace(tzinfo=UTC)
         since_ts = int(dt.timestamp())
-    rows = await asyncio.to_thread(indexer.capture_new_commit_rows, since_ts=since_ts)
-    if rows:
-        await upsert_git_commits_bulk(session, repo_id, rows)
+    with timed(timings, "persist.commits.capture"):
+        rows = await asyncio.to_thread(indexer.capture_new_commit_rows, since_ts=since_ts)
+        if rows:
+            await upsert_git_commits_bulk(session, repo_id, rows)
 
-    await reconcile_commit_experience(session, repo_id, indexer)
+    with timed(timings, "persist.commits.experience"):
+        await reconcile_commit_experience(session, repo_id, indexer)
     # Fills the commit-offset column on indexes written before it existed, so a
     # new capture never needs a re-index to become useful.
-    await reconcile_commit_offsets(session, repo_id, indexer)
+    with timed(timings, "persist.commits.offsets"):
+        await reconcile_commit_offsets(session, repo_id, indexer)
 
     # Refresh the repo-level whole-history totals so age / commit / contributor
     # counts keep growing between full re-indexes (#730). Cheap git calls, and
@@ -1054,7 +1328,8 @@ async def persist_incremental_commits(session: Any, repo_id: str, repo_path: Any
     # was stored last time lets it add only the range since, and it re-proves
     # that range is safe to add before doing so.
     prior = _churn_prior(await get_repository(session, repo_id))
-    totals = await asyncio.to_thread(indexer.capture_repo_totals, prior)
+    with timed(timings, "persist.commits.totals"):
+        totals = await asyncio.to_thread(indexer.capture_repo_totals, prior)
     await update_repo_git_totals(
         session,
         repo_id,
@@ -1068,7 +1343,8 @@ async def persist_incremental_commits(session: Any, repo_id: str, repo_path: Any
         churn_anchor_sha=totals.churn_anchor_sha,
     )
 
-    await persist_incremental_fix_events(session, repo_id, indexer)
+    with timed(timings, "persist.commits.fix_events"):
+        await persist_incremental_fix_events(session, repo_id, indexer)
 
 
 def _churn_prior(repo_row: Any) -> Any:
@@ -1391,6 +1667,7 @@ async def persist_incremental_index(
     log: LogFn | None = None,
     degraded: list[str] | None = None,
     failed_steps: list[str] | None = None,
+    timings: PhaseTimings | None = None,
 ) -> None:
     """Persist an incremental index refresh (graph + symbols + git + dead-code + health).
 
@@ -1417,6 +1694,10 @@ async def persist_incremental_index(
     looks range-scoped and is not: it bounds its walk by the newest
     ``committed_at`` already in the table, so a run it skipped is re-walked by
     the next one whatever the diff base says.
+
+    ``timings`` records the whole write as ``persist`` and each step as a
+    ``persist.*`` row. A step that did not run records nothing, so an absent
+    row means skipped rather than free.
     """
     from repowise.core.persistence import (
         create_engine,
@@ -1443,12 +1724,18 @@ async def persist_incremental_index(
     tombstoned_page_ids: list[str] = []
     # Same contract, for rows of a page that has been retired outright.
     swept_page_ids: list[str] = []
+    if timings is not None:
+        timings.start("persist")
     try:
-        await init_db(engine)
-        sf = create_session_factory(engine)
+        with timed(timings, "persist.open"):
+            await init_db(engine)
+            sf = create_session_factory(engine)
 
         async with get_session(sf) as session:
-            repo = await upsert_repository(session, name=repo_path.name, local_path=str(repo_path))
+            with timed(timings, "persist.open"):
+                repo = await upsert_repository(
+                    session, name=repo_path.name, local_path=str(repo_path)
+                )
             repo_id = repo.id
 
             # Delete rows of pages retired since this index was built. This
@@ -1462,12 +1749,16 @@ async def persist_incremental_index(
                     sweep_retired_pages,
                 )
 
-                swept_page_ids = await sweep_retired_pages(session, repo_id)
-                # Same reasoning as the retirement sweep above: this path never
-                # regenerates a cycle page, so asking the rebuilt graph whether
-                # the cycle still exists is the only way a fixed cycle's page
-                # can ever be retired for a user who only runs `update`.
-                swept_page_ids += await sweep_absent_cycle_pages(session, repo_id, graph_builder)
+                with timed(timings, "persist.sweeps"):
+                    swept_page_ids = await sweep_retired_pages(session, repo_id)
+                    # Same reasoning as the retirement sweep above: this path
+                    # never regenerates a cycle page, so asking the rebuilt
+                    # graph whether the cycle still exists is the only way a
+                    # fixed cycle's page can ever be retired for a user who
+                    # only runs `update`.
+                    swept_page_ids += await sweep_absent_cycle_pages(
+                        session, repo_id, graph_builder
+                    )
             except Exception as exc:
                 _skip("Retired page sweep", exc)
 
@@ -1481,9 +1772,10 @@ async def persist_incremental_index(
                         tombstone_candidates,
                     )
 
-                    tombstoned_page_ids = await mark_tombstone_pages(
-                        session, repo_id, tombstone_candidates(file_diffs)
-                    )
+                    with timed(timings, "persist.tombstones"):
+                        tombstoned_page_ids = await mark_tombstone_pages(
+                            session, repo_id, tombstone_candidates(file_diffs)
+                        )
                 except Exception as exc:
                     _skip("Tombstone marking", exc, range_scoped=True)
 
@@ -1492,7 +1784,8 @@ async def persist_incremental_index(
             try:
                 from repowise.core.pipeline.page_tree_sync import rebuild_page_tree
 
-                await rebuild_page_tree(session, repo_id)
+                with timed(timings, "persist.page_tree"):
+                    await rebuild_page_tree(session, repo_id)
             except Exception as exc:
                 _skip("Page tree rebuild", exc)
 
@@ -1506,17 +1799,21 @@ async def persist_incremental_index(
                     # Idle files' decay-only rows upsert alongside the changed
                     # files' full rows; the percentile re-rank then runs over
                     # every row against the freshly decayed scores (#728).
-                    await upsert_git_metadata_bulk(
-                        session,
-                        repo_id,
-                        [*git_meta_map.values(), *(git_decay_map or {}).values()],
-                    )
-                    await recompute_git_percentiles(session, repo_id)
+                    with timed(timings, "persist.git"):
+                        await upsert_git_metadata_bulk(
+                            session,
+                            repo_id,
+                            [*git_meta_map.values(), *(git_decay_map or {}).values()],
+                        )
+                        await recompute_git_percentiles(session, repo_id)
                 except Exception as exc:
                     _skip("Git persist", exc, range_scoped=True)
 
                 try:
-                    await persist_incremental_commits(session, repo_id, repo_path)
+                    with timed(timings, "persist.commits"):
+                        await persist_incremental_commits(
+                            session, repo_id, repo_path, timings=timings
+                        )
                 except Exception as exc:
                     _skip("Commit capture", exc)
 
@@ -1531,18 +1828,22 @@ async def persist_incremental_index(
                     # verdict the change flipped outside the change set. The
                     # scope is the set of files whose confidence was scored on
                     # real git metadata; the rest keep what they had.
-                    await replace_dead_code_findings(
-                        session,
-                        repo_id,
-                        dead_code_report.findings,
-                        scope=dead_code_report.authoritative_paths,
-                    )
+                    with timed(timings, "persist.dead_code"):
+                        await replace_dead_code_findings(
+                            session,
+                            repo_id,
+                            dead_code_report.findings,
+                            scope=dead_code_report.authoritative_paths,
+                        )
                 except Exception as exc:
                     _skip("Dead-code persist", exc, range_scoped=True)
 
             if partial_health_report is not None:
                 try:
-                    await persist_partial_health(session, repo_id, partial_health_report)
+                    with timed(timings, "persist.health"):
+                        await persist_partial_health(
+                            session, repo_id, partial_health_report, repo_path
+                        )
                 except Exception as exc:
                     _skip("Health persist", exc, range_scoped=True)
 
@@ -1555,7 +1856,8 @@ async def persist_incremental_index(
             try:
                 from repowise.core.pipeline.persist import persist_graph_nodes
 
-                await persist_graph_nodes(session, repo_id, graph_builder)
+                with timed(timings, "persist.graph_nodes"):
+                    await persist_graph_nodes(session, repo_id, graph_builder, timings=timings)
             except Exception as exc:
                 _skip("Graph nodes persist", exc)
 
@@ -1567,7 +1869,10 @@ async def persist_incremental_index(
             try:
                 from repowise.core.pipeline.persist import persist_incremental_symbols
 
-                await persist_incremental_symbols(session, repo_id, parsed_files, changed_paths)
+                with timed(timings, "persist.symbols"):
+                    await persist_incremental_symbols(
+                        session, repo_id, parsed_files, changed_paths
+                    )
             except Exception as exc:
                 _skip("Symbol persist", exc, range_scoped=True)
 
@@ -1579,9 +1884,10 @@ async def persist_incremental_index(
             try:
                 from repowise.core.pipeline.persist import persist_incremental_edges
 
-                await persist_incremental_edges(
-                    session, repo_id, graph_builder, parsed_files, changed_paths
-                )
+                with timed(timings, "persist.edges"):
+                    await persist_incremental_edges(
+                        session, repo_id, graph_builder, parsed_files, changed_paths
+                    )
             except Exception as exc:
                 _skip("Graph edges persist", exc, range_scoped=True)
 
@@ -1592,13 +1898,14 @@ async def persist_incremental_index(
                 from repowise.core.generation.related_pages import file_import_edges
                 from repowise.core.persistence.crud import backfill_related_pages
 
-                changed_rel = await backfill_related_pages(
-                    session,
-                    repo_id,
-                    import_edges=file_import_edges(graph_builder),
-                    git_meta_map=git_meta_map,
-                    pagerank=graph_builder.pagerank(),
-                )
+                with timed(timings, "persist.related_pages"):
+                    changed_rel = await backfill_related_pages(
+                        session,
+                        repo_id,
+                        import_edges=file_import_edges(graph_builder),
+                        git_meta_map=git_meta_map,
+                        pagerank=graph_builder.pagerank(),
+                    )
                 if changed_rel:
                     log(f"Related pages refreshed on {changed_rel} pages")
             except Exception as exc:
@@ -1608,7 +1915,8 @@ async def persist_incremental_index(
                 try:
                     from repowise.core.pipeline.persist import persist_kg
 
-                    await persist_kg(knowledge_graph_result, session, repo_id)
+                    with timed(timings, "persist.kg"):
+                        await persist_kg(knowledge_graph_result, session, repo_id)
                 except Exception as exc:
                     _skip("Knowledge-graph persist", exc)
 
@@ -1617,7 +1925,10 @@ async def persist_incremental_index(
             # dep list forever. Gated + no LLM (see refresh_external_systems).
             if file_diffs:
                 try:
-                    await refresh_external_systems(session, repo_id, repo_path, file_diffs, log=log)
+                    with timed(timings, "persist.external_systems"):
+                        await refresh_external_systems(
+                            session, repo_id, repo_path, file_diffs, log=log
+                        )
                 except Exception as exc:
                     _skip("External systems refresh", exc, range_scoped=True)
 
@@ -1678,9 +1989,10 @@ async def persist_incremental_index(
                     for node, data in graph.nodes(data=True)
                     if data.get("node_type", "file") == "file"
                 }
-                pruned, refusals = await prune_deleted_file_rows(
-                    session, repo_id, repo_path, live_hint=live_hint
-                )
+                with timed(timings, "persist.prune"):
+                    pruned, refusals = await prune_deleted_file_rows(
+                        session, repo_id, repo_path, live_hint=live_hint
+                    )
                 if pruned:
                     log(f"Pruned rows for [cyan]{pruned}[/cyan] deleted file(s)")
                 for refusal in refusals:
@@ -1735,11 +2047,12 @@ async def persist_incremental_index(
                 from repowise.core.persistence.search import FullTextSearch
 
                 fts = FullTextSearch(engine)
-                await fts.ensure_index()
-                if tombstoned_page_ids:
-                    await fts.delete_many(tombstoned_page_ids)
-                if swept_page_ids:
-                    await fts.delete_many(swept_page_ids)
+                with timed(timings, "persist.fts"):
+                    await fts.ensure_index()
+                    if tombstoned_page_ids:
+                        await fts.delete_many(tombstoned_page_ids)
+                    if swept_page_ids:
+                        await fts.delete_many(swept_page_ids)
             except Exception as exc:
                 # Range-scoped for the tombstone half: mark_tombstone_pages
                 # re-marks and re-returns pages that are already tombstones, so
@@ -1759,3 +2072,5 @@ async def persist_incremental_index(
         # (which does delete it) or a reindex.
     finally:
         await engine.dispose()
+        if timings is not None:
+            timings.stop("persist")

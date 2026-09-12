@@ -108,13 +108,17 @@ export interface ArchitectureEdgeResponse {
 export interface ArchitectureGraphResponse {
   nodes: ArchitectureNodeResponse[];
   edges: ArchitectureEdgeResponse[];
+  population?: PopulationBreakdown | null;
+  unclustered?: UnclusteredFiles | null;
 }
 
 export interface ArchitectureNodeResponse {
   community_id: number;
   label: string;
   cohesion: number;
+  conductance?: number | null;
   member_count: number;
+  hidden_member_count?: number;
   top_file: string;
   avg_pagerank: number;
   hotspot_count?: number;
@@ -314,10 +318,10 @@ export interface ChatMessageResponse {
 
 /** Navigation metadata supplied by a product chat surface. */
 export interface ChatPageContext {
-  kind: "repository" | "overview" | "documentation" | "architecture" | "graph" | "health" | "refactoring" | "file" | "symbol" | "module" | "dependency" | "commit" | "contributor" | "decision" | "risk" | "security" | "usage" | "settings" | "chat";
+  kind: "repository" | "overview" | "documentation" | "architecture" | "graph" | "health" | "refactoring" | "file" | "symbol" | "module" | "dependency" | "commit" | "contributor" | "decision" | "risk" | "dead-code" | "blast-radius" | "security" | "usage" | "settings" | "chat";
   label: string;
   target?: string | null;
-  target_kind?: "path" | "symbol" | "module" | "commit" | "person" | "decision" | "documentation" | null;
+  target_kind?: "path" | "symbol" | "module" | "dependency" | "commit" | "person" | "decision" | "documentation" | null;
 }
 
 export interface ChatRequest {
@@ -326,6 +330,24 @@ export interface ChatRequest {
   provider?: string | null;
   model?: string | null;
   context?: ChatPageContext | null;
+}
+
+/**
+ * One composer chip. ``source`` lets a client rank a measured question
+ * above the static tier it already ships.
+ */
+export interface ChatSuggestion {
+  text: string;
+  source: "static" | "page" | "followup";
+  toolHint?: string | null;
+}
+
+/**
+ * Only the measured tier. An empty list means the page had nothing to
+ * measure, and the client's own static tier stands.
+ */
+export interface ChatSuggestionsResponse {
+  suggestions?: ChatSuggestion[];
 }
 
 /**
@@ -500,16 +522,27 @@ export interface CommunityDetailResponse {
   community_id: number;
   label: string;
   cohesion: number;
+  conductance?: number | null;
   member_count: number;
+  hidden_member_count?: number;
   members: CommunityMember[];
   truncated: boolean;
   neighboring_communities: NeighboringCommunity[];
+  health_score?: number | null;
+  scored_member_count?: number;
+  hot_count?: number;
+  dead_count?: number;
+  decision_count?: number;
+  primary_owner?: string | null;
+  primary_owner_file_count?: number;
 }
 
 export interface CommunityMember {
   path: string;
   pagerank: number;
   is_entry_point: boolean;
+  is_hotspot?: boolean;
+  is_dead?: boolean;
 }
 
 export interface CommunitySliceNodeResponse {
@@ -538,13 +571,16 @@ export interface CommunitySliceResponse {
   community_id: number;
   member_count: number;
   truncated?: boolean;
+  hidden_member_count?: number;
 }
 
 export interface CommunitySummaryItem {
   community_id: number;
   label: string;
   cohesion: number;
+  conductance?: number | null;
   member_count: number;
+  hidden_member_count?: number;
   top_file: string;
 }
 
@@ -1525,15 +1561,21 @@ export interface HealthTrendAlert {
   baseline?: number | null;
   delta: number;
   message: string;
+  driver?: string | null;
+  structure_delta?: number | null;
+  history_delta?: number | null;
 }
 
 /** One snapshot in the repo-level history, newest first. */
 export interface HealthTrendKpiRow {
   taken_at?: string | null;
-  hotspot_health: number;
+  hotspot_health?: number | null;
   average_health: number;
   worst_performer_path?: string | null;
   worst_performer_score?: number | null;
+  structure_average?: number | null;
+  history_average?: number | null;
+  maintainability_average?: number | null;
 }
 
 export interface HealthTrendResponse {
@@ -1543,15 +1585,18 @@ export interface HealthTrendResponse {
   file_deltas?: HealthFileDelta[];
   file_deltas_total?: number;
   snapshot_count?: number;
+  scope?: string;
 }
 
 export interface HealthTrendSummary {
-  current_hotspot_health: number;
+  current_hotspot_health?: number | null;
   current_average_health: number;
   previous_hotspot_health?: number | null;
   previous_average_health?: number | null;
   hotspot_delta?: number | null;
   average_delta?: number | null;
+  current_structure_deduction?: number | null;
+  current_history_deduction?: number | null;
 }
 
 /** One file in the triage queue, ranked by impact over effort. */
@@ -1570,6 +1615,7 @@ export interface HealthWorkItem {
   primary_finding_id: string;
   total_impact: number;
   finding_count: number;
+  open_finding_count?: number;
   biomarkers?: string[];
   effort_bucket: string;
   impact_per_effort: number;
@@ -1578,6 +1624,9 @@ export interface HealthWorkItem {
 export interface HealthWorkQueueResponse {
   targets?: HealthWorkItem[];
   total?: number;
+  finding_total?: number;
+  offset?: number;
+  limit?: number;
 }
 
 export interface HotFilesGraphResponse {
@@ -2008,6 +2057,23 @@ export interface Paginated_SymbolResponse_ {
   total: number;
   has_more: boolean;
   next_offset?: number | null;
+}
+
+/**
+ * What the map is counting.
+ *
+ * Every count in the payload is over ``visible``. The category totals are
+ * reported whether or not included, so a client can offer "show tests (N)".
+ */
+export interface PopulationBreakdown {
+  total: number;
+  visible: number;
+  tests?: number;
+  examples?: number;
+  docs?: number;
+  include_tests?: boolean;
+  include_examples?: boolean;
+  include_docs?: boolean;
 }
 
 /** One provider in the catalog, as the settings picker renders it. */
@@ -2556,6 +2622,16 @@ export interface TransitiveEntry {
 }
 
 /**
+ * Visible files below ``min_members``; almost all have no dependency edge.
+ *
+ * ``files`` is the head by PageRank, capped.
+ */
+export interface UnclusteredFiles {
+  file_count: number;
+  files?: string[];
+}
+
+/**
  * Persist a new ``mcp.tools`` override for a repo.
  *
  * ``tools`` accepts the same shapes as the config block: a list of explicit
@@ -2929,12 +3005,71 @@ export interface WorkspaceSystemNode {
   is_isolated?: boolean;
 }
 
+/** One consumer file the join looked at, and the state it ended in. */
+export interface WorkspaceTestImpactFile {
+  consumer_repo?: string;
+  consumer_file?: string;
+  state?: string;
+  measured_tests_count?: number;
+  inferred_tests_count?: number;
+  via?: string | null;
+  provider_repos?: string[];
+  contract_ids?: string[];
+  consumer_symbol_ids?: string[];
+}
+
+/** ``GET /api/workspace/test-impact``: consumer tests for a provider change. */
+export interface WorkspaceTestImpactResponse {
+  workspace?: boolean;
+  recommendations?: WorkspaceTestRecommendation[];
+  recommendations_total?: number;
+  recommendations_emitted?: number;
+  recommendations_truncated?: boolean;
+  recommendations_omitted?: number;
+  recommendations_by_basis?: Record<string, number>;
+  recommendations_by_repo?: Record<string, number>;
+  recommendations_by_consumer_repo?: Record<string, number>;
+  unresolved?: WorkspaceUnresolvedLink[];
+  files_analyzed?: WorkspaceTestImpactFile[];
+  summary?: Record<string, unknown>;
+}
+
+/** A test in a consumer repo that guards a changed provider file. */
+export interface WorkspaceTestRecommendation {
+  test_id?: string;
+  test_file?: string;
+  consumer_repo?: string;
+  consumer_files?: string[];
+  consumer_symbol_ids?: string[];
+  provider_repo?: string;
+  contract_ids?: string[];
+  contract_types?: string[];
+  basis?: string;
+  via?: string;
+  confidence?: number;
+  source_files?: string[];
+  evidence?: Record<string, unknown>[];
+}
+
 export interface WorkspaceUnmatchedConsumer {
   repo: string;
   file_path: string;
   contract_id: string;
   contract_type: string;
   reason: string;
+}
+
+/** A contract link the join could not follow, and why. */
+export interface WorkspaceUnresolvedLink {
+  consumer_repo?: string;
+  consumer_file?: string;
+  consumer_symbol_id?: string | null;
+  provider_repo?: string;
+  provider_file?: string;
+  contract_id?: string;
+  contract_type?: string;
+  reason?: string;
+  detail?: string | null;
 }
 
 export interface ZoomMapResponse {

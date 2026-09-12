@@ -24,6 +24,7 @@ Usage:
 from __future__ import annotations
 
 import importlib
+import logging
 import sys
 from typing import Any
 
@@ -52,6 +53,7 @@ from repowise.server.mcp_server import _state
 #: imports; individually they are what a single-tool consumer pays for.
 _TOOL_MODULES: dict[str, str] = {
     "generate_refactoring_code": "tool_refactoring",
+    "set_finding_status": "tool_findings",
     "get_answer": "tool_answer",
     "get_architecture": "tool_architecture",
     "get_blast_radius": "tool_blast_radius",
@@ -177,7 +179,17 @@ def ensure_full_surface() -> Any:
         return _mcp
 
     for module in dict.fromkeys(_TOOL_MODULES.values()):
-        importlib.import_module(f"{__name__}.{module}")
+        try:
+            importlib.import_module(f"{__name__}.{module}")
+        except ImportError as exc:
+            # One tool's optional dependency must not take the whole surface
+            # down: a host respawns a server that dies at import, forever.
+            logging.getLogger("repowise.mcp").warning(
+                "repowise MCP: skipping tool module %s, cannot import %s: %s",
+                module,
+                exc.name or "a dependency",
+                exc,
+            )
 
     from repowise.core.registry import mcp_tool_registry
     from repowise.server.mcp_server._tool_selection import snapshot_full_surface
@@ -218,6 +230,8 @@ _STATE_NAMES = frozenset(
         "_workspace_root",
         "_cross_repo_enricher",
         "_embedder_status",
+        "_release_check",
+        "_release_announced",
     }
 )
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ import structlog
 
 from repowise.cli.helpers import console, head_commit_ts, run_async, save_state
 from repowise.core.analysis.health import HEALTH_ANALYZER_VERSION
+from repowise.core.pipeline import PhaseTimings, timed
 
 from .incremental import _build_repo_graph
 
@@ -363,6 +365,7 @@ def _persist_index_only_update(
     exclude_patterns: list[str] | None = None,
     head_ts: float | None = None,
     force_full_rescore: bool = False,
+    timings: PhaseTimings | None = None,
 ) -> None:
     """Persist the index-only update (graph + symbols + git + dead-code + health + KG),
     save state, and print the completion line. No LLM regeneration.
@@ -371,6 +374,10 @@ def _persist_index_only_update(
     periodic gate. Set by the config-changed caller, which relies on this path
     rather than re-scoring separately and returning — doing that advanced
     ``last_sync_commit`` past commits it never indexed.
+
+    ``timings`` is the run's phase table. Its ``run`` row is closed here, at
+    the state write, and the whole table lands in ``state.json`` as
+    ``phase_timings`` the way ``init`` records its own run.
 
     DB persistence delegates to :mod:`repowise.core.pipeline.incremental`;
     state-file updates and console reporting stay here. Best-effort steps
@@ -398,6 +405,7 @@ def _persist_index_only_update(
             log=console.print,
             degraded=degraded,
             failed_steps=failed_steps,
+            timings=timings,
         )
     )
     from repowise.cli.helpers import config_fingerprint
@@ -412,9 +420,13 @@ def _persist_index_only_update(
     # only reached the changed files.
     last_full_rescore_at = state.get("last_full_rescore_at")
     health_analyzer_version = state.get("health_analyzer_version")
-    if (force_full_rescore or full_rescore_due(state, head_ts)) and run_decay_health_rescore(
-        repo_path, graph_builder, parsed_files or [], exclude_patterns or []
-    ):
+    rescored = False
+    if force_full_rescore or full_rescore_due(state, head_ts):
+        with timed(timings, "rescore"):
+            rescored = run_decay_health_rescore(
+                repo_path, graph_builder, parsed_files or [], exclude_patterns or []
+            )
+    if rescored:
         # Only the time gate reads this, and it treats a non-numeric value as
         # "never re-scored", so leave a real stamp alone rather than writing
         # None over it when git gave us no timestamp.
@@ -456,6 +468,9 @@ def _persist_index_only_update(
         except Exception as exc:
             console.print(f"[yellow]Knowledge-graph export skipped: {exc}[/yellow]")
             degraded.append(f"Knowledge-graph export: {exc}")
+    if timings is not None:
+        timings.stop("run")
+        new_state["phase_timings"] = timings.totals
     save_state(repo_path, new_state)
     elapsed = time.monotonic() - start
     from .reporting import show_index_only_completion
@@ -572,6 +587,7 @@ def _persist_full_update(
     decay_paths: list[str] | None = None,
     parsed_files: list | None = None,
     git_decay_map: dict | None = None,
+    timings: PhaseTimings | None = None,
 ) -> int:
     """Persist a full (LLM-regenerating) update in one transaction.
 
@@ -606,6 +622,7 @@ def _persist_full_update(
             decay_paths=decay_paths,
             parsed_files=parsed_files,
             git_decay_map=git_decay_map,
+            timings=timings,
         )
     )
 
@@ -628,6 +645,7 @@ async def _persist_full_update_async(
     decay_paths: list[str] | None = None,
     parsed_files: list | None = None,
     git_decay_map: dict | None = None,
+    timings: PhaseTimings | None = None,
 ) -> int:
     from repowise.cli.helpers import get_db_url_for_repo
     from repowise.core.persistence import (
@@ -652,18 +670,21 @@ async def _persist_full_update_async(
     # Same contract, for rows of a page that has been retired outright.
     swept_page_ids: list[str] = []
     try:
-        await init_db(engine)
-        sf = create_session_factory(engine)
+        with timed(timings, "persist.open"):
+            await init_db(engine)
+            sf = create_session_factory(engine)
 
         async with get_session(sf) as session:
-            repo = await upsert_repository(session, name=repo_name, local_path=str(repo_path))
+            with timed(timings, "persist.open"):
+                repo = await upsert_repository(session, name=repo_name, local_path=str(repo_path))
             repo_id = repo.id
 
             # Pages first and without a net: everything else is derived
             # metadata, but a docs-mode update that can't write pages failed.
             # Batched (one SELECT + one flush); the checkpointer sink already
             # streamed each page per-commit for durability.
-            await upsert_pages_from_generated(session, generated_pages, repo_id)
+            with timed(timings, "persist.pages"):
+                await upsert_pages_from_generated(session, generated_pages, repo_id)
 
             # Delete rows of pages that have been retired since this index was
             # built. Nothing else on the update path can reach them: an update
@@ -678,13 +699,15 @@ async def _persist_full_update_async(
                     sweep_retired_pages,
                 )
 
-                swept_page_ids = await sweep_retired_pages(session, repo_id)
-                # Cycle pages are never regenerated on this path (the ladder
-                # stops at file pages), so a cycle that no longer exists can
-                # only be retired by asking the rebuilt graph directly.
-                swept_page_ids += await sweep_absent_cycle_pages(
-                    session, repo_id, graph_builder
-                )
+                with timed(timings, "persist.sweeps"):
+                    swept_page_ids = await sweep_retired_pages(session, repo_id)
+                    # Cycle pages are never regenerated on this path (the
+                    # ladder stops at file pages), so a cycle that no longer
+                    # exists can only be retired by asking the rebuilt graph
+                    # directly.
+                    swept_page_ids += await sweep_absent_cycle_pages(
+                        session, repo_id, graph_builder
+                    )
 
                 # Drop the embeddings before the SQL session commits, the same
                 # ordering ``init`` uses: the vector store is a separate engine,
@@ -705,9 +728,10 @@ async def _persist_full_update_async(
                     tombstone_candidates,
                 )
 
-                tombstoned_page_ids = await mark_tombstone_pages(
-                    session, repo_id, tombstone_candidates(file_diffs)
-                )
+                with timed(timings, "persist.tombstones"):
+                    tombstoned_page_ids = await mark_tombstone_pages(
+                        session, repo_id, tombstone_candidates(file_diffs)
+                    )
             except Exception as exc:
                 _skip("Tombstone marking", exc)
 
@@ -719,16 +743,17 @@ async def _persist_full_update_async(
                 from repowise.core.generation.related_pages import file_import_edges
                 from repowise.core.persistence.crud import backfill_related_pages
 
-                await backfill_related_pages(
-                    session,
-                    repo_id,
-                    import_edges=file_import_edges(graph_builder),
-                    git_meta_map=git_meta_map,
-                    pagerank=graph_builder.pagerank(),
-                    # This run's pages carry fresher metadata (including
-                    # module siblings) than the recompute could produce.
-                    skip_page_ids={p.page_id for p in generated_pages},
-                )
+                with timed(timings, "persist.related_pages"):
+                    await backfill_related_pages(
+                        session,
+                        repo_id,
+                        import_edges=file_import_edges(graph_builder),
+                        git_meta_map=git_meta_map,
+                        pagerank=graph_builder.pagerank(),
+                        # This run's pages carry fresher metadata (including
+                        # module siblings) than the recompute could produce.
+                        skip_page_ids={p.page_id for p in generated_pages},
+                    )
             except Exception as exc:
                 _skip("Related-pages backfill", exc)
 
@@ -738,9 +763,43 @@ async def _persist_full_update_async(
             # detector computed decay_only all along but it was never
             # persisted.
             try:
-                from repowise.core.pipeline.persist import mark_stale_pages
+                from repowise.core.generation import GenerationConfig
+                from repowise.core.generation.cascade import expand_cascade
+                from repowise.core.generation.models import compute_page_id
+                from repowise.core.generation.scope import (
+                    build_dependencies,
+                    load_page_records,
+                )
+                from repowise.core.pipeline.persist import mark_page_ids_stale
+                from repowise.core.pipeline.scoped_generation import (
+                    _load_page_rows,
+                    load_kg_context,
+                )
+                from repowise.core.repo_config import load_repo_config
 
-                await mark_stale_pages(session, repo_id, decay_paths or [])
+                with timed(timings, "persist.stale_pages"):
+                    if decay_paths:
+                        repo_cfg = load_repo_config(repo_path)
+                        generation_config = GenerationConfig.from_repo_config(repo_cfg)
+                        records = load_page_records(await _load_page_rows(session, repo_id))
+                        deps = build_dependencies(
+                            parsed_files=parsed_files or [],
+                            graph_builder=graph_builder,
+                            config=generation_config,
+                            kg_ctx=load_kg_context(Path(repo_path)),
+                            records=records,
+                            repo_name=repo_name,
+                        )
+                        seed_ids = {compute_page_id("file_page", path) for path in decay_paths}
+                        # mode="none": mark dependents stale, do not regenerate
+                        # them. "dependents" would regenerate every module/SCC/
+                        # repo-wide container touched by this commit, spending
+                        # model budget on every `update`, the exact cost
+                        # AUTO_SYNC.md promises sync never incurs. Marking is
+                        # free; the operator opts into the spend explicitly via
+                        # `generate --stale`.
+                        cascade = expand_cascade(seed_ids, "none", deps)
+                        await mark_page_ids_stale(session, repo_id, cascade.stale_ids | seed_ids)
             except Exception as exc:
                 _skip("Stale-page decay", exc)
 
@@ -749,7 +808,8 @@ async def _persist_full_update_async(
             try:
                 from repowise.core.pipeline.page_tree_sync import rebuild_page_tree
 
-                await rebuild_page_tree(session, repo_id)
+                with timed(timings, "persist.page_tree"):
+                    await rebuild_page_tree(session, repo_id)
             except Exception as exc:
                 _skip("Page tree rebuild", exc)
 
@@ -759,7 +819,8 @@ async def _persist_full_update_async(
                 try:
                     from repowise.core.pipeline.persist import persist_kg
 
-                    await persist_kg(knowledge_graph_result, session, repo_id)
+                    with timed(timings, "persist.kg"):
+                        await persist_kg(knowledge_graph_result, session, repo_id)
                 except Exception as exc:
                     _skip("Knowledge-graph persist", exc)
 
@@ -774,21 +835,25 @@ async def _persist_full_update_async(
                     # Changed files' full rows + idle files' decay-only rows
                     # (#728), then a repo-wide percentile re-rank over the fresh
                     # scores.
-                    await upsert_git_metadata_bulk(
-                        session,
-                        repo_id,
-                        [*git_meta_map.values(), *(git_decay_map or {}).values()],
-                    )
-                    await recompute_git_percentiles(session, repo_id)
+                    with timed(timings, "persist.git"):
+                        await upsert_git_metadata_bulk(
+                            session,
+                            repo_id,
+                            [*git_meta_map.values(), *(git_decay_map or {}).values()],
+                        )
+                        await recompute_git_percentiles(session, repo_id)
                 except Exception as exc:
                     _skip("Git persist", exc)
                 try:
-                    await _persist_incremental_commits(session, repo_id, repo_path)
+                    with timed(timings, "persist.commits"):
+                        await _persist_incremental_commits(session, repo_id, repo_path)
                 except Exception as exc:
                     _skip("Commit capture", exc)
 
             # Decision records: new markers + harvested decisions, supersession
             # detection, staleness recompute.
+            if timings is not None:
+                timings.start("persist.decisions")
             try:
                 # The same three store repairs the full-index path runs, in the
                 # same order (see ``pipeline/persist.py``). They live here too
@@ -865,14 +930,20 @@ async def _persist_full_update_async(
                     await recompute_decision_staleness(session, repo_id, git_meta_map)
             except Exception as exc:
                 _skip("Decision persist", exc)
+            finally:
+                if timings is not None:
+                    timings.stop("persist.decisions")
 
             # Governance findings pass: runs after decisions + staleness.
+            if timings is not None:
+                timings.start("persist.governance")
             try:
                 from sqlalchemy import select as _sel_dec
 
                 from repowise.core.analysis.health.governance import build_governance_findings
                 from repowise.core.persistence.crud import (
                     get_decision_health_summary,
+                    get_scored_file_paths,
                     replace_governance_findings,
                 )
                 from repowise.core.persistence.models import DecisionRecord
@@ -885,15 +956,20 @@ async def _persist_full_update_async(
                 _gov = build_governance_findings(
                     health_summary=_summary,
                     decisions=_decisions,
+                    scored_paths=await get_scored_file_paths(session, repo_id),
                 )
                 await replace_governance_findings(session, repo_id, _gov)
             except Exception as exc:
                 _skip("Governance findings", exc)
+            finally:
+                if timings is not None:
+                    timings.stop("persist.governance")
 
             # Code-health findings + metrics (partial — upsert only).
             if partial_health_report is not None:
                 try:
-                    await _persist_partial_health(session, repo_id, partial_health_report)
+                    with timed(timings, "persist.health"):
+                        await _persist_partial_health(session, repo_id, partial_health_report)
                 except Exception as exc:
                     _skip("Health persist", exc)
 
@@ -908,12 +984,13 @@ async def _persist_full_update_async(
 
                     from repowise.core.persistence.crud import replace_dead_code_findings
 
-                    await replace_dead_code_findings(
-                        session,
-                        repo_id,
-                        [_dc_dead.asdict(f) for f in dead_code_report.findings],
-                        scope=dead_code_report.authoritative_paths,
-                    )
+                    with timed(timings, "persist.dead_code"):
+                        await replace_dead_code_findings(
+                            session,
+                            repo_id,
+                            [_dc_dead.asdict(f) for f in dead_code_report.findings],
+                            scope=dead_code_report.authoritative_paths,
+                        )
                 except Exception as exc:
                     _skip("Dead-code persist", exc)
 
@@ -922,7 +999,8 @@ async def _persist_full_update_async(
             try:
                 from repowise.core.pipeline.persist import persist_graph_nodes
 
-                await persist_graph_nodes(session, repo_id, graph_builder)
+                with timed(timings, "persist.graph_nodes"):
+                    await persist_graph_nodes(session, repo_id, graph_builder)
             except Exception as exc:
                 _skip("Graph nodes persist", exc)
 
@@ -932,9 +1010,10 @@ async def _persist_full_update_async(
             try:
                 from repowise.core.pipeline.persist import persist_incremental_symbols
 
-                await persist_incremental_symbols(
-                    session, repo_id, parsed_files, [fd.path for fd in file_diffs]
-                )
+                with timed(timings, "persist.symbols"):
+                    await persist_incremental_symbols(
+                        session, repo_id, parsed_files, [fd.path for fd in file_diffs]
+                    )
             except Exception as exc:
                 _skip("Symbol persist", exc)
 
@@ -945,9 +1024,14 @@ async def _persist_full_update_async(
             try:
                 from repowise.core.pipeline.persist import persist_incremental_edges
 
-                await persist_incremental_edges(
-                    session, repo_id, graph_builder, parsed_files, [fd.path for fd in file_diffs]
-                )
+                with timed(timings, "persist.edges"):
+                    await persist_incremental_edges(
+                        session,
+                        repo_id,
+                        graph_builder,
+                        parsed_files,
+                        [fd.path for fd in file_diffs],
+                    )
             except Exception as exc:
                 _skip("Graph edges persist", exc)
 
@@ -957,7 +1041,8 @@ async def _persist_full_update_async(
             try:
                 from repowise.core.pipeline.incremental import refresh_external_systems
 
-                await refresh_external_systems(session, repo_id, repo_path, file_diffs)
+                with timed(timings, "persist.external_systems"):
+                    await refresh_external_systems(session, repo_id, repo_path, file_diffs)
             except Exception as exc:
                 _skip("External systems refresh", exc)
 
@@ -1009,6 +1094,8 @@ async def _persist_full_update_async(
 
         # FTS outside the transaction — rebuildable, and its writer manages
         # its own connection state.
+        if timings is not None:
+            timings.start("persist.fts")
         try:
             fts = FullTextSearch(engine)
             await fts.ensure_index()
@@ -1034,6 +1121,9 @@ async def _persist_full_update_async(
                 await fts.delete_many(swept_page_ids)
         except Exception as exc:
             _skip("Full-text search indexing", exc)
+        finally:
+            if timings is not None:
+                timings.stop("persist.fts")
         return total_pages
     finally:
         await engine.dispose()
@@ -1195,12 +1285,21 @@ async def _rescore_health_from_db(
                 session, repo_id, report, analyzed_commit=get_head_commit(Path(repo_path))
             )
             if coverage_files:
+                # Stamp the live HEAD from disk, not the stored
+                # ``repo.head_commit`` column. The column names the last
+                # *indexed* commit; the coverage just scored describes the
+                # working tree, and the two diverge when the tree moved after
+                # the last index (issue #1747). Live HEAD is the provenance
+                # answer: it is the tree the coverage was measured against.
+                live_head = get_head_commit(Path(repo_path)) or getattr(
+                    repo, "head_commit", None
+                )
                 await save_coverage_files(
                     session,
                     repo_id,
                     coverage_files,
                     source_format=coverage_format or "lcov",
-                    ingested_commit_sha=getattr(repo, "head_commit", None),
+                    ingested_commit_sha=live_head,
                 )
             await persist_graph_nodes(session, repo_id, graph_builder)
 
@@ -1281,7 +1380,15 @@ def _full_rescore_interval_days() -> float:
         try:
             return max(0.0, float(raw))
         except ValueError:
-            pass
+            # Say it where the user will actually see it: a silently-ignored
+            # value makes the rescore cadence look deliberate when it is
+            # actually the default (issue #1370). stderr matches how
+            # build_embedder reports the same class of misconfiguration.
+            print(
+                f"REPOWISE_FULL_RESCORE_INTERVAL_DAYS={raw!r} is not a number; "
+                f"using the default {_FULL_RESCORE_INTERVAL_DAYS} days.",
+                file=sys.stderr,
+            )
     return _FULL_RESCORE_INTERVAL_DAYS
 
 
