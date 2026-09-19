@@ -140,6 +140,12 @@ def _coerce_dt(value: datetime | str) -> datetime:
 # ---------------------------------------------------------------------------
 
 
+#: The output budget for one batch of either commit prompt. Reasoning tokens
+#: are charged to it, so a budget that only fits the answer buys an empty
+#: body rather than a short one. Roughly twice the largest completion measured
+#: on this repository; see decision ``1c228ed8``.
+_BATCH_MAX_TOKENS = 8000
+
 #: How many of a commit's files either commit prompt will show. The model has
 #: to read the list to pick from it, and a commit that touched ninety files is
 #: not one whose decisions can be assigned by reading the list anyway.
@@ -235,6 +241,15 @@ class DecisionSourceError(RuntimeError):
     Raised so :meth:`DecisionExtractor.extract_all` records the source as
     failed rather than empty. A source that loses *some* batches still
     returns what it has and only logs, because partial supply beats none.
+    """
+
+
+class EmptyModelResponseError(DecisionSourceError):
+    """The model returned no body at all for one batch.
+
+    Distinct from ``[]``, which is a real answer and the common one. Raised so
+    the batch lands in :func:`_collect_batches` as a failure rather than as a
+    source with nothing in it.
     """
 
 
@@ -798,7 +813,7 @@ class DecisionExtractor:
 
             prompt = GIT_ARCHAEOLOGY_PROMPT.format(commits_block=commits_block)
             response = await provider.generate(
-                _SYSTEM_PROMPT, prompt, max_tokens=2000, temperature=0.2
+                _SYSTEM_PROMPT, prompt, max_tokens=_BATCH_MAX_TOKENS, temperature=0.2
             )
             extracted = self._parse_decisions_json(response.content)
 
@@ -1075,7 +1090,7 @@ class DecisionExtractor:
             # requests" — the exact zero-that-means-failure this change exists
             # to remove.
             response = await provider.generate(
-                _SYSTEM_PROMPT, prompt, max_tokens=2500, temperature=0.2
+                _SYSTEM_PROMPT, prompt, max_tokens=_BATCH_MAX_TOKENS, temperature=0.2
             )
             extracted = self._parse_decisions_json(response.content)
             for d in extracted:
@@ -1698,9 +1713,17 @@ class DecisionExtractor:
         return tags
 
     def _parse_decisions_json(self, content: str) -> list[ExtractedDecision]:
-        """Parse LLM response as JSON array of decisions."""
+        """Parse LLM response as JSON array of decisions.
+
+        A blank body raises :class:`EmptyModelResponseError`; every caller
+        sits inside a gather or a fallback that counts that as a lost batch.
+        """
         # Extract JSON from response (may be wrapped in markdown code blocks)
         content = content.strip()
+        if not content:
+            raise EmptyModelResponseError(
+                "the model returned no content for this batch"
+            )
         if content.startswith("```"):
             # Remove markdown code fences
             lines = content.split("\n")
