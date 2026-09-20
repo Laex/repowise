@@ -1163,6 +1163,8 @@ class DecisionAcceptance(Base):
     The CHECK constraints are the acceptance contract, enforced by the database
     rather than by whichever caller happens to be writing: a reason, a scope, an
     evidence reference, and an accepter or artifact identity.
+
+    ``accepter_kind`` is the fifth: the identity says who, this says what.
     """
 
     __tablename__ = "decision_acceptances"
@@ -1172,6 +1174,12 @@ class DecisionAcceptance(Base):
         CheckConstraint("scope_json NOT IN ('', '[]')", name="ck_acceptance_scope"),
         CheckConstraint("evidence_json NOT IN ('', '[]')", name="ck_acceptance_evidence"),
         CheckConstraint("accepter <> '' OR artifact <> ''", name="ck_acceptance_identity"),
+        # A local store takes its columns from the additive reconciler and
+        # never this CHECK, so ``record_acceptance`` is the enforcement.
+        CheckConstraint(
+            "accepter_kind IN ('', 'person', 'agent', 'import')",
+            name="ck_acceptance_accepter_kind",
+        ),
         CheckConstraint(
             "currency IN ('active', 'needs_review', 'uncheckable', 'superseded', 'dismissed')",
             name="ck_acceptance_currency",
@@ -1207,6 +1215,10 @@ class DecisionAcceptance(Base):
     #: the only accepter that is not a person.
     accepter: Mapped[str] = mapped_column(Text, nullable=False, default="")
     artifact: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    #: person | agent | import, or '' on a row written before provenance.
+    accepter_kind: Mapped[str] = mapped_column(String(16), nullable=False, default="")
+    #: The agent session that signed, when one did.
+    accepter_session: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     note: Mapped[str] = mapped_column(Text, nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_now_utc

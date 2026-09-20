@@ -16,6 +16,9 @@ from dataclasses import dataclass
 
 __all__ = [
     "ACCEPTANCE_ACTIONS",
+    "ACCEPTER_KINDS",
+    "ACCEPTER_SESSION_MAX",
+    "AGENT_ACCEPTANCE_REMEDY",
     "AGREEMENT_KIND",
     "AGREEMENT_SCOPE",
     "ARCHITECTURAL_KIND",
@@ -23,17 +26,21 @@ __all__ = [
     "DECISION_CURRENCIES",
     "DECISION_KINDS",
     "DECISION_STATUS_ORDER",
+    "GRANTING_ACTIONS",
     "NEEDS_REVIEW_STALENESS",
     "REVIEW_LANES",
     "SPLIT_MARKERS",
     "STORED_CURRENCIES",
+    "UNRECORDED_ACCEPTER_KIND",
     "AcceptanceRequirement",
     "acceptance_blockers",
+    "accepter_kind_blocker",
     "bundles_decisions",
     "currency_for_legacy_status",
     "effective_currency",
     "is_governing",
     "legacy_status_for_currency",
+    "machine_grant_blocker",
     "status_rank",
 ]
 
@@ -155,6 +162,56 @@ ACCEPTANCE_ACTIONS: tuple[str, ...] = (
     "dismissed",
     "returned_to_review",
 )
+
+#: Actions that create or renew authority, against the three that withdraw it.
+GRANTING_ACTIONS: frozenset[str] = frozenset({"accepted", "reaffirmed", "merged"})
+
+#: Who signed an acceptance. ``person`` is a human, ``agent`` a coding agent
+#: or a pipeline stage, ``import`` a tracked artifact or manifest speaking for
+#: whoever committed it. ``accepter`` alone cannot answer this: it is a free
+#: string resolved from the repository's git identity, so a machine signing
+#: reads as a person.
+#:
+#: Stored ``""`` is a row written before this column, never backfilled to
+#: ``person``: "unrecorded" and "a human signed" are what this keeps apart.
+ACCEPTER_KINDS: tuple[str, ...] = ("person", "agent", "import")
+UNRECORDED_ACCEPTER_KIND = ""
+
+#: Width of ``decision_acceptances.accepter_session``, so a caller can refuse
+#: a longer id rather than hand Postgres a truncation error.
+ACCEPTER_SESSION_MAX = 64
+
+#: What fixes a :func:`machine_grant_blocker` refusal. Addressed to a person,
+#: because the party reading it is the agent that was just refused.
+AGENT_ACCEPTANCE_REMEDY = (
+    "Someone who owns this repository can allow it with "
+    "`repowise decision config agent-acceptance --on`, or accept it themselves."
+)
+
+
+def accepter_kind_blocker(kind: str) -> str | None:
+    """Why *kind* cannot be stamped on a new acceptance, or ``None``."""
+    if kind in ACCEPTER_KINDS:
+        return None
+    if kind == UNRECORDED_ACCEPTER_KIND:
+        return "no accepter kind: say whether a person, an agent or an import signed this"
+    return f"unknown accepter kind {kind!r}: one of {', '.join(ACCEPTER_KINDS)}"
+
+
+def machine_grant_blocker(kind: str, action: str, *, granted: bool) -> str | None:
+    """Why an agent may not take *action*, or ``None``.
+
+    A machine revokes but does not grant: withdrawing narrows what a record
+    claims and re-accepting undoes it, while granting mints a constraint
+    nobody agreed to. Stated rather than left true by omission.
+    """
+    if kind != "agent" or action not in GRANTING_ACTIONS or granted:
+        return None
+    return (
+        f"an agent may not record a {action!r} acceptance: machines withdraw "
+        "authority but do not grant it"
+    )
+
 
 #: The fraction of a decision's files that must have moved before the decision
 #: is worth re-reading. Same 0.5 the staleness surfaces already use; the number

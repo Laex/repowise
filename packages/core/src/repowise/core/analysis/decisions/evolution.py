@@ -771,6 +771,8 @@ async def _retire(session, record, *, successor_id: str | None = None) -> None:
                 action="superseded",
                 currency="superseded",
                 accepter="evolution",
+                # This stage retires records and has no path that accepts one.
+                kind="agent",
                 note="a later commit reversed this decision",
             )
     record.status = "superseded"
