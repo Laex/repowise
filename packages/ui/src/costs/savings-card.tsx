@@ -5,80 +5,84 @@ import { Card, CardContent } from "../ui/card";
 import { Skeleton, SkeletonRegion } from "../ui/skeleton";
 import { formatCost, formatTokens } from "../lib/format";
 
-export interface DistillSavingsGroup {
-  group: string;
+export interface SavingsBreakdownRow {
+  group: string | null;
   events: number;
-  raw_tokens: number;
-  distilled_tokens: number;
-  saved_tokens: number;
+  saved_input_tokens: number;
 }
 
-export interface McpDropGroup {
-  tool: string;
+export interface SavingsAgentRow {
+  agent: string;
+  agent_display_name: string | null;
   events: number;
-  tokens: number;
-  /** "counterfactual" (answer replaced raw exploration) or "truncation" (budget drop). */
-  kind?: string;
+  saved_input_tokens: number;
 }
 
-export interface DistillSavingsData {
+/** The canonical savings report. Field names match the wire exactly, so this
+ *  component never has to know how a number was derived — only how to show it. */
+export interface SavingsData {
   available: boolean;
-  events: number;
-  raw_tokens: number;
-  distilled_tokens: number;
-  saved_tokens: number;
-  estimated_usd_saved: number;
-  pricing_model: string;
-  pricing_agent?: string;
-  pricing_source?: string;
-  per_filter: DistillSavingsGroup[];
-  per_day: DistillSavingsGroup[];
-  mcp_events?: number;
-  mcp_tokens?: number;
-  /** Count of counterfactual MCP queries answered ("N MCP queries answered"). */
-  mcp_queries?: number;
-  mcp_per_tool?: McpDropGroup[];
-  /** Raw (non-distilled) agent commands a filter would have caught. */
+  unique_events: number;
+  mcp_queries_answered: number;
+  saved_input_tokens: number;
+  measured_saved_input_tokens: number;
+  inferred_saved_input_tokens: number;
+  priced_saved_input_tokens: number;
+  unpriced_saved_input_tokens: number;
+  priced_input_savings_usd: number;
+  per_operation: SavingsBreakdownRow[];
+  per_surface: SavingsBreakdownRow[];
+  /** Carried for callers and for the Phase 4 surface; this card does not
+   *  render it, so it is optional rather than a required field nothing reads. */
+  per_agent?: SavingsAgentRow[];
+  per_day?: SavingsBreakdownRow[];
   missed_events?: number;
   missed_tokens_est?: number;
   missed_window_days?: number;
-  /** Full re-reads of unchanged files a targeted get_symbol would have replaced. */
   reread_events?: number;
   reread_tokens_est?: number;
 }
 
-export interface DistillSavingsCardProps {
-  /** Savings rollup from /distill-savings; undefined while loading. */
-  data?: DistillSavingsData;
+export interface SavingsCardProps {
+  /** The savings report; undefined while loading. */
+  data?: SavingsData;
 }
 
 const DISTILL_DOCS = "https://github.com/repowise-dev/repowise/blob/main/docs/agent/DISTILL.md";
 
-/** Humanize the resolved pricing agent for the "priced at" caption. */
-function agentLabel(agent: string | undefined): string {
-  if (agent === "claude_code") return "Claude Code";
-  if (agent === "codex") return "Codex";
-  return "";
+/** Surface slugs read as identifiers; these are the words for them. Kept here
+ *  rather than server-side because a surface is a fixed part of the accounting
+ *  contract, unlike an agent, whose label comes from the registry on the wire. */
+const SURFACE_LABELS: Record<string, string> = {
+  distill: "Distill",
+  hook: "Hooks",
+  mcp: "MCP",
+  vscode_lm: "VS Code",
+};
+
+function surfaceLabel(slug: string | null): string {
+  if (!slug) return "Unknown";
+  return SURFACE_LABELS[slug] ?? slug;
 }
 
 /**
- * Hero results card for the Costs page: every token & dollar repowise saved the
- * coding agent, across the `repowise distill` ledger (CLI + hook) and the MCP
- * tools — each curated answer replacing raw file exploration. Priced at the
- * agent's *real* model — saved tokens are input the agent never had to read.
+ * Hero results card for the Costs page: the input tokens repowise kept out of
+ * the agent's context, and what they were worth.
+ *
+ * The headline is deliberately not one confident number. Measured reductions
+ * (a known before and after) and inferred avoidance (a documented
+ * counterfactual) are different evidence and are shown as such, and the dollar
+ * figure covers only the tokens whose events carried a rate.
  */
-export function DistillSavingsCard({ data }: DistillSavingsCardProps) {
-  const distillSaved = data?.saved_tokens ?? 0;
-  const mcpSaved = data?.mcp_tokens ?? 0;
-  const total = distillSaved + mcpSaved;
+export function SavingsCard({ data }: SavingsCardProps) {
+  const total = data?.saved_input_tokens ?? 0;
   const hasData = !!data?.available && total > 0;
 
   if (!data) {
-    // Mirrors the populated card below rather than reserving a flat block:
-    // headline, the two right-aligned totals, the breakdown bar with its
-    // legend, and the two detail columns. The flat version stood 176px tall
-    // against a card that measures 350-450px, so the whole page jumped on
-    // first paint.
+    // Mirrors the populated card rather than reserving a flat block: headline,
+    // the right-aligned totals, the evidence bar with its legend, and the two
+    // detail columns. A flat version stood 176px against a card measuring
+    // 350-450px, so the whole page jumped on first paint.
     return (
       <Card>
         <CardContent className="py-6">
@@ -96,9 +100,11 @@ export function DistillSavingsCard({ data }: DistillSavingsCardProps) {
                     <Skeleton className="block h-[1lh] w-24" />
                   </span>
                 </div>
-                <p className="mt-1 text-xs">
+                {/* A div, not a p: Skeleton renders a div, and a p may not
+                    contain one. */}
+                <div className="mt-1 text-xs">
                   <Skeleton className="block h-[1lh] w-56" />
-                </p>
+                </div>
               </div>
               <div className="flex gap-6">
                 {[0, 1].map((i) => (
@@ -160,25 +166,18 @@ export function DistillSavingsCard({ data }: DistillSavingsCardProps) {
     );
   }
 
-  const distillPct = total > 0 ? Math.round((distillSaved / total) * 100) : 0;
-  const mcpPct = 100 - distillPct;
-  const topFilters = [...data.per_filter]
-    .sort((a, b) => b.saved_tokens - a.saved_tokens)
-    .slice(0, 5);
-  const topTools = (data.mcp_per_tool ?? []).slice(0, 5);
-  const priced = agentLabel(data.pricing_agent) || data.pricing_model;
-  const detected = data.pricing_source && data.pricing_source !== "default";
+  const measured = data.measured_saved_input_tokens;
+  const inferred = data.inferred_saved_input_tokens;
+  const measuredPct = total > 0 ? Math.round((measured / total) * 100) : 0;
+  const inferredPct = 100 - measuredPct;
+  const topOperations = data.per_operation.slice(0, 5);
+  const topSurfaces = data.per_surface.slice(0, 5);
   const missed = (data.missed_tokens_est ?? 0) > 0;
   const reread = (data.reread_tokens_est ?? 0) > 0;
-
-  // Prefer the counterfactual framing ("N queries answered") when any MCP call
-  // recorded a real saving; fall back to the truncation-drop count otherwise.
-  const mcpQueries = data.mcp_queries ?? 0;
-  const mcpEvents = data.mcp_events ?? 0;
-  const mcpCaption =
-    mcpQueries > 0
-      ? `MCP · ${mcpQueries.toLocaleString()} quer${mcpQueries === 1 ? "y" : "ies"} answered`
-      : `MCP · ${mcpEvents.toLocaleString()} drop${mcpEvents === 1 ? "" : "s"}`;
+  const unpriced = data.unpriced_saved_input_tokens;
+  // "Estimated" while any of the total rests on a counterfactual rather than a
+  // measured before and after.
+  const headline = inferred > 0 ? "Estimated agent savings" : "Tokens saved for your agent";
 
   return (
     <Card>
@@ -188,139 +187,147 @@ export function DistillSavingsCard({ data }: DistillSavingsCardProps) {
           <div>
             <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-wide text-[var(--color-text-tertiary)]">
               <Sparkles className="h-3.5 w-3.5 text-[var(--color-savings-distill)]" />
-              Tokens saved for your agent
+              {headline}
             </div>
             <div className="mt-1 flex items-baseline gap-3">
               <span className="text-4xl font-semibold tabular-nums text-[var(--color-text-primary)]">
                 {formatTokens(total)}
               </span>
               <span className="text-2xl font-semibold tabular-nums text-[var(--color-success)]">
-                {formatCost(data.estimated_usd_saved)}
+                {formatCost(data.priced_input_savings_usd)}
               </span>
             </div>
             <p className="mt-1 text-xs text-[var(--color-text-secondary)]">
-              priced at {priced}
-              {detected ? (
-                <span className="text-[var(--color-text-tertiary)]"> · {data.pricing_source}</span>
-              ) : (
+              {unpriced > 0 ? (
                 <span
-                  className="text-[var(--color-text-tertiary)]"
-                  title="No agent session was detected, so savings are valued at the standard published rate for this model."
+                  title="Each event is priced at the rate recorded when it happened. Events recorded without a rate are counted but not valued."
                 >
-                  {" "}
-                  · estimated at the standard model rate
+                  priced on {formatTokens(data.priced_saved_input_tokens)} of{" "}
+                  {formatTokens(total)} tokens
                 </span>
+              ) : (
+                <span>priced at the rate recorded on each event</span>
               )}
             </p>
           </div>
           <div className="flex gap-6 text-right">
             <div>
               <div className="text-lg font-semibold tabular-nums text-[var(--color-text-primary)]">
-                {formatTokens(distillSaved)}
+                {data.unique_events.toLocaleString()}
               </div>
               <div className="text-xs text-[var(--color-text-tertiary)]">
-                distill · {data.events.toLocaleString()} event{data.events === 1 ? "" : "s"}
+                interaction{data.unique_events === 1 ? "" : "s"}
               </div>
             </div>
             <div>
               <div className="text-lg font-semibold tabular-nums text-[var(--color-text-primary)]">
-                {formatTokens(mcpSaved)}
+                {data.mcp_queries_answered.toLocaleString()}
               </div>
-              <div className="text-xs text-[var(--color-text-tertiary)]">{mcpCaption}</div>
+              <div className="text-xs text-[var(--color-text-tertiary)]">
+                MCP quer{data.mcp_queries_answered === 1 ? "y" : "ies"} answered
+              </div>
             </div>
           </div>
         </div>
 
-        {/* Two-segment breakdown bar */}
+        {/* Evidence mix — the distinction the headline must not flatten. */}
         <div className="mt-4 flex h-2.5 w-full overflow-hidden rounded-full bg-[var(--color-bg-inset)]">
-          {distillSaved > 0 && (
+          {measured > 0 && (
             <div
               className="h-full bg-[var(--color-savings-distill)]"
-              style={{ width: `${distillPct}%` }}
-              title={`Distill — ${formatTokens(distillSaved)} (${distillPct}%)`}
+              style={{ width: `${measuredPct}%` }}
+              title={`Measured — ${formatTokens(measured)} (${measuredPct}%)`}
             />
           )}
-          {mcpSaved > 0 && (
+          {inferred > 0 && (
             <div
               className="h-full bg-[var(--color-savings-mcp)]"
-              style={{ width: `${mcpPct}%` }}
-              title={`MCP tools — ${formatTokens(mcpSaved)} (${mcpPct}%)`}
+              style={{ width: `${inferredPct}%` }}
+              title={`Inferred — ${formatTokens(inferred)} (${inferredPct}%)`}
             />
           )}
         </div>
         <div className="mt-1.5 flex items-center gap-4 text-xs text-[var(--color-text-secondary)]">
           <span className="flex items-center gap-1.5">
-            <span className="h-2 w-2 rounded-full bg-[var(--color-savings-distill)]" /> Distill {distillPct}%
+            <span className="h-2 w-2 rounded-full bg-[var(--color-savings-distill)]" /> Measured{" "}
+            {formatTokens(measured)}
           </span>
           <span className="flex items-center gap-1.5">
-            <span className="h-2 w-2 rounded-full bg-[var(--color-savings-mcp)]" /> MCP tools {mcpPct}%
+            <span className="h-2 w-2 rounded-full bg-[var(--color-savings-mcp)]" /> Inferred{" "}
+            {formatTokens(inferred)}
           </span>
         </div>
 
-        {/* Per-surface detail */}
+        {/* Where the savings came from */}
         <div className="mt-4 grid grid-cols-1 gap-x-8 gap-y-4 sm:grid-cols-2">
-          {topFilters.length > 0 && (
+          {topSurfaces.length > 0 && (
             <SurfaceDetail
-              title="Distill — by filter"
-              rows={topFilters.map((f) => ({
-                label: f.group,
-                tokens: f.saved_tokens,
+              title="By surface"
+              rows={topSurfaces.map((row) => ({
+                label: surfaceLabel(row.group),
+                tokens: row.saved_input_tokens,
               }))}
-              max={distillSaved}
+              max={total}
               barClass="bg-[var(--color-savings-distill)]"
             />
           )}
-          {topTools.length > 0 && (
+          {topOperations.length > 0 && (
             <SurfaceDetail
-              title="MCP — by tool"
-              rows={topTools.map((t) => ({ label: t.tool, tokens: t.tokens }))}
-              max={mcpSaved}
+              title="By operation"
+              rows={topOperations.map((row) => ({
+                label: row.group ?? "Unknown",
+                tokens: row.saved_input_tokens,
+              }))}
+              max={total}
               barClass="bg-[var(--color-savings-mcp)]"
             />
           )}
         </div>
 
-        {/* Missed → opportunity CTA */}
+        {/* Observed opportunities — never part of the total above. */}
         {missed && (
-          <a
-            href={DISTILL_DOCS}
-            target="_blank"
-            rel="noreferrer"
-            className="mt-5 flex items-center gap-3 rounded-lg border border-[var(--color-warning)]/30 bg-[var(--color-warning)]/5 px-3 py-2.5 transition-colors hover:bg-[var(--color-warning)]/10"
-          >
+          <div className="mt-5 flex items-center gap-3 rounded-lg border border-[var(--color-warning)]/30 bg-[var(--color-warning)]/5 px-3 py-2.5">
             <Zap className="h-4 w-4 shrink-0 text-[var(--color-warning)]" />
             <div className="text-xs text-[var(--color-text-secondary)]">
               <span className="font-medium text-[var(--color-warning)]">
-                Unlock ~{formatTokens(data.missed_tokens_est ?? 0)} more
+                Observed opportunity: ~{formatTokens(data.missed_tokens_est ?? 0)}
               </span>{" "}
               — {(data.missed_events ?? 0).toLocaleString()} raw command
-              {(data.missed_events ?? 0) === 1 ? "" : "s"} bypassed distill in the last{" "}
-              {data.missed_window_days ?? 7} days. Enable auto-capture →
+              {(data.missed_events ?? 0) === 1 ? "" : "s"} bypassed distillation in the last{" "}
+              {data.missed_window_days ?? 7} days.{" "}
+              <a
+                href={DISTILL_DOCS}
+                target="_blank"
+                rel="noreferrer"
+                className="underline underline-offset-2 hover:text-[var(--color-text-primary)]"
+              >
+                See the distillation setup guide
+              </a>
             </div>
-          </a>
+          </div>
         )}
 
-        {/* Re-read waste → MCP opportunity CTA */}
         {reread && (
           <div className="mt-3 flex items-center gap-3 rounded-lg border border-[var(--color-warning)]/30 bg-[var(--color-warning)]/5 px-3 py-2.5">
             <Zap className="h-4 w-4 shrink-0 text-[var(--color-warning)]" />
             <div className="text-xs text-[var(--color-text-secondary)]">
               <span className="font-medium text-[var(--color-warning)]">
-                Save ~{formatTokens(data.reread_tokens_est ?? 0)} more
+                Potentially avoid ~{formatTokens(data.reread_tokens_est ?? 0)}
               </span>{" "}
               — {(data.reread_events ?? 0).toLocaleString()} full re-read
-              {(data.reread_events ?? 0) === 1 ? "" : "s"} of unchanged files a targeted{" "}
-              <code>get_symbol</code> would have replaced.
+              {(data.reread_events ?? 0) === 1 ? "" : "s"} of unchanged files{" "}
+              {(data.reread_events ?? 0) === 1 ? "was" : "were"} observed.
             </div>
           </div>
         )}
 
         <p className="mt-3 text-xs leading-snug text-[var(--color-text-tertiary)]">
-          Distill counts <code>repowise distill</code> command/hook savings; MCP counts the raw
-          file exploration each tool answer replaced (plus any over-budget content trimmed). Saved
-          tokens are agent input priced at the agent&apos;s input rate, plus a small credit for the
-          tool calls repowise let the agent skip; counts are estimates (~chars/4) and deliberately
-          undersell. Everything stays on this machine.
+          Savings are input tokens your agent never had to read, recorded one event per
+          interaction across the <code>repowise distill</code> path, the replacement hooks and
+          MCP calls. Measured figures compare a known before and after; inferred figures estimate
+          the exploration an answer replaced. Each event is valued at the rate recorded when it
+          happened, so the dollar figure covers only priced events. Counts are estimates
+          (~chars/4) and deliberately undersell. Everything stays on this machine.
         </p>
       </CardContent>
     </Card>

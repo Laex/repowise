@@ -6,7 +6,6 @@ import json
 import os
 import subprocess
 from collections import Counter
-from dataclasses import replace
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -16,17 +15,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from repowise.core.analysis.change_risk import (
     SCORE_MEASURES,
     SCORE_UNIT,
-    BaselineSample,
     FixHistoryUnavailableError,
     RiskNormalizer,
+    assess_change,
     baseline_samples,
     change_features_from_stored,
-    change_fix_density,
     densities_excluding,
     extract_range_features,
-    fix_density_percentile,
     fix_pressure,
-    hot_files,
     range_anchor,
     review_priority_classification,
     score_change,
@@ -67,10 +63,6 @@ from repowise.server.schemas import (
 )
 from repowise.server.services.module_health import top_level_module
 from repowise.server.services.reviewer_suggestions import suggest_reviewers
-
-# Below this many sampled commits a percentile isn't worth showing; mirrors
-# the CLI's ``repowise risk`` threshold so the two surfaces agree.
-_MIN_BASELINE = 8
 
 router = APIRouter(
     prefix="/api/repos",
@@ -231,25 +223,39 @@ def _commit_detail_from_row(
 @router.get("/{repo_id}/commits", response_model=Paginated[CommitResponse])
 async def get_commits(
     repo_id: str,
-    sort: str = Query("risk", pattern="^(risk|date)$"),
+    sort: str = Query("date", pattern="^(risk|date)$"),
     authorship: str = Query("all", pattern="^(all|agent|human)$"),
+    kind: str = Query("all", pattern="^(all|high|fixes)$"),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     session: AsyncSession = Depends(get_db_session),
 ) -> Paginated[CommitResponse]:
     """Per-commit change-risk feed — the review-priority queue.
 
-    ``sort=risk`` (default) orders by supporting diff-shape score descending (the
-    review-priority order); ``sort=date`` orders by recency. ``authorship``
-    narrows the feed to agent-attributed or human commits. Each commit also
-    carries a **repo-relative** ``risk_percentile`` + ``review_priority`` so the
-    ranking is portable across repos (the absolute calibration band is not).
+    ``sort=date`` (default) orders by recency; ``sort=risk`` orders by the
+    supporting diff-shape score descending. ``authorship`` narrows to
+    agent-attributed or human commits, and ``kind`` to the ``high``
+    review-priority band or to ``fixes``. Each commit carries a
+    **repo-relative** ``risk_percentile`` + ``review_priority`` so the ranking
+    is portable across repos (the absolute calibration band is not).
     """
-    total = await crud.count_git_commits(session, repo_id, authorship=authorship)
-    rows = await crud.get_git_commits(
-        session, repo_id, limit=limit, offset=offset, sort=sort, authorship=authorship
-    )
     normalizer = RiskNormalizer.from_scores(await crud.get_commit_risk_scores(session, repo_id))
+    # The high band is a tercile of the repo's own scores, so the boundary has
+    # to be resolved before the page is cut rather than derived per row.
+    high_cut = normalizer.high_cut
+    total = await crud.count_git_commits(
+        session, repo_id, authorship=authorship, kind=kind, high_cut=high_cut
+    )
+    rows = await crud.get_git_commits(
+        session,
+        repo_id,
+        limit=limit,
+        offset=offset,
+        sort=sort,
+        authorship=authorship,
+        kind=kind,
+        high_cut=high_cut,
+    )
     author_counts = await _author_commit_counts(session, repo_id)
     items = [_commit_from_row(r, normalizer, author_counts) for r in rows]
     next_offset = offset + limit if offset + limit < total else None
@@ -701,43 +707,34 @@ def get_risk_range(
             status_code=400, detail=f"Could not read range {base!r}..{head!r}: {exc}"
         ) from exc
 
-    risk = score_change(features)
-
-    percentile: float | None = None
-    priority: str | None = None
-    samples: list[BaselineSample] = []
-    if baseline:
-        # Same anchor rule as the CLI/MCP scorer, so both surfaces rank a range
-        # against the history it forked from rather than against its own commits.
-        samples = baseline_samples(local_path, range_anchor(local_path, base, head), baseline, ())
-        scores = scores_excluding(samples, "")
-        if len(scores) >= _MIN_BASELINE:
-            normalizer = RiskNormalizer.from_scores(scores)
-            # Rank with experience unknown, matching the baseline (diff-shape
-            # percentile within the repo), keeping the comparison like-with-like.
-            rank_score = score_change(replace(features, exp=None)).score
-            percentile = normalizer.percentile(rank_score)
-            priority = normalizer.priority(rank_score)
-
-    # Read at the fork point, matching the CLI/MCP scorer: the record predates
-    # the change rather than counting fixes the range itself brought in.
+    # The fork point anchors both the baseline cohort and the fix record, so a
+    # range is ranked against the history it forked from and is never credited
+    # with fixes it brought in itself.
+    anchor = range_anchor(local_path, base, head)
+    samples = baseline_samples(local_path, anchor, baseline, ()) if baseline else []
     try:
-        pressure = fix_pressure(local_path, range_anchor(local_path, base, head))
-        fix_available = True
+        pressure: dict[str, float] | None = fix_pressure(local_path, anchor)
     except FixHistoryUnavailableError:
-        pressure, fix_available = {}, False
-    density = change_fix_density(pressure, features.file_churn)
+        pressure = None
+
+    assessed = assess_change(
+        features,
+        fix_pressure=pressure,
+        baseline_scores=scores_excluding(samples, ""),
+        baseline_fix_densities=densities_excluding(samples, "", pressure or {}),
+    )
+    risk, percentile, priority = assessed.risk, assessed.percentile, assessed.priority
 
     return RiskRangeResponse(
         base=base,
         head=head,
         fix_history=FixHistoryResponse(
-            available=fix_available,
-            density=round(density, 3),
-            percentile=fix_density_percentile(densities_excluding(samples, "", pressure), density),
+            available=assessed.fix_history_available,
+            density=assessed.fix_density,
+            percentile=assessed.fix_percentile,
             files=[
                 FixHistoryFileResponse(path=path, churn=churn, fix_pressure=p)
-                for path, churn, p in hot_files(pressure, features.file_churn)
+                for path, churn, p in assessed.hot_files
             ],
         ),
         risk_authority=change_risk_authority(),

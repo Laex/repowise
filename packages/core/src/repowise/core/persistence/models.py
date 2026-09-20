@@ -11,6 +11,7 @@ repowise.core.ingestion.models.Symbol in files that import from both modules.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
@@ -66,6 +67,16 @@ def _derive_decision_id_default(context: Any) -> str:
         params.get("title") or "",
         source=params.get("source") or DEFAULT_DECISION_SOURCE,
         evidence_file=params.get("evidence_file"),
+        affected_files=json.loads(params.get("affected_files_json") or "[]"),
+        evidence_line=params.get("evidence_line"),
+        # The same fallback ``upsert_decision`` uses: a path that supplies no
+        # quote still pins something, and the two agree on what.
+        identity_quote=(
+            params.get("identity_quote")
+            or params.get("decision")
+            or params.get("title")
+            or ""
+        ),
     )
 
 
@@ -111,6 +122,17 @@ class Repository(Base):
     # reconcile. NULL on indexes written before this, which just means the next
     # capture walks once and anchors itself.
     churn_anchor_sha: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    # The repo-wide 80th percentile of per-function modification counts, the
+    # gate ``function_hotspot`` scores against. Stored for the same reason as
+    # the totals above: the only other repo-wide source is the
+    # ``git_function_blame`` rollup, and that table is keyed by
+    # ``{path}::{name}``, so every same-named function in a file collapses to
+    # one row and the percentile is taken over a population missing those
+    # samples. A full index computes this over every walked function and writes
+    # it here; an incremental update reads it back, so a hotspot verdict does
+    # not flip between ``init`` and ``update`` (issue #1484). NULL until the
+    # first full index after this field landed, where the reader falls back.
+    function_mod_p80: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # ``parser_fingerprint()`` of the build that last wrote this repo's
     # ``graph_edges``. An incremental update only rewrites the git-changed
     # files' edges, so a query/extractor change would otherwise reach a file
@@ -620,6 +642,20 @@ class GitMetadata(Base):
     change_entropy: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     change_entropy_pct: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
 
+    # Co-change breadth, measured over every partner rather than over the
+    # truncated ``co_change_partners_json`` list: the distinct-partner total,
+    # the commit-decayed sum of their pair weights, and the repo-relative rank
+    # of that mass among files that have any (as ``change_entropy_pct`` does).
+    # All zero when the walk did not run, which keeps the biomarker silent.
+    co_change_partner_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    co_change_mass: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    co_change_scatter_pct: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+
+    # Repo-relative rank of prior_defect_count, so the entry gate is a share of
+    # this repository rather than a fixed number of fixes in six months, which
+    # a busy repository clears for most of its files.
+    prior_defect_pct: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+
     # Agent-provenance rollup: how much of this file's indexed history is
     # agent-attributed (deterministic local-channel classification — identity
     # fields, message footers, co-author trailers; see
@@ -897,6 +933,13 @@ class DecisionRecord(Base):
     status: Mapped[str] = mapped_column(
         String(32), nullable=False, default="proposed"
     )  # proposed | active | deprecated | superseded | dismissed
+    # Which of the two nouns this is. ``architectural`` is the default because
+    # it is the checkable one: a record wrongly left here keeps the contract it
+    # already had, while one wrongly called an agreement stops being checked
+    # against the code at all.
+    kind: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="architectural"
+    )  # architectural | agreement
     context: Mapped[str] = mapped_column(Text, nullable=False, default="")
     decision: Mapped[str] = mapped_column(Text, nullable=False, default="")
     rationale: Mapped[str] = mapped_column(Text, nullable=False, default="")
@@ -915,6 +958,26 @@ class DecisionRecord(Base):
     )  # git_archaeology | inline_marker | adr | pr | comment | session | cli
     evidence_file: Mapped[str | None] = mapped_column(Text, nullable=True)
     evidence_line: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    #: The verbatim span this record's identity is keyed on, written once
+    #: at first capture and never revised. Re-extraction rewords a quote
+    #: freely, and the id follows the identity, so re-deriving this would
+    #: move the id of an unchanged decision every time a model phrased it
+    #: differently. Empty on a record captured before the column existed;
+    #: the id migration fills it from the strongest evidence row it holds.
+    identity_quote: Mapped[str] = mapped_column(
+        Text, nullable=False, default="", server_default=""
+    )
+    #: How ``affected_files_json`` was arrived at, and so whether this record
+    #: may answer "what governs this path". ``commit_footprint`` means the
+    #: files are the file list of the commit the record was mined from: kept
+    #: for provenance and staleness, skipped by every path-scoped surface.
+    #: ``commit_selected`` means the same miner asked the model which of that
+    #: commit's files the decision was about and stored the answer, so the
+    #: list is a claim and binds.
+    #: See :func:`~repowise.core.analysis.decisions.scope.binds_to_paths`.
+    scope_basis: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="", server_default=""
+    )
     confidence: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
 
     # Verification (anti-hallucination gate, Phase 1D). Aggregate over the
@@ -1100,6 +1163,8 @@ class DecisionAcceptance(Base):
     The CHECK constraints are the acceptance contract, enforced by the database
     rather than by whichever caller happens to be writing: a reason, a scope, an
     evidence reference, and an accepter or artifact identity.
+
+    ``accepter_kind`` is the fifth: the identity says who, this says what.
     """
 
     __tablename__ = "decision_acceptances"
@@ -1109,6 +1174,12 @@ class DecisionAcceptance(Base):
         CheckConstraint("scope_json NOT IN ('', '[]')", name="ck_acceptance_scope"),
         CheckConstraint("evidence_json NOT IN ('', '[]')", name="ck_acceptance_evidence"),
         CheckConstraint("accepter <> '' OR artifact <> ''", name="ck_acceptance_identity"),
+        # A local store takes its columns from the additive reconciler and
+        # never this CHECK, so ``record_acceptance`` is the enforcement.
+        CheckConstraint(
+            "accepter_kind IN ('', 'person', 'agent', 'import')",
+            name="ck_acceptance_accepter_kind",
+        ),
         CheckConstraint(
             "currency IN ('active', 'needs_review', 'uncheckable', 'superseded', 'dismissed')",
             name="ck_acceptance_currency",
@@ -1144,6 +1215,10 @@ class DecisionAcceptance(Base):
     #: the only accepter that is not a person.
     accepter: Mapped[str] = mapped_column(Text, nullable=False, default="")
     artifact: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    #: person | agent | import, or '' on a row written before provenance.
+    accepter_kind: Mapped[str] = mapped_column(String(16), nullable=False, default="")
+    #: The agent session that signed, when one did.
+    accepter_session: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     note: Mapped[str] = mapped_column(Text, nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_now_utc
@@ -1381,6 +1456,110 @@ class DeadCodeFinding(Base):
     # The table had no index, so the per-file lookup the file page issues
     # full-scanned every finding in the repo to return the handful on one path.
     __table_args__ = (Index("ix_dead_code_repo_path", "repository_id", "file_path"),)
+
+
+class DocDriftReference(Base):
+    """One resolved ``(document, file)`` reference - the reverse index.
+
+    Where :class:`DocDriftFinding` stores what a document got *wrong*, this
+    stores what it got right: ``document_path`` names ``target_path`` and the
+    repository still has it. Complements, not two views of one thing: a
+    drifted reference resolves to nothing, so it can never appear here, and no
+    surface may read one as evidence against the other.
+
+    A table, not a graph edge, for :class:`TestCoverageEntry`'s reason - the
+    consumer is a straight lookup keyed by file path. It is stored at all
+    because the process answering "which documents mention this file" holds no
+    ``source_map``: 0.7 ms to serve, 243 ms to re-run the pass, 1,562 ms on a
+    document-heavy tree.
+
+    ``ix_doc_drift_ref_repo_target`` is the hot index, the direction the
+    findings table lacks; the document index serves the scoped rewrite and the
+    prune. Rows are replaced per run under the same ``authoritative_paths`` as
+    findings, so a document a run could not read keeps its rows.
+    """
+
+    __tablename__ = "doc_drift_references"
+    __table_args__ = (
+        UniqueConstraint(
+            "repository_id",
+            "document_path",
+            "kind",
+            "line_number",
+            "target_path",
+            name="uq_doc_drift_reference_site",
+        ),
+        # Reverse index (file -> documents naming it) is the hot path.
+        Index("ix_doc_drift_ref_repo_target", "repository_id", "target_path"),
+        # Forward index (document -> what it names), for the scoped rewrite.
+        Index("ix_doc_drift_ref_repo_doc", "repository_id", "document_path"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    repository_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False
+    )
+    #: The document making the reference, which is the file a reader edits.
+    document_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    #: The file it resolved to. Not what the document wrote: a relative link
+    #: resolves against its own directory.
+    target_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    line_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    #: The enclosing heading trail, carried because the reverse view shows it:
+    #: it is how a reader finds the passage rather than just the file.
+    section: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+
+class DocDriftFinding(Base):
+    """An assertion a document makes that the repository no longer satisfies.
+
+    ``file_path`` is the **document** that is wrong, not the target it names:
+    that is the file a reader has to edit, so it is the one the finding is
+    filed against.
+
+    Persisted on the security-findings pattern rather than dead code's, because
+    a drift finding is a line-level hit rather than a graph-derived aggregate.
+    The ``(repository_id, file_path, kind, line_number, target)`` constraint
+    makes re-runs idempotent. ``target`` is in the key because one line can
+    carry two references --- a markdown link yields both a ``link`` row and an
+    ``anchor`` row --- and dropping it would silently collapse them.
+    """
+
+    __tablename__ = "doc_drift_findings"
+    __table_args__ = (
+        UniqueConstraint(
+            "repository_id",
+            "file_path",
+            "kind",
+            "line_number",
+            "target",
+            name="uq_doc_drift_finding_site",
+        ),
+        Index("ix_doc_drift_repo_path", "repository_id", "file_path"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    repository_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False
+    )
+    file_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    line_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    target: Mapped[str] = mapped_column(String(1024), nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    #: Which named resolution strategy concluded this, from ``DriftOrigin``.
+    #: Every origin carries a fixed confidence, so the origin distribution and
+    #: the confidence histogram are two views of the same data.
+    origin: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    evidence_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    #: The reference exactly as written, and the line it was written on.
+    raw: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    context: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    detected_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now_utc
+    )
 
 
 class HealthFinding(Base):

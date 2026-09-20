@@ -30,7 +30,14 @@ from .models import (
 )
 from .perf_delta import PerfOpportunityView, opportunities_for
 from .service import ChangeHealthDeltaService, DeltaRequest
-from .sources import FileChange, GitRevisionSource, RevisionPair, RevisionSource
+from .sources import (
+    FileChange,
+    GitRevisionSource,
+    MappingRevisionSource,
+    RevisionPair,
+    RevisionSource,
+    filter_changes,
+)
 
 __all__ = [
     "AnalysisFingerprint",
@@ -47,6 +54,7 @@ __all__ = [
     "FindingKey",
     "FindingMatcher",
     "GitRevisionSource",
+    "MappingRevisionSource",
     "MatchResult",
     "MatchedFinding",
     "PerfOpportunityView",
@@ -57,6 +65,7 @@ __all__ = [
     "RevisionSource",
     "ScopeCounts",
     "change_finding_id",
+    "filter_changes",
     "finding_key",
     "opportunities_for",
 ]

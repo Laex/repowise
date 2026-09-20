@@ -97,17 +97,30 @@ def tool_middleware(fn: Any) -> Any:
        the whole session), so it must see the raw tool.
     2. ``trust`` — adds the final transport trust envelope.
     3. ``quantize`` — rounds every float in the response. Outside the shield so
-       shaped error responses are covered too, and inside the savings layer so
-       the ledger measures the payload as actually delivered.
-    4. ``budget`` — caps the delivered shape before savings are measured.
-    5. ``instrument`` — records the bounded result and adds savings metadata.
-    6. ``budget`` — accounts for those final middleware fields and rechecks.
+       shaped error responses are covered too.
+    4. ``budget`` — caps the delivered shape. Also reports the raw tool output
+       size to the interaction: this is the only layer that sees it before
+       anything has been shed.
+    5. ``instrument`` — derives the counterfactual and adds savings metadata.
+       It must be here rather than further out, because the estimators read
+       fields a later budget pass is free to drop.
+    6. ``timed`` — stamps ``_meta.timing_ms`` for any tool that did not.
+    7. ``budget`` — accounts for those final middleware fields and rechecks.
+    8. ``record`` — writes the one savings event for the call.
+
+    Layer 8 is outside everything for a reason. The ledger row used to be
+    written at layer 5, after which ``timed`` stamped ``_meta`` and layer 7 ran
+    the budgeter twice more, free to shed content and re-stamp sizes. The
+    recorded delivered size was therefore one the agent never received. Each
+    layer now reports what only it can see, and the event is written when the
+    payload is final.
 
     Named rather than inlined at the ``apply`` call so tests can wrap a tool in
     the real composition; ``tests/unit/server/mcp/test_number_precision.py``
     relies on that to prove no raw double reaches an agent.
     """
     import inspect
+    import time
     from functools import wraps
 
     from repowise.server.mcp_server._budget import (
@@ -117,7 +130,9 @@ def tool_middleware(fn: Any) -> Any:
     from repowise.server.mcp_server._failure_shield import shield
     from repowise.server.mcp_server._meta import finalize_trust_envelope
     from repowise.server.mcp_server._rounding import quantize
+    from repowise.server.mcp_server._savings import event as savings_event
     from repowise.server.mcp_server._savings import instrument
+    from repowise.server.mcp_server._savings import interaction as savings_interaction
 
     evidence_kind = getattr(fn, "__repowise_trust_kind__", None)
     signature = inspect.signature(fn)
@@ -131,13 +146,42 @@ def tool_middleware(fn: Any) -> Any:
 
         return wrapped
 
+    def timed(inner: Any) -> Any:
+        """Stamp elapsed time for the tools that do not thread it themselves.
+
+        A tool that already reports ``timing_ms`` keeps its own number, which
+        measures its retrieval rather than the middleware around it.
+        """
+
+        @wraps(inner)
+        async def wrapped(*args: Any, **kwargs: Any) -> Any:
+            started = time.perf_counter()
+            result = await inner(*args, **kwargs)
+            if isinstance(result, dict):
+                meta = result.setdefault("_meta", {})
+                if isinstance(meta, dict) and meta.get("timing_ms") is None:
+                    meta["timing_ms"] = round((time.perf_counter() - started) * 1000, 2)
+            return result
+
+        return wrapped
+
     def budget(inner: Any) -> Any:
         @wraps(inner)
         async def wrapped(*args: Any, **kwargs: Any) -> Any:
             repo_root = await resolve_response_budget_repo_root(signature, args, kwargs)
+            raw = await inner(*args, **kwargs)
+            live = savings_interaction.current()
+            if live is not None:
+                # Both instantiations run this closure, and the inner one runs
+                # first, so only its value has seen untrimmed output. Guarded
+                # rather than merely ignored: the measurement serializes the
+                # whole payload, and the outer layer's result is discarded.
+                if live.pre_budget_input_tokens is None:
+                    live.observe_pre_budget(savings_event.raw_response_tokens(raw))
+                live.repo_root = live.repo_root or (str(repo_root) if repo_root else None)
             result = enforce_response_budget(
                 fn.__name__,
-                await inner(*args, **kwargs),
+                raw,
                 signature=signature,
                 args=args,
                 kwargs=kwargs,
@@ -155,7 +199,19 @@ def tool_middleware(fn: Any) -> Any:
 
         return wrapped
 
-    return budget(instrument(budget(quantize(trust(shield(fn))))))
+    def record(inner: Any) -> Any:
+        """Open the interaction, then write its one event once nothing can change."""
+
+        @wraps(inner)
+        async def wrapped(*args: Any, **kwargs: Any) -> Any:
+            with savings_interaction.begin(fn.__name__) as live:
+                result = await inner(*args, **kwargs)
+                savings_event.record(live, result)
+                return result
+
+        return wrapped
+
+    return record(budget(timed(instrument(budget(quantize(trust(shield(fn))))))))
 
 
 def ensure_full_surface() -> Any:

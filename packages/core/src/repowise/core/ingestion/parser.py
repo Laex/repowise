@@ -61,6 +61,7 @@ from .extractors.synthetic_symbols import extract_synthetic_symbols
 from .extractors.visibility import (
     refine_cpp_visibility,
     refine_csharp_visibility,
+    refine_rust_visibility,
     refine_ts_visibility,
     ts_deferred_export_names,
     ts_export_aliases,
@@ -107,6 +108,7 @@ from .parser_helpers import (
     _qualified_cpp_parent,
     _qualified_pascal_parent,
     _run_query,
+    _rust_shadowed_by_type_param,
 )
 from .python_local_refs import extract_python_local_refs
 from .sfc_source import component_call_sites, prepare_source
@@ -743,20 +745,15 @@ def _cpp_export_macro_parent(node: Node, parent_names: dict[int, str]) -> str | 
 
 
 @cache
-def _load_compiled_query(lang: str, grammar_tag: str | None = None) -> object | None:
-    """Process-wide cache of compiled tree-sitter Query objects.
+def _compile_query(lang: str, grammar_tag: str | None = None) -> tuple[object | None, str | None]:
+    """Compile and return (Query, None) or (None, error_str).
 
-    Compiling `.scm` queries is non-trivial; in process-pool parsing each worker
-    would otherwise recompile per file. ``grammar_tag`` may differ from
-    ``lang`` when a language reuses another's grammar at a different
-    variant — e.g. ``.tsx`` files reuse ``typescript.scm`` but must bind
-    to the JSX-aware ``tsx`` grammar so React components don't drown in
-    ERROR nodes.
+    Cached process-wide so preflight and parsing workers never recompile the same query.
     """
     grammar = grammar_tag or lang
     language = _get_language(grammar)
     if language is None:
-        return None
+        return None, None
 
     # The spec names the query file, so a language can reuse another's
     # queries wholesale (svelte -> typescript.scm). Every other spec declares
@@ -766,7 +763,7 @@ def _load_compiled_query(lang: str, grammar_tag: str | None = None) -> object | 
     scm_path = QUERIES_DIR / scm_name
     if not scm_path.exists():
         log.debug("No .scm query file found", language=lang, path=str(scm_path))
-        return None
+        return None, None
 
     scm_text = scm_path.read_text(encoding="utf-8")
     # Grammar-variant-specific additions (e.g. JSX node captures that are
@@ -779,10 +776,26 @@ def _load_compiled_query(lang: str, grammar_tag: str | None = None) -> object | 
     try:
         from tree_sitter import Query  # type: ignore[attr-defined]
 
-        return Query(language, scm_text)
+        return Query(language, scm_text), None
     except Exception as exc:
-        log.warning("Failed to compile query", language=lang, error=str(exc))
-        return None
+        return None, str(exc)
+
+
+@cache
+def _load_compiled_query(lang: str, grammar_tag: str | None = None) -> object | None:
+    """Process-wide cache of compiled tree-sitter Query objects.
+
+    Compiling `.scm` queries is non-trivial; in process-pool parsing each worker
+    would otherwise recompile per file. ``grammar_tag`` may differ from
+    ``lang`` when a language reuses another's grammar at a different
+    variant — e.g. ``.tsx`` files reuse ``typescript.scm`` but must bind
+    to the JSX-aware ``tsx`` grammar so React components don't drown in
+    ERROR nodes.
+    """
+    query, err = _compile_query(lang, grammar_tag)
+    if err is not None:
+        log.warning("Failed to compile query", language=lang, error=err)
+    return query
 
 
 # Languages that intentionally have no AST parser.  Derived from the
@@ -819,7 +832,10 @@ def _build_language_registry() -> dict[str, Language]:
         try:
             mod = __import__(spec.grammar_package)
             loader_fn = getattr(mod, spec.grammar_loader)
-            lang_obj = Language(loader_fn())
+            loaded = loader_fn(*spec.grammar_loader_args)
+            # Standalone grammar wheels return a PyCapsule; shared grammar
+            # packs may return the fully constructed Language directly.
+            lang_obj = loaded if isinstance(loaded, Language) else Language(loaded)
             registry[spec.tag] = lang_obj
         except Exception as exc:
             log.debug(
@@ -894,11 +910,54 @@ def missing_grammar_languages(language_tags: Iterable[str]) -> list[str]:
     return sorted(missing)
 
 
+def failed_query_languages(language_tags: Iterable[str]) -> list[tuple[str, str]]:
+    """Of *language_tags*, those whose tree-sitter queries fail to compile.
+
+    Scoped to what traversal discovered in the repo. Only checks languages with
+    a registered LanguageConfig and query file. Best-effort and bounded.
+    """
+    failed: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    for tag in language_tags:
+        if tag in seen or tag not in LANGUAGE_CONFIGS:
+            continue
+        seen.add(tag)
+
+        _, err = _compile_query(tag)
+        if err is not None:
+            failed.append((tag, err))
+            continue
+
+        # Check grammar variants if applicable (e.g. tsx for typescript)
+        if tag == "typescript":
+            _, tsx_err = _compile_query("typescript", grammar_tag="tsx")
+            if tsx_err is not None:
+                failed.append((tag, f"tsx variant: {tsx_err}"))
+
+    return sorted(failed, key=lambda x: x[0])
+
+
 def _get_language(tag: str) -> Language | None:
     global _LANGUAGE_REGISTRY
     if not _LANGUAGE_REGISTRY:
         _LANGUAGE_REGISTRY = _build_language_registry()
     return _LANGUAGE_REGISTRY.get(tag)
+
+
+def grammar_tag_for(language: str, path: str) -> str:
+    """The grammar a file is read with, which is not always its language tag.
+
+    A ``.tsx`` file arrives tagged ``typescript``, and tree-sitter-typescript's
+    default grammar errors on every ``<Component />``. Only the grammar moves:
+    the language tag keeps selecting dialects and vocabularies, several of
+    which (``mocks/lexicon.py`` among them) carry no ``tsx`` row and would
+    silently degrade if handed one.
+    """
+    # Case-folded, because the extension table that tagged the file is.
+    if language == "typescript" and path.lower().endswith(".tsx"):
+        return "tsx"
+    return language
 
 
 # Private alias for internal use (kept for compatibility with _find_parent)
@@ -954,11 +1013,10 @@ class ASTParser:
             return parsed
 
         config = LANGUAGE_CONFIGS.get(lang)
-        # .tsx files need the JSX-aware grammar; tree-sitter-typescript's
-        # default `language_typescript` errors out on every `<Component />`
-        # and the resulting ERROR-node recovery hoists nested helpers
-        # (handlers defined inside component bodies) to the top level.
-        grammar_tag = "tsx" if lang == "typescript" and file_info.path.endswith(".tsx") else lang
+        # .tsx needs the JSX-aware grammar: the default one's ERROR-node
+        # recovery hoists nested helpers (handlers defined inside component
+        # bodies) to the top level.
+        grammar_tag = grammar_tag_for(lang, file_info.path)
         language = _get_language(grammar_tag)
 
         # tree-sitter-fsharp ships a second grammar (``language_signature``)
@@ -1261,7 +1319,7 @@ class ASTParser:
                 continue
 
             def_node = def_nodes[0]
-            name = _node_text(name_nodes[0], src)
+            name = config.symbol_name_fn(_node_text(name_nodes[0], src), def_node.type)
             if not name:
                 continue
 
@@ -1395,6 +1453,8 @@ class ASTParser:
             # the trailing body sibling or call-site attribution stops at the
             # signature line.
             end_line = def_node.end_point[0] + 1
+            if config.symbol_end_line_fn is not None:
+                end_line = config.symbol_end_line_fn(def_node, end_line)
             if export_type is not None:
                 end_line = export_type.range_node.end_point[0] + 1
             # F#: the captured node is the binding's left-hand side, so its
@@ -1527,6 +1587,10 @@ class ASTParser:
             # inline, via ``export { x }`` lists, or ``export default x``.
             elif file_info.language in _TS_JS_LANGUAGES:
                 visibility = refine_ts_visibility(def_node, visibility, name, ts_deferred_exports)
+            # Rust: a trait's items may not write ``pub`` of their own, so the
+            # trait's modifier is the only place their visibility is stated.
+            elif file_info.language == "rust":
+                visibility = refine_rust_visibility(def_node, visibility, src)
 
             # Parent class detection
             parent_name = self._find_parent(def_node, config, receiver_nodes, src)
@@ -2066,7 +2130,10 @@ class ASTParser:
                 continue
 
             site_node = site_nodes[0]
-            target_name = _node_text(target_nodes[0], src).strip()
+            target_node = target_nodes[0]
+            target_name = config.call_target_name_fn(
+                _node_text(target_node, src).strip(), target_node.type
+            )
             if not target_name:
                 continue
 
@@ -2335,6 +2402,13 @@ class ASTParser:
             for type_node in type_nodes:
                 head = head_of(type_node, src)
                 if not head:
+                    continue
+                # ``struct Wrapper<Item> { value: Item }`` binds Item as a type
+                # parameter, and the capture cannot tell that from a reference
+                # to a real ``struct Item``. The head extractor drops a
+                # single-letter ``T`` but not a named one, so the shadow has to
+                # be read off the enclosing item's ``type_parameters``.
+                if lang == "rust" and _rust_shadowed_by_type_param(type_node, head, src):
                     continue
                 line = type_node.start_point[0] + 1
                 key = (head, line)

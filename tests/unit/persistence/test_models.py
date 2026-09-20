@@ -305,6 +305,8 @@ def test_base_includes_all_models():
         "git_function_blame",
         "fix_events",
         "dead_code_findings",
+        "doc_drift_findings",
+        "doc_drift_references",
         "decision_records",
         "decision_evidence",
         "decision_edges",

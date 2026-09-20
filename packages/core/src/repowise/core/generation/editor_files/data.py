@@ -56,6 +56,9 @@ class DecisionSummary:
     status: str  # active | deprecated | superseded | proposed
     rationale: str  # first ~100 chars of decision.rationale
     decision: str = ""  # what was chosen (first ~120 chars)
+    #: Pre-rendered mark for a line a person did not sign, else "". Empty in
+    #: the ordinary case, so the common line costs no extra tokens.
+    signed_by: str = ""
 
 
 @dataclass(frozen=True)
@@ -128,6 +131,7 @@ class EditorFileData:
     # Rendered MCP tool table (single source: tool_table.py). A data field
     # rather than a Jinja global so any environment can render the template.
     tool_table_md: str = field(default_factory=lambda: _render_tool_table())
+    index_scope: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------

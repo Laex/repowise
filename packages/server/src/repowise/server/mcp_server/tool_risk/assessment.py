@@ -54,16 +54,17 @@ def normalize_target_path(target: str, repo_root: str | None = None) -> str:
     # root when we know it. Uses a prefix check on the normalized forms, so a
     # path that is already repo-relative is left untouched.
     if repo_root:
-        root_norm = str(Path(repo_root).resolve()).replace("\\", "/")
+        root_path = Path(repo_root).resolve()
         try:
             # Resolve against the repo root, not the process cwd: the MCP
             # server's cwd is not the repo, so a relative path that happens
             # to exist there could resolve somewhere unrelated.
-            resolved = Path(repo_root, normalized).resolve()
-            if str(resolved).startswith(root_norm.rstrip("/") + "/"):
-                normalized = str(resolved).replace("\\", "/")[len(root_norm.rstrip("/")) + 1 :]
+            candidate = Path(normalized)
+            resolved = (candidate if candidate.is_absolute() else root_path / candidate).resolve()
+            normalized = resolved.relative_to(root_path).as_posix()
         except (OSError, ValueError):
-            # resolve() can raise ValueError on a malformed Windows path.
+            # Resolution can fail for malformed paths; relative_to() also
+            # rejects absolute paths outside the selected repository.
             pass
     # Strip a leading cwd-relative prefix and any leading slash left over.
     # A prefix strip, not lstrip: lstrip takes a character set, so it would
@@ -509,6 +510,28 @@ def _load_commit_categories(meta: Any) -> dict:
     return categories
 
 
+def _unresolved_reason(target: str, lookup_path: str, repo_root: str | None) -> str:
+    """Why *target* names nothing this tool can score, in the caller's terms.
+
+    ``not_indexed`` and ``no_such_path`` are spelled as
+    ``get_health._unresolved_targets`` spells them. The other two are not
+    borrowed: ``get_health``'s ``no_such_module`` means "no module of that
+    name", and it resolves a directory to ``not_indexed`` — both would
+    prescribe a fix that cannot help here.
+    """
+    if target.startswith("module:"):
+        return "unsupported_target_kind"
+    try:
+        on_disk = Path(repo_root) / lookup_path if repo_root else Path(lookup_path)
+        if on_disk.is_dir():
+            return "directory"
+        if on_disk.exists():
+            return "not_indexed"
+    except (OSError, ValueError):
+        pass
+    return "no_such_path"
+
+
 async def _assess_one_target(
     session: AsyncSession,
     repository: Repository,
@@ -640,6 +663,24 @@ async def _assess_one_target(
         )
     )
     meta = res.scalar_one_or_none()
+
+    symbol_target = "::" in target
+    if meta is None and lookup_path not in node_meta and not symbol_target:
+        # Nothing below measured this target, so every numeric field would be
+        # a structural zero no reader could tell from a measured one. Name the
+        # miss and emit no counts.
+        #
+        # All three conditions are required. A graph node without a git row is
+        # a real target (a new file); a ``path::Symbol`` id is an accepted
+        # input shape here, so rejecting one is a different change.
+        return {
+            "target": target,
+            "resolved": False,
+            "unresolved_reason": _unresolved_reason(target, lookup_path, repository.local_path),
+            "risk_summary": (
+                f"{target} — not resolved to an indexed file; no risk signal was computed"
+            ),
+        }
 
     if meta is None:
         result_data["hotspot_score"] = 0.0

@@ -62,11 +62,11 @@ _TESTS_TO_RUN_LIMIT = 10
 def _breaking_change_directive(
     repo_alias: str, collector: OmissionCollector | None = None
 ) -> tuple[list[dict[str, Any]], int]:
-    """Breaking-change half of the PR directive: incompatible provider changes.
+    """Contract-comparison half of the PR directive: incompatibilities and warnings.
 
     Reads the persisted breaking-change report (current HEAD vs the previously
     indexed contracts), filtered to providers in the changed repo, and reports
-    each change with the consumers it endangers across repos. Carries every
+    each finding with its endpoint-exposed consumers across repos. Carries every
     contract type the report holds, ``code`` (a published package symbol)
     included. Returns ``(changes, dropped)`` where ``dropped`` counts the
     cross-repo changes the cap left out — a shared-package bump can produce
@@ -84,39 +84,47 @@ def _breaking_change_directive(
             return out, 0
         for change in enricher.get_breaking_changes_for_repo(repo_alias):
             consumers = change.get("impacted_consumers", [])
-            # Only surface changes that actually endanger a cross-repo consumer —
-            # an internal-only removed endpoint isn't a cross-repo break.
+            # This directive is cross-repo scoped, so retain only findings with
+            # endpoint-exposed consumers outside the provider repository.
             cross = [c for c in consumers if c.get("repo") != repo_alias]
             if not cross:
                 continue
             entry = {
-                    "contract_id": change.get("contract_id"),
-                    "type": change.get("contract_type"),
-                    "kind": change.get("kind"),
-                    "severity": change.get("severity"),
-                    "detail": change.get("detail"),
-                    "provider_file": change.get("provider_file"),
-                    # The changed symbol itself, when the contract bound to one.
-                    # It is what the reader passes to get_symbol to see the
-                    # signature that broke.
-                    **(
-                        {"provider_symbol_id": psid}
-                        if (psid := change.get("provider_symbol_id"))
-                        else {}
-                    ),
-                    "impacted_consumers": [
-                        # symbol_id only when the contract bound to one: it is
-                        # what the reader can pass to get_symbol, and a null
-                        # would just cost budget.
-                        {
-                            "repo": c.get("repo"),
-                            "service": c.get("service"),
-                            "file": c.get("file"),
-                            **({"symbol_id": sid} if (sid := c.get("symbol_id")) else {}),
-                        }
-                        for c in cross
-                    ],
-                }
+                "contract_id": change.get("contract_id"),
+                "type": change.get("contract_type"),
+                "kind": change.get("kind"),
+                "severity": change.get("severity"),
+                "detail": change.get("detail"),
+                "provider_file": change.get("provider_file"),
+                **({"side": side} if (side := change.get("side")) else {}),
+                **(
+                    {"comparison_source": source}
+                    if (source := change.get("comparison_source"))
+                    else {}
+                ),
+                **({"comparison_key": key} if (key := change.get("comparison_key")) else {}),
+                **({"field_name": field_name} if (field_name := change.get("field_name")) else {}),
+                # The changed symbol itself, when the contract bound to one.
+                # It is what the reader passes to get_symbol to see the
+                # signature that broke.
+                **(
+                    {"provider_symbol_id": psid}
+                    if (psid := change.get("provider_symbol_id"))
+                    else {}
+                ),
+                "impacted_consumers": [
+                    # symbol_id only when the contract bound to one: it is
+                    # what the reader can pass to get_symbol, and a null
+                    # would just cost budget.
+                    {
+                        "repo": c.get("repo"),
+                        "service": c.get("service"),
+                        "file": c.get("file"),
+                        **({"symbol_id": sid} if (sid := c.get("symbol_id")) else {}),
+                    }
+                    for c in cross
+                ],
+            }
             cap_collection(
                 entry,
                 "impacted_consumers",
@@ -423,9 +431,7 @@ async def _governance_directive(ctx: Any, changed_files: list[str]) -> list[dict
     return governance_risk
 
 
-def _governance_reason(
-    dr: Any, currency: str, conflict_decision_ids: set[str]
-) -> str | None:
+def _governance_reason(dr: Any, currency: str, conflict_decision_ids: set[str]) -> str | None:
     """Map an accepted decision to a directive reason, or None when clean.
 
     *currency* is the effective currency from the acceptance, so the caller has
@@ -440,6 +446,35 @@ def _governance_reason(
     if dr.id in conflict_decision_ids:
         return "contradicted_decision"
     return None
+
+
+def _project_recommendation(row: dict[str, Any]) -> dict[str, Any]:
+    """Drop what a reader can rebuild from the row it ships beside.
+
+    ``analyze_test_impact`` builds ``source_files`` and ``bases`` by folding
+    ``evidence`` (``core/analysis/test_impact.py:256-270``), so on the wire they
+    are the same fact twice. ``test_file`` differs from ``test_id`` only for a
+    measured row whose id carries a ``::`` selector, and ``source_format`` is
+    None on every inferred row. The typed row core hands its own callers is
+    untouched; this is the projection get_risk emits.
+    """
+    out = {k: v for k, v in row.items() if k not in {"repository", "repository_id"}}
+    evidence = out.get("evidence")
+    if isinstance(evidence, list):
+        sources = sorted({e["source_file"] for e in evidence if isinstance(e, dict)})
+        if out.get("source_files") == sources:
+            out.pop("source_files", None)
+        out["evidence"] = [
+            {k: v for k, v in e.items() if not (k == "source_format" and v is None)}
+            if isinstance(e, dict)
+            else e
+            for e in evidence
+        ]
+    if out.get("bases") == [out.get("basis")]:
+        out.pop("bases", None)
+    if out.get("test_file") in (out.get("test_id"), None):
+        out.pop("test_file", None)
+    return out
 
 
 def _build_pr_directive(
@@ -463,6 +498,10 @@ def _build_pr_directive(
     # Everything trimmed below is persisted via the collector so the
     # response carries an expandable [repowise#<ref>] marker for it.
     for r in response["targets"].values():
+        # The counts below would be the structural zeros get_risk stopped
+        # emitting for a card that resolved nothing.
+        if r.get("resolved") is False:
+            continue
         partners = r.get("co_change_partners") or []
         if len(partners) > 3:
             r["co_change_partners"] = partners[:3]
@@ -587,16 +626,18 @@ def _build_pr_directive(
             f"cross-repo co-changer(s) missing."
         )
 
-    # Breaking-change guard — incompatible provider changes (removed route /
-    # field, type change, ...) in this repo and the consumers they endanger.
-    # Schema-level truth, distinct from the topology-level will_break_consumers.
+    # Contract guard — provider incompatibilities and explicit comparison
+    # uncertainty in this repo, scoped to endpoint-exposed consumers. Distinct
+    # from topology-level structural reach.
     breaking_changes, breaking_changes_dropped = _breaking_change_directive(alias, collector)
     bc_suffix = ""
     if breaking_changes:
         bc_consumers = sum(len(b["impacted_consumers"]) for b in breaking_changes)
+        bc_incompatible = sum(b.get("severity") == "breaking" for b in breaking_changes)
+        bc_warnings = len(breaking_changes) - bc_incompatible
         bc_suffix = (
-            f" Breaking changes: {len(breaking_changes)} provider contract(s) changed "
-            f"incompatibly, endangering {bc_consumers} consumer(s)."
+            f" Contract findings: {bc_incompatible} provider incompatibility finding(s), "
+            f"{bc_warnings} warning(s), and {bc_consumers} endpoint-exposed consumer link(s)."
         )
         if breaking_changes_dropped:
             bc_suffix += f" {breaking_changes_dropped} more not listed."
@@ -695,6 +736,35 @@ def _build_pr_directive(
             label=f"directive.{key} beyond cap={cap}",
             preserve_counts=(key in {"missing_tests", "tests_to_run", "test_recommendations"}),
         )
+
+    # Name the repository once instead of on every recommendation: both values
+    # are single arguments to ``analyze_test_impact``, so every row it builds
+    # carries the same pair by construction, not by coincidence.
+    emitted_recommendations = directive.get("test_recommendations") or []
+    if emitted_recommendations:
+        first = emitted_recommendations[0]
+        directive["test_recommendations_repository"] = first.get("repository")
+        directive["test_recommendations_repository_id"] = first.get("repository_id")
+        directive["test_recommendations"] = [
+            _project_recommendation(row) for row in emitted_recommendations
+        ]
+
+    # The same rows also ride under ``pr_blast_radius.test_impact`` as the full
+    # population the directive's cap trimmed. Two copies of one row in one
+    # payload must not disagree about their shape, so the projection applies to
+    # both. ``trimmed_blast`` is a shallow copy of the analyzer's dict, so the
+    # nested block is copied before it is rewritten.
+    blast = response.get("pr_blast_radius")
+    if isinstance(blast, dict):
+        blast_impact = blast.get("test_impact")
+        if isinstance(blast_impact, dict) and blast_impact.get("recommendations"):
+            rows = blast_impact["recommendations"]
+            blast["test_impact"] = {
+                **blast_impact,
+                "recommendations_repository": rows[0].get("repository"),
+                "recommendations_repository_id": rows[0].get("repository_id"),
+                "recommendations": [_project_recommendation(row) for row in rows],
+            }
 
     for key, total in (
         ("will_break_consumers", will_break_total),

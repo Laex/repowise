@@ -41,6 +41,7 @@ LanguageTag = Literal[
     "luau",
     "dart",
     "pascal",
+    "cobol",
     "gdscript",
     "vbnet",
     # Passthrough code languages (no AST parser yet — empty ParsedFile,
@@ -300,7 +301,7 @@ class CallSite:
     supplied_props: set[str] | None = None  # prop names supplied in JSX element (None if unknown/spread)
 
 
-HeritageKind = Literal["extends", "implements", "trait_impl", "mixin"]
+HeritageKind = Literal["extends", "implements", "trait_impl", "mixin", "derive"]
 
 
 @dataclass
@@ -452,6 +453,13 @@ ResolutionOrigin = Literal[
     "receiver_framework_same_package",  # 0.90
     "receiver_framework_import",  # 0.88
     "receiver_framework_global",  # 0.75
+    # A C# extension method, reached through the type its ``this`` parameter
+    # names rather than the static class holding it. One family, not a fourth
+    # set of four: no same-package tier reaches the extension index. Separable
+    # because the holder class is a file no call site names.
+    "receiver_extension_same_file",  # 0.93
+    "receiver_extension_import",  # 0.88 — the holder class's file is imported
+    "receiver_extension_global",  # 0.75 — declared somewhere; a name match
     # Chained receiver typed from the inner callee's declared return type.
     "return_type_same_file",  # 0.93
     "return_type_same_package",  # 0.90 (JVM)

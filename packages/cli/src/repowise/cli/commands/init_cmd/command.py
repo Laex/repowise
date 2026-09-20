@@ -80,6 +80,7 @@ from repowise.core.docs_mode import docs_mode_state_fields, resolve_docs_mode
 from repowise.core.generation.languages import SUPPORTED_LANGUAGES
 from repowise.core.generation.styles import DEFAULT_STYLE, list_styles, resolve_style
 from repowise.core.reasoning import REASONING_MODES
+from repowise.core.repo_config import config_dependency_fingerprints
 
 from ._interactive import offer_distill_rewrite_hook, offer_hook_install
 from .generation import (
@@ -92,6 +93,7 @@ from .generation import (
     structural_page_summary,
 )
 from .persistence import (
+    apply_git_history_coverage_state,
     build_resume_controller,
     effective_run_mode_for_resume,
     git_tier_for_run_mode,
@@ -100,6 +102,30 @@ from .persistence import (
 )
 from .reporting import show_analysis_summary, show_completion
 from .workspace import _workspace_init
+
+
+def _catch_up_savings(repo_path: Path) -> None:
+    """Bank the savings this repository's agents were shown before indexing.
+
+    Keyless, time-budgeted and best-effort, following the session-decision
+    stage that runs here for the same reason: the history is already on disk,
+    and a first index that ignores it shows an empty savings page for a
+    repository that has been saving tokens for months.
+
+    Not in ``repowise update``: update runs on every commit, and this reads a
+    corpus bounded by how much the user has worked rather than by the repo.
+    """
+    try:
+        from repowise.core.savings.transcript import sync_transcript_savings
+
+        outcome = sync_transcript_savings(repo_path)
+    except Exception:
+        return
+    if outcome.recorded:
+        console.print(
+            f"  [{OK}]✓[/] Recovered {outcome.saved_input_tokens:,} saved tokens "
+            f"from agent history"
+        )
 
 
 def _record_init_outcome(
@@ -236,20 +262,11 @@ def _run_deterministic_generation_phase(
     Returns the embedder actually used, which the caller persists so a later
     ``repowise update`` embeds the same way rather than re-deciding.
     """
+    from repowise.cli.providers import template_run_embedder
     from repowise.core.generation import GenerationConfig
     from repowise.core.providers.llm.template import TemplateProvider
 
-    # This mode is sold as "no key, no spend", and embedding 2000+ pages
-    # through a hosted embedder is a real bill. ``resolve_embedder`` infers one
-    # from any LLM key it finds in the environment, which is the right default
-    # for a run that is already paying a model and the wrong one here: nobody
-    # who typed --index-only asked to be charged. So a hosted embedder is used
-    # only when the user named it, through --embedder or REPOWISE_EMBEDDER.
-    # Anything else falls back to the mock, which keeps full-text search
-    # working and leaves semantic search to be built later with
-    # ``repowise reindex``.
-    hosted = embedder_name_resolved not in ("mock", "ollama")
-    embedder = "mock" if hosted and not embedder_was_requested else embedder_name_resolved
+    embedder = template_run_embedder(embedder_name_resolved, embedder_was_requested)
 
     print_phase_header(
         console,
@@ -1410,6 +1427,25 @@ def init_command(
 
     orchestrator_mode = OrchestratorMode.FAST if run_mode == "fast" else OrchestratorMode.STANDARD
 
+    # The store generation would build anyway, hoisted so the analysis
+    # checkpoint inside the pipeline can dedup decisions against it;
+    # ``run_repo_generation`` reuses this object. Never more than that store,
+    # so the exclusions are the runs that build none: a dry run, and index-only
+    # fast mode, which also pins no embedder for a table to be read back with.
+    # Keyless is dropped rather than handed to a matcher that refuses it.
+    index_vector_store = None
+    if not dry_run and not (index_only and run_mode == "fast"):
+        from repowise.cli.providers import build_embedder, build_vector_store, template_run_embedder
+        from repowise.core.providers.embedding import store_has_semantic_vectors
+
+        _store_embedder = (
+            template_run_embedder(embedder_name_resolved, embedder_was_requested)
+            if index_only or no_provider
+            else embedder_name_resolved
+        )
+        _candidate = build_vector_store(repo_path, build_embedder(_store_embedder, repo_path))
+        index_vector_store = _candidate if store_has_semantic_vectors(_candidate) else None
+
     index_columns: list[Any] = [
         SpinnerColumn(spinner_name=OWL_SPINNER, style=BRAND_STYLE),
         TextColumn("[progress.description]{task.description}"),
@@ -1464,6 +1500,7 @@ def init_command(
                     include_submodules=include_submodules,
                     generate_docs=False,
                     llm_client=llm_client,
+                    vector_store=index_vector_store,
                     concurrency=concurrency,
                     test_run=test_run,
                     mode=orchestrator_mode,
@@ -1671,6 +1708,8 @@ def init_command(
     phase_timings: dict[str, float] = callback.timings
     console.print(f"  [{OK}]✓[/] Database updated")
 
+    _catch_up_savings(repo_path)
+
     # Persist the onboarding choice so subsequent `repowise update` runs
     # honor it without re-passing the flag. Default True is omitted to keep
     # config files tidy — only the override is recorded.
@@ -1711,12 +1750,9 @@ def init_command(
     # One flag, one meaning: --no-editor-setup now suppresses the project-local
     # writes as well as the global registration. The paths come back so the
     # completion panel can name what landed in the working tree.
-    files_written = write_editor_project_files(
-        console,
-        repo_path,
-        options=editor_options,
-        no_editor_setup=not editor_setup,
-    )
+    # Render after state persistence below so generated guidance reads the same
+    # canonical index_scope that status/API/MCP expose.
+    files_written: list[Path] = []
     register_editor_clients(console, repo_path, no_editor_setup=not editor_setup)
 
     # Inherit the workspace's distill rewrite-hook verdict NOW, before the
@@ -1755,6 +1791,60 @@ def init_command(
     # same tier instead of silently upgrading ESSENTIAL → FULL (issue #341).
     base_state["run_mode"] = run_mode
     base_state["git_tier"] = git_tier_for_run_mode(run_mode)
+    apply_git_history_coverage_state(base_state, result)
+    from repowise.core.generation.selection import count_documentable_files
+    from repowise.core.index_scope import file_page_scope, stamp_index_scope
+
+    _scope_embedder = embedder_name_resolved if not effective_index_only else _index_only_embedder
+    _unavailable = []
+    if getattr(result, "health_report", None) is None:
+        _unavailable.append("health")
+    _skipped = ["generation"] if run_mode == "fast" else []
+    stamp_index_scope(
+        base_state,
+        {"commit_limit": resolved_commit_limit, "max_file_pages": max_file_pages},
+        run_mode=run_mode,
+        content_provenance={"none": "none", "deterministic": "template", "llm": "model"}[
+            _docs_mode
+        ],
+        git_tier=git_tier_for_run_mode(run_mode),
+        git_commit_cap=resolved_commit_limit,
+        file_pages={
+            "configured_cap": max_file_pages,
+            **(
+                result.generation_scope
+                if getattr(result, "generation_scope", None)
+                else file_page_scope(
+                    configured_cap=max_file_pages,
+                    eligible=count_documentable_files(result.parsed_files),
+                    generated_pages=result.generated_pages,
+                )
+            ),
+        },
+        analysis={"unavailable": _unavailable, "skipped": _skipped},
+        provider={
+            "name": provider.provider_name if provider is not None else None,
+            "model": provider.model_name if provider is not None else None,
+            "embedder": _scope_embedder,
+            "reused": False,
+            "model_cost_possible": _docs_mode == "llm",
+        },
+        search={
+            "full_text": "available" if result.generated_pages else "unavailable",
+            "semantic": (
+                "available"
+                if result.generated_pages and _scope_embedder and _scope_embedder != "mock"
+                else "unavailable"
+            ),
+            "next_command": "repowise reindex" if result.generated_pages else None,
+        },
+        upgrade={
+            "status": "pending" if _docs_mode != "llm" else "not_applicable",
+            "retryable": _docs_mode != "llm",
+            "completed_stages": [],
+            "next_stage": "git_backfill" if run_mode == "fast" else "generation",
+        },
+    )
     # Record whether submodules were indexed so `repowise update` rebuilds
     # the graph with the same boundary semantics (same pattern as git_tier:
     # missing → False keeps legacy behavior for old state files).
@@ -1794,6 +1884,7 @@ def init_command(
         )
         # Fingerprint after config writes so the first update doesn't false-positive.
         base_state["config_fingerprint"] = config_fingerprint(repo_path)
+        base_state["config_dependency_fingerprints"] = config_dependency_fingerprints(repo_path)
         # Index-only is the keyless default, so this is where most installs get
         # their stamp. Without it `health_analyzer_changed` reads absent-as-
         # unchanged and the version trigger never fires for them.
@@ -1831,9 +1922,17 @@ def init_command(
             commit_limit=commit_limit,
             resolved_commit_limit=resolved_commit_limit,
             resolved_reasoning=resolved_reasoning,
+            max_file_pages=max_file_pages,
             include_submodules=include_submodules,
             save_key=save_key,
         )
+
+    files_written = write_editor_project_files(
+        console,
+        repo_path,
+        options=editor_options,
+        no_editor_setup=not editor_setup,
+    )
 
     _record_init_outcome(
         result=result,

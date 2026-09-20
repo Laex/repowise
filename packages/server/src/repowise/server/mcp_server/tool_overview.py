@@ -62,6 +62,9 @@ from repowise.server.mcp_server._helpers import (
     is_excluded,
 )
 from repowise.server.mcp_server._meta import build_meta as _build_meta
+from repowise.server.mcp_server._meta import (
+    build_meta_with_full_scope as _build_meta_with_full_scope,
+)
 from repowise.server.mcp_server._tool_selection import registry_tool_rows, selected_tool_names
 
 # Orientation, not a directory listing — the top few modules are enough to
@@ -1109,7 +1112,10 @@ async def get_overview(repo: str | None = None, include: list[str] | None = None
 
         result["tool_surface"] = _tool_surface_guide(is_workspace=_state._registry is not None)
 
-        result["_meta"] = _build_meta(repository=repository)
+        # The orientation call, and the one place the whole scope is worth its
+        # bytes: it is made once per session and it is what the compact
+        # projection on every other response points at.
+        result["_meta"] = _build_meta_with_full_scope(repository=repository)
         collector.attach(result)
         return result
 
