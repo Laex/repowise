@@ -231,6 +231,12 @@ async def _resolve_decision_id(session, decision_id: str) -> str | None:
 )
 @click.option("--tag", "tags", multiple=True, help="A tag. Repeatable.")
 @click.option(
+    "--evidence-commit",
+    "evidence_commits",
+    multiple=True,
+    help="A commit this decision was made in. Repeatable.",
+)
+@click.option(
     "--kind",
     type=click.Choice(DECISION_KINDS),
     default=ARCHITECTURAL_KIND,
@@ -248,6 +254,7 @@ def decision_add(
     consequences: tuple[str, ...],
     affected: tuple[str, ...],
     tags: tuple[str, ...],
+    evidence_commits: tuple[str, ...],
     kind: str,
     fmt: str,
 ) -> None:
@@ -270,7 +277,7 @@ def decision_add(
     non_interactive = bool(title and decision_text)
     if not non_interactive:
         flagged = any((title, context, decision_text, rationale)) or any(
-            (alternatives, consequences, affected, tags)
+            (alternatives, consequences, affected, tags, evidence_commits)
         )
         if flagged or fmt == "json":
             _ta.emit_error(
@@ -360,8 +367,12 @@ def decision_add(
                 alternatives=alternatives_list,
                 consequences=consequences_list,
                 affected_files=affected_files,
-                affected_modules=[],
+                # None derives them from the files; [] would clear them.
+                affected_modules=None,
                 tags=tags_list,
+                # What the capture hook suppresses on: without it, the hook
+                # asks again next session for a commit already recorded.
+                evidence_commits=list(evidence_commits),
                 kind=kind,
                 source="cli",
                 # No confidence: upsert_decision scores a manual entry.

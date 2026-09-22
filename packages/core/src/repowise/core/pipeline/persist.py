@@ -1643,6 +1643,7 @@ async def persist_git(result: Any, session: Any, repo_id: str) -> None:
         prune_fix_events_before,
         update_repo_git_totals,
         upsert_fix_events_bulk,
+        upsert_git_commit_files_bulk,
         upsert_git_commits_bulk,
         upsert_git_metadata_bulk,
     )
@@ -1656,6 +1657,10 @@ async def persist_git(result: Any, session: Any, repo_id: str) -> None:
     commit_rows = getattr(summary, "commit_rows", None)
     if commit_rows:
         await upsert_git_commits_bulk(session, repo_id, commit_rows)
+
+    commit_file_rows = getattr(summary, "commit_file_rows", None)
+    if commit_file_rows:
+        await upsert_git_commit_files_bulk(session, repo_id, commit_file_rows)
 
     # Per fix-commit x file rows (with their SZZ candidates). The prune keeps a
     # re-index of an already-indexed repo from leaving behind events that have
@@ -1712,13 +1717,23 @@ async def replace_git_history(
     from repowise.core.persistence.models import (
         FixEvent,
         GitCommit,
+        GitCommitFile,
+        GitCommitHealthDelta,
+        GitCommitHealthFinding,
         GitMetadata,
     )
 
     # Function blame describes the current source tree and is produced by the
     # health pass, not by persist_git. Preserve it across a history-window
     # replacement; scope reconciliation prunes entries for excluded files.
-    for model in (FixEvent, GitCommit, GitMetadata):
+    for model in (
+        FixEvent,
+        GitCommit,
+        GitCommitFile,
+        GitCommitHealthDelta,
+        GitCommitHealthFinding,
+        GitMetadata,
+    ):
         await session.execute(delete(model).where(model.repository_id == repo_id))
     await persist_git(
         SimpleNamespace(
@@ -2066,6 +2081,7 @@ async def persist_analysis(result: Any, session: Any, repo_id: str) -> None:
     try:
         from repowise.core.persistence.decision_migration import (
             apply_migration,
+            backfill_decision_node_links,
             backfill_scope_basis,
             backfill_session_scope_basis,
             prune_unindexed_scope_files,
@@ -2078,6 +2094,7 @@ async def persist_analysis(result: Any, session: Any, repo_id: str) -> None:
         await prune_unindexed_scope_files(session, repo_id)
         await backfill_scope_basis(session, repo_id)
         await backfill_session_scope_basis(session, repo_id)
+        await backfill_decision_node_links(session, repo_id)
     except Exception as _migrate_err:
         logger.debug("decision_entity_migration_skipped", error=str(_migrate_err))
 
@@ -2240,6 +2257,22 @@ async def persist_kg(kg: Any, session: Any, repo_id: str) -> None:
         await upsert_kg_node_meta(session, repo_id, file_node_meta)
 
 
+async def _refresh_commit_health(result: Any, session: Any, repo_id: str) -> None:
+    """Seed the per-commit health rows for the commits this run wrote."""
+    repo_path = getattr(result, "repo_path", "")
+    summary = getattr(result, "git_summary", None)
+    if not repo_path or summary is None:
+        return
+    from .commit_health import recent_shas, refresh_commit_health
+
+    await refresh_commit_health(
+        session,
+        repo_id,
+        repo_path,
+        recent_shas(getattr(summary, "commit_rows", None)),
+    )
+
+
 async def persist_pipeline_result(
     result: Any,
     session: Any,
@@ -2314,6 +2347,11 @@ async def persist_pipeline_result(
         await persist_git(result, session, repo_id)
     await persist_analysis(result, session, repo_id)
     await persist_generation(result, session, repo_id)
+
+    # What each recent commit did to health. Needs the working tree, so it
+    # runs here rather than on the read path, and it is bounded: older commits
+    # keep no row until a later update reaches them.
+    await _refresh_commit_health(result, session, repo_id)
 
     # Sweep structurally-keyed generated pages (module/layer/scc) that this
     # run did not reproduce — their ids drift between runs, so without the

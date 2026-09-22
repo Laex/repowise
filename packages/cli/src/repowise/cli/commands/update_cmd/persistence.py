@@ -207,8 +207,10 @@ def stamp_head_commit(repo_path: Any, head: str | None) -> None:
     # One stamper for both update paths: delegate to the core implementation
     # the workspace updater uses. It touches only head_commit/updated_at on an
     # existing row (the old upsert here clobbered url/default_branch with
-    # defaults), creates the row when missing from an existing wiki.db, and
-    # no-ops when wiki.db itself is absent instead of conjuring an empty DB.
+    # defaults), creates the row when missing from an existing store, and
+    # no-ops when no store exists at all instead of conjuring an empty DB. A
+    # configured database counts as one, which the repo-local file check this
+    # used to make could never see.
     from repowise.core.workspace.update import reconcile_repo_head_commit
 
     run_async(reconcile_repo_head_commit(Path(repo_path), head))
@@ -228,8 +230,10 @@ def heal_commit_offsets(repo_path: Any) -> None:
     once the column is filled, and no git at all in that case. Best-effort — a
     failure here must never turn a clean no-op into an error.
     """
+    from repowise.core.persistence.database import has_db_store
+
     root = Path(repo_path)
-    if not (root / ".repowise" / "wiki.db").is_file():
+    if not has_db_store(root):
         return
 
     async def _run() -> None:
@@ -1033,6 +1037,7 @@ async def _persist_full_update_async(
                 # classified.
                 from repowise.core.persistence.decision_migration import (
                     apply_migration,
+                    backfill_decision_node_links,
                     backfill_scope_basis,
                     backfill_session_scope_basis,
                     prune_unindexed_scope_files,
@@ -1048,6 +1053,7 @@ async def _persist_full_update_async(
                 await prune_unindexed_scope_files(session, repo_id)
                 await backfill_scope_basis(session, repo_id)
                 await backfill_session_scope_basis(session, repo_id)
+                await backfill_decision_node_links(session, repo_id)
 
                 if require_decision_persist_success:
                     from repowise.core.persistence.crud import (

@@ -117,6 +117,29 @@ def _emit(repo_path: Path, resolution, fmt: str) -> None:
         )
     else:
         console.print("  [dim]Agent acceptance: off. Agents withdraw authority, never grant it.[/dim]")
+    if policy.capture_prompt:
+        from repowise.cli.editor_integrations.claude_config import (
+            claude_code_capture_hook_installed,
+        )
+
+        console.print(
+            "  [dim]Capture prompt: on. After a commit that states a choice, the "
+            "agent is asked once a session to record it.[/dim]"
+        )
+        if not policy.enabled:
+            console.print(
+                "  [yellow]  ...but decision capture is off for this repository, "
+                "so it stays silent. `decision config enable` to use it.[/yellow]"
+            )
+        elif not claude_code_capture_hook_installed():
+            # The flag is per repository and the hook is per install, so the
+            # two drift: another repository's --off removes the shared entry.
+            console.print(
+                "  [yellow]  ...but no shell hook is installed to fire it. "
+                "Re-run `decision config capture-prompt --on`.[/yellow]"
+            )
+    else:
+        console.print("  [dim]Capture prompt: off. Nothing asks an agent to record a decision.[/dim]")
     console.print("")
 
     for warning in resolution.warnings:
@@ -193,6 +216,14 @@ def _diff(before: DecisionPolicy, after: DecisionPolicy) -> list[dict[str, str]]
                 "to": str(after.agent_acceptance),
             }
         )
+    if before.capture_prompt != after.capture_prompt:
+        changes.append(
+            {
+                "key": "capture_prompt",
+                "from": str(before.capture_prompt),
+                "to": str(after.capture_prompt),
+            }
+        )
     if before.harnesses != after.harnesses:
         changes.append(
             {
@@ -238,8 +269,9 @@ def config_preset(name: str, path: str | None, dry_run: bool, fmt: str) -> None:
     from repowise.core.analysis.decisions.policy import preset_policy
 
     repo_path = _resolve_decision_repo(path, fmt)
-    # A preset names source membership; the harness list and the agent-grant
-    # switch are not, so applying one leaves both as the caller set them.
+    # A preset names source membership. The harness list and the two agent
+    # switches are not membership, so applying one leaves them as the caller
+    # set them.
     current = _load(repo_path).policy
     _apply(
         repo_path,
@@ -247,6 +279,7 @@ def config_preset(name: str, path: str | None, dry_run: bool, fmt: str) -> None:
             preset_policy(name),
             harnesses=current.harnesses,
             agent_acceptance=current.agent_acceptance,
+            capture_prompt=current.capture_prompt,
         ),
         fmt,
         dry_run,
@@ -322,6 +355,74 @@ def config_agent_acceptance(
     repo_path = _resolve_decision_repo(path, fmt)
     current = _load(repo_path).policy
     _apply(repo_path, current.with_agent_acceptance(bool(enabled)), fmt, dry_run)
+
+
+@config_group.command("capture-prompt")
+@click.argument("path", required=False, default=None)
+@click.option(
+    "--on/--off", "enabled", default=None, required=True, help="Ask the agent to record."
+)
+@click.option("--dry-run", is_flag=True, default=False, help="Show the change; write nothing.")
+@format_option()
+def config_capture_prompt(
+    path: str | None, enabled: bool | None, dry_run: bool, fmt: str
+) -> None:
+    """Ask the agent to record a decision after a commit that states one.
+
+    Off by default. An agent cannot decline a hook, so this fires at most once
+    a session, only on a commit whose message carries two or more decision
+    signals, and never on one a record already cites. It proposes; nothing is
+    recorded without the agent running `repowise decision add`.
+    """
+    from repowise.cli.commands.decision_cmd import _resolve_decision_repo
+
+    repo_path = _resolve_decision_repo(path, fmt)
+    current = _load(repo_path).policy
+    _apply(repo_path, current.with_capture_prompt(bool(enabled)), fmt, dry_run)
+    if dry_run:
+        return
+    # The flag is per repository; the hook it fires from is a per-install
+    # matcher, and the shared one deliberately excludes the shell tools.
+    # Writing the flag without this would store a switch nothing reads.
+    from repowise.cli.editor_integrations.claude_config import (
+        claude_code_capture_hook_installed,
+        set_claude_code_capture_hook,
+    )
+
+    settings = set_claude_code_capture_hook(bool(enabled))
+    if fmt == "json":
+        emit_json(
+            {
+                "repo": str(repo_path),
+                "capture_prompt": bool(enabled),
+                "hook_settings_file": str(settings) if settings else None,
+                "hook_installed": claude_code_capture_hook_installed(),
+            }
+        )
+        return
+    if enabled and not claude_code_capture_hook_installed():
+        # The flag alone is a switch nothing reads. Silence here is the defect
+        # this command was changed to fix, one level down.
+        console.print(
+            "[yellow]Flag written, but no Claude Code settings file was found to "
+            "install the shell hook into, so nothing will fire it. Run "
+            "`repowise init` or install the editor integration first.[/yellow]"
+        )
+        return
+    if settings is None:
+        return
+    if enabled:
+        console.print(
+            f"[dim]Added a shell PostToolUse hook to {settings}. Other "
+            "repositories on this machine pay a process start on shell calls "
+            "and emit nothing unless they switch this on too.[/dim]"
+        )
+    else:
+        console.print(
+            f"[dim]Removed the shell PostToolUse hook from {settings}. Any "
+            "other repository using the capture prompt needs "
+            "`capture-prompt --on` again.[/dim]"
+        )
 
 
 @click.group("source")

@@ -431,6 +431,8 @@ export interface CommitDetailResponse {
   agent_confidence?: string | null;
   drivers?: RiskDriverResponse[];
   agent_channel?: string | null;
+  files?: CommitFileResponse[];
+  health?: CommitHealthResponse | null;
 }
 
 /**
@@ -462,6 +464,46 @@ export interface CommitEvolutionResponse {
   granularity: string;
   first_commit_at?: string | null;
   last_commit_at?: string | null;
+}
+
+/** One file a commit touched, with what it cost and what it carries. */
+export interface CommitFileResponse {
+  path: string;
+  lines_added: number;
+  lines_deleted: number;
+  prior_fixes?: number | null;
+}
+
+/** One thing a commit introduced or worsened. */
+export interface CommitHealthFindingResponse {
+  change_kind: string;
+  dimension: string;
+  biomarker_type: string;
+  severity: string;
+  severity_before?: string | null;
+  path: string;
+  symbol?: string | null;
+  line_start?: number | null;
+  line_end?: number | null;
+  attribution_basis: string;
+  reason: string;
+}
+
+/**
+ * What a commit did to code health, as computed at index time.
+ *
+ * Absent on the commit, rather than empty, when the commit was never
+ * scanned — the scan is bounded, so older commits routinely have no row and
+ * that is not the same claim as "changed nothing".
+ */
+export interface CommitHealthResponse {
+  status: string;
+  introduced_count: number;
+  worsened_count: number;
+  resolved_count: number;
+  files_analyzed: number;
+  files_skipped: number;
+  findings?: CommitHealthFindingResponse[];
 }
 
 /**
@@ -2538,6 +2580,12 @@ export interface SavingsResponse {
   priced_saved_output_tokens?: number;
   unpriced_saved_output_tokens?: number;
   priced_output_savings_usd?: number;
+  baseline_events?: number;
+  reducing_events?: number;
+  baseline_input_tokens?: number;
+  baseline_saved_input_tokens?: number;
+  input_reduction_ratio?: number | null;
+  input_reduction_ratio_p90?: number | null;
   per_operation?: SavingsBreakdownRow[];
   per_surface?: SavingsBreakdownRow[];
   per_agent?: SavingsAgentRow[];
@@ -3073,6 +3121,13 @@ export interface WorkspaceRepoEntry {
   status?: string;
   docs_enabled?: boolean;
   docs_skip_reason?: string | null;
+}
+
+/** Response returned when a repo is removed from the workspace config. */
+export interface WorkspaceRepoRemovedResponse {
+  ok?: boolean;
+  alias: string;
+  remaining_repos: number;
 }
 
 export interface WorkspaceResponse {

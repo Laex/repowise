@@ -21,6 +21,7 @@ from repowise.core.analysis.decisions.lifecycle import (
     ARCHITECTURAL_KIND,
     DECISION_KINDS,
     DECISION_STATUS_ORDER,
+    RETIRED_STATUSES,
     status_rank,
 )
 from repowise.core.analysis.decisions.provenance import (
@@ -32,7 +33,7 @@ from repowise.core.analysis.decisions.provenance import (
 )
 from repowise.core.analysis.decisions.scope import SCOPE_BASIS_STATED, binds_to_paths
 
-from ..decision_graph import sync_decision_node_links
+from ..decision_graph import scope_modules, sync_links_from_record
 from ..models import (
     DecisionCandidateMeta,
     DecisionEdge,
@@ -329,9 +330,16 @@ async def upsert_decision(
         # The caller supplied these files, so they are its claim and not
         # any footprint the row carried.
         rec.scope_basis = SCOPE_BASIS_STATED if affected_files else ""
-        rec.affected_modules_json = json.dumps(affected_modules or [])
+        rec.affected_modules_json = json.dumps(
+            scope_modules(affected_files or [], affected_modules)
+        )
         rec.tags_json = json.dumps(tags or [])
-        rec.evidence_commits_json = json.dumps(evidence_commits or [])
+        # ``None`` leaves the commits alone, like ``kind`` above: a caller
+        # restating a record without naming them has not disowned them, and
+        # the capture hook's suppression reads this column — wiping it asks
+        # the agent again for a decision it has already recorded.
+        if evidence_commits is not None:
+            rec.evidence_commits_json = json.dumps(evidence_commits)
         rec.evidence_line = evidence_line
         rec.confidence = confidence
         rec.verification = verification
@@ -340,6 +348,7 @@ async def upsert_decision(
         rec.superseded_by = superseded_by
         rec.updated_at = _now_utc()
         await session.flush()
+        await sync_links_from_record(session, rec)
         await _write_candidate_meta(session, repository_id, {}, only={rec.id})
         return rec
 
@@ -393,7 +402,11 @@ async def upsert_decision(
         alternatives_json=json.dumps(alternatives or []),
         consequences_json=json.dumps(consequences or []),
         affected_files_json=json.dumps(affected_files or []),
-        affected_modules_json=json.dumps(affected_modules or []),
+        # Same claim as the restate arm: files the caller supplied are stated.
+        scope_basis=SCOPE_BASIS_STATED if affected_files else "",
+        affected_modules_json=json.dumps(
+            scope_modules(affected_files or [], affected_modules)
+        ),
         tags_json=json.dumps(tags or []),
         evidence_commits_json=json.dumps(evidence_commits or []),
         source=source,
@@ -407,6 +420,7 @@ async def upsert_decision(
     )
     session.add(rec)
     await session.flush()
+    await sync_links_from_record(session, rec)
     await _write_candidate_meta(session, repository_id, {}, only={rec.id})
     return rec
 
@@ -575,21 +589,28 @@ async def update_decision_metadata(
 ) -> DecisionRecord | None:
     """Patch the module/file linkage on a decision record.
 
-    Each argument left as ``None`` is preserved. Pass an empty list to clear.
-    Returns the updated record, or ``None`` if the id was not found.
+    Each argument left as ``None`` is preserved, except that supplying files
+    without modules re-derives the modules from those files: a scope whose two
+    halves describe different code links the record to a module its files are
+    not in. Pass an empty list to clear either. Returns the updated record, or
+    ``None`` if the id was not found.
     """
     rec = await session.get(DecisionRecord, decision_id)
     if rec is None:
         return None
-    if affected_modules is not None:
-        rec.affected_modules_json = json.dumps(affected_modules)
     if affected_files is not None:
         rec.affected_files_json = json.dumps(affected_files)
         # A scope set by hand is stated, whatever the row held before:
         # otherwise the new files are stored and then ignored everywhere.
         rec.scope_basis = SCOPE_BASIS_STATED
+        # Modules follow the files they describe. Replacing one and keeping
+        # the other links the record to a module its files are not in.
+        affected_modules = scope_modules(affected_files, affected_modules)
+    if affected_modules is not None:
+        rec.affected_modules_json = json.dumps(affected_modules)
     rec.updated_at = _now_utc()
     await session.flush()
+    await sync_links_from_record(session, rec)
     return rec
 
 
@@ -635,7 +656,7 @@ async def update_decision_status(
                 await accept_decision(
                     session, rec, accepter=accepter or "unrecorded", kind=kind
                 )
-        elif accepted and status in ("dismissed", "deprecated", "superseded"):
+        elif accepted and status in RETIRED_STATUSES:
             await record_acceptance(
                 session,
                 rec,
@@ -651,6 +672,9 @@ async def update_decision_status(
     if superseded_by is not None:
         rec.superseded_by = superseded_by
     rec.updated_at = _now_utc()
+    # Both directions: a retirement drops the links and a revival rebuilds
+    # them, rather than either waiting for the next index.
+    await sync_links_from_record(session, rec)
     await session.flush()
     return rec
 
@@ -685,8 +709,11 @@ async def update_decision_by_id(
     }
     if "affected_files" in fields:
         # Same rule as every other path that takes a scope from its caller:
-        # the basis has to move with the files it describes.
+        # the basis and the modules have to move with the files they describe.
         rec.scope_basis = SCOPE_BASIS_STATED if fields["affected_files"] else ""
+        fields["affected_modules"] = scope_modules(
+            fields["affected_files"], fields.get("affected_modules")
+        )
     _scalar_fields = {
         "title",
         "context",
@@ -705,6 +732,7 @@ async def update_decision_by_id(
 
     rec.updated_at = _now_utc()
     await session.flush()
+    await sync_links_from_record(session, rec)
     return rec
 
 
@@ -1448,20 +1476,7 @@ async def bulk_upsert_decisions(
             prior_split or any(bool(d.get("needs_split")) for d in members),
         )
 
-        # Mirror the JSON file/module arrays into first-class decision→code
-        # links so the graph is traversable both directions (Phase 3A). The
-        # JSON stays the cheap read cache; these rows are the queryable truth.
-        # A footprint contributes no links. The graph is what session
-        # injection and the ``get_risk`` directives ask "which decisions touch
-        # this node", so gating this one write path covers both readers.
-        binds = binds_to_paths(rec.scope_basis)
-        await sync_decision_node_links(
-            session,
-            repository_id,
-            rec.id,
-            files=json.loads(rec.affected_files_json or "[]") if binds else [],
-            modules=json.loads(rec.affected_modules_json or "[]") if binds else [],
-        )
+        await sync_links_from_record(session, rec)
 
         # (Re-)embed the record into the shared store so it's matchable by
         # later groups in this batch + future runs, and discoverable via
@@ -1732,7 +1747,13 @@ async def recompute_decision_staleness(
         if affected:
             affected_by_id[dec.id] = affected
 
-    modules_updated = _backfill_module_nodes(decisions, affected_by_id)
+    remodelled = _backfill_module_nodes(decisions, affected_by_id)
+    modules_updated = len(remodelled)
+    # This repair runs after ``backfill_decision_node_links`` on both index
+    # paths, so a module array it rewrites here would otherwise keep the link
+    # the backfill had already judged correct.
+    for dec in remodelled:
+        await sync_links_from_record(session, dec)
     if not affected_by_id:
         if modules_updated:
             await session.flush()
@@ -1798,15 +1819,19 @@ async def recompute_decision_staleness(
 def _backfill_module_nodes(
     decisions: list[DecisionRecord],
     affected_by_id: dict[str, list[str]],
-) -> int:
-    """Re-derive each record's module linkage from its files. Returns rows moved.
+) -> list[DecisionRecord]:
+    """Re-derive each record's module linkage from its files.
+
+    Returns the records whose array moved, because the caller has to relink
+    each one: this rewrites half a record's scope and the graph holds the
+    other half.
 
     Records naming no file are left alone: there is nothing to derive from, and
     an invented scope is worse than an absent one.
     """
     from repowise.core.analysis.decisions.scope import resolve_module_nodes
 
-    moved = 0
+    moved = []
     for dec in decisions:
         affected = affected_by_id.get(dec.id)
         if not affected:
@@ -1814,7 +1839,7 @@ def _backfill_module_nodes(
         derived = resolve_module_nodes(affected)
         if derived != json.loads(dec.affected_modules_json or "[]"):
             dec.affected_modules_json = json.dumps(derived)
-            moved += 1
+            moved.append(dec)
     return moved
 
 
