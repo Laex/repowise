@@ -233,9 +233,17 @@ def _collect_perf_hits(
     fn_kinds = lmap.function_kinds
     lambda_kinds = lmap.lambda_kinds
     async_fn_kinds = lmap.async_function_kinds
+    bare_call_wrapper_kinds = lmap.bare_call_wrapper_kinds
     # Block-iteration loops (Ruby ``items.each do … end``): only pay for the
     # per-call-node hook when the dialect actually overrides it.
     do_block_loop = _overrides(dialect, "block_loop_body")
+    # Parenless calls (Pascal ``Q.Open;``): only probe a bare-call wrapper
+    # (``statement``) when the dialect actually overrides the hook, same
+    # pay-for-what-you-use posture as ``do_block_loop``.
+    do_bare_stmt_call = (
+        bool(bare_call_wrapper_kinds)
+        and _overrides(dialect, "bare_statement_call")
+    )
     do_chunked = _overrides(dialect, "is_chunked_loop")
     do_magnitude = _overrides(dialect, "loop_magnitude")
     do_batch = _overrides(dialect, "batch_form")
@@ -380,23 +388,33 @@ def _collect_perf_hits(
                     PerfHit(icm, node.start_point[0] + 1, next_func, "", func_start=next_start)
                 )
 
+        call_node: Node | None = None
         if t in call_kinds:
-            method = dialect.callee_method_name(node) or ""
-            root_name = dialect.callee_root_name(node) or ""
-            awaited = dialect.is_awaited(node)
-            line = node.start_point[0] + 1
+            call_node = node
+        elif do_bare_stmt_call and t in bare_call_wrapper_kinds:
+            # A parenless call (Pascal ``Q.Open;``): no ``call_kinds`` node
+            # exists at all, so the dialect is asked whether this particular
+            # statement wrapper IS one (it also wraps non-call statements —
+            # Pascal's bare ``Exit;`` / ``inherited;`` — that must stay None).
+            call_node = dialect.bare_statement_call(node)
+
+        if call_node is not None:
+            method = dialect.callee_method_name(call_node) or ""
+            root_name = dialect.callee_root_name(call_node) or ""
+            awaited = dialect.is_awaited(call_node)
+            line = call_node.start_point[0] + 1
             if do_bare_call_marker:
                 # A call that is its own iteration construct (``.reduce`` with an
                 # accumulator spread) — a perf smell at any loop depth.
-                bare = dialect.bare_call_marker(root_name, method, node)
+                bare = dialect.bare_call_marker(root_name, method, call_node)
                 if bare is not None:
                     hits.append(PerfHit(bare, line, next_func, "", func_start=next_start))
             kind = dialect.call_sink_kind(
-                node, awaited=awaited, io_names=io_names, has_db_import=has_db_import
+                call_node, awaited=awaited, io_names=io_names, has_db_import=has_db_import
             )
             if kind is not None:
                 if loop_depth >= 1:
-                    facts = loop_facts(node, sink=True)
+                    facts = loop_facts(call_node, sink=True)
                     hits.append(
                         PerfHit("io_in_loop", line, next_func, kind, func_start=next_start, loop=facts)
                     )
@@ -462,7 +480,7 @@ def _collect_perf_hits(
             else:
                 if loop_depth >= 1:
                     marker = (
-                        dialect.loop_call_marker(root_name, method, node, list_names)
+                        dialect.loop_call_marker(root_name, method, call_node, list_names)
                         if do_loop_call_marker
                         else None
                     )
@@ -470,7 +488,7 @@ def _collect_perf_hits(
                         hits.append(
                             PerfHit(
                                 marker, line, next_func, "", func_start=next_start,
-                                loop=loop_facts(node, sink=False),
+                                loop=loop_facts(call_node, sink=False),
                             )
                         )
                     elif method:
@@ -480,7 +498,7 @@ def _collect_perf_hits(
                         targets = _acc(next_start, next_func)[0]
                         if method not in targets:
                             targets[method] = line
-                            facts = loop_facts(node, sink=False)
+                            facts = loop_facts(call_node, sink=False)
                             if facts is not None:
                                 call_facts.setdefault(next_start, {})[line] = facts
                 if do_lock_io and lock_depth >= 1 and method:
