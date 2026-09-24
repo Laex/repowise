@@ -373,7 +373,7 @@ map before markers fire. This table is why a language is Full rather than Good.
 | Scala | ✅ | ✅ | ✅ | later | later | later | ✅ |
 | Ruby | ✅ | ✅ | ✅ | later | later | later | ✅ |
 | Dart | ✅ | n/a | ✅ | later | later | later | ✅ |
-| Object Pascal | ✅ | n/a | later | n/a | n/a | later | n/a |
+| Object Pascal | ✅ | n/a | ✅ | n/a | n/a | later | ✅ |
 | Razor | ✅ | n/a | n/a | n/a | n/a | later | ✅ |
 | Shell | ✅ | n/a | n/a | n/a | n/a | n/a | n/a |
 
@@ -828,6 +828,19 @@ cannot check.
 - **Razor has no import edges**, and an attribute-bound handler carries none.
 - **Object Pascal's `extends`/`implements` split is a naming heuristic**,
   inferred from the `I`-prefix convention rather than a language guarantee.
+- **Object Pascal's DB/network performance sinks are gated on file-wide
+  `uses`-clause evidence, not per-receiver evidence.** A file importing
+  `FireDAC` gates every `.Open` / `.ExecSQL` / `.Post` call in it, not only
+  calls on an actual `TFDQuery`, because a Pascal variable's declared type has
+  no textual link back to the unit it came from the way `client = requests.Session()`
+  does in Python.
+- **Object Pascal has no `assertion_free_test`.** `large_assertion_block` /
+  `duplicated_assertion_block` / `mock_saturated_test` all read the same
+  assertion counts and work for it; `assertion_free_test` additionally gates
+  on a `SHIPPING_LANGUAGES` allowlist that needs its own measured-precision
+  pass (see the module docstring) before Pascal joins it. It has no mock
+  dialect either, so `mock_saturated_test`'s mock-setup half stays at zero --
+  advisory and harmless, never a false `mock_saturated_test` positive.
 - **A GDScript `uid://` resolves through the `.uid` sidecar Godot writes for
   scripts**, so a `preload` naming one reaches its file. A uid naming a scene
   does not: Godot writes no sidecar for `.tscn` / `.tres`, and the
@@ -859,7 +872,7 @@ Per-language mechanics behind these:
 | C# | Full (health) | Dataflow dialect |
 | Dart | Good | riverpod / get_it dynamic hints, dataflow dialect |
 | GDScript | Good | The health dialects (complexity, performance, dataflow) that would take it to Full; the grammar supports all three |
-| Object Pascal | Good | Assertion and performance markers, a dedicated `uses` resolver |
+| Object Pascal | Good | A dedicated `uses` resolver; `assertion_free_test` needs a measured-precision pass before it joins its language allowlist |
 | COBOL | Good | Copybook resolution, source-format normalization, dialect coverage, health markers |
 | VB.NET | Good | Health markers, project-level `<Import Include=...>` as implicit imports |
 | Elixir | Good | Health markers, and a call-resolution strategy beyond same-file |

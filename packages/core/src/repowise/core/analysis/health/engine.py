@@ -112,6 +112,46 @@ log = structlog.get_logger(__name__)
 # and a declining call's arguments are not scanned, so an assertion passed as an
 # argument still does not stand in for the header's oracle.
 #
+# v31: Pascal opts into assertion detection (``assert_call_kinds``): DUnit's
+# ``Check``/``CheckEquals``/``Fail`` family (a new ``asserts/lexicon.py`` row,
+# broad tier) and DUnitX's ``Assert.*`` plus the RTL's own ``Assert(cond, msg)``
+# (narrow tier, no row needed -- ``Assert`` itself is an assert-prefixed
+# identifier). A new ``expr_stmt_kinds`` field tells the walker that a call in
+# flat statement position sits under a node named ``statement``, not the
+# hardcoded ``expression_statement`` every other mapped grammar uses.
+# ``block_kinds`` also gains ``statements`` (plural) -- a ``try``'s guarded
+# body and its ``except``/``finally`` clauses use that distinct container, not
+# ``block``, so every assertion inside a ``try ... finally Free; end`` (close
+# to universal in Delphi tests) was invisible before this: measured on a real
+# ~150-file Delphi codebase's Test*.dpr suite, assertion coverage moved from
+# 66/120 files (1844 assertions) to 86/120 (2873). ``large_assertion_block`` /
+# ``duplicated_assertion_block`` now fire for Pascal; ``assertion_free_test``
+# deliberately does not -- it gates on a ``SHIPPING_LANGUAGES`` allowlist that
+# needs its own measured-precision pass before Pascal joins it.
+#
+# v30: a Pascal call to a zero-argument procedure may omit its parentheses
+# entirely (``Q.Open;``), which produces no ``exprCall`` node at all -- just a
+# bare ``identifier`` / ``exprDot`` under a ``statement`` wrapper, invisible to
+# the whole performance pass regardless of sink kind. The new
+# ``bare_call_wrapper_kinds`` / ``PerfDialect.bare_statement_call`` hook (a
+# no-op for every language that does not map it) tells that shape apart from
+# the wrapper's other tenants (``Exit;`` / ``inherited;``), so ``Q.Open;`` now
+# finds the same ``io_in_loop`` as ``Q.Open();`` already did.
+#
+# v29: Pascal's ``uses`` clause now feeds ``io_boundaries.collect_io_names``
+# (``FireDAC`` / ``ADODB`` -> db, ``IdHTTP`` / ``System.Net.HttpClient`` ->
+# network), and the Pascal ``PerfDialect`` gates ``TDataSet.Open`` /
+# ``.ExecSQL`` / ``.Post`` and an HTTP client's ``.Get`` / ``.Post`` on that
+# evidence -- a loop calling one of these now produces a ``db`` / ``network``
+# ``io_in_loop`` where before it stayed silent (filesystem/subprocess only).
+#
+# v28: Pascal's ``foreach`` (``for x in collection do``) was absent from its
+# ``loop_kinds``, so a for-in loop contributed no CCN and opened no nesting
+# level -- stored complexity / nesting for any Pascal function using one
+# understates both. Pascal also gained a ``PerfDialect`` (filesystem /
+# subprocess sinks by RTL/VCL/FPC name), so ``io_in_loop`` / ``hot_path_sync_io``
+# now fire for it instead of the pass silently skipping every Pascal file.
+#
 # v27: a new marker, ``lazy_load_in_loop`` (a lazy relationship read on each
 # iteration of a loop over its rows); and ``unbounded_read_reduced_in_memory`` now
 # runs on ``init`` too, where it never ran before. A v26 store built by ``init`` has
@@ -263,7 +303,7 @@ log = structlog.get_logger(__name__)
 # forms. Files that were counted untested and are not become tested, which
 # moves untested-hotspot findings and the scores that carry them, on every
 # language with a prefix or spec convention rather than Ruby alone.
-HEALTH_ANALYZER_VERSION = 27
+HEALTH_ANALYZER_VERSION = 31
 
 
 def walked_functions(
