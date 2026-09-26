@@ -1,72 +1,58 @@
-"""Architectural Decision Intelligence - extraction from multiple sources.
+"""Architectural decision extraction from every index-time source.
 
-Capture sources (see ``decision_provenance.SOURCE_RANK`` for the trust ladder):
-    1. Inline markers     (# WHY:, # DECISION:, etc.)
-    2. Git archaeology    (significant commit messages)
-    3. ADR auto-discovery (Nygard/MADR records — deterministic parse first)
-    4. PR / squash-body mining (commit bodies captured in git indexing)
-    5. Comment archaeology (LLM rationale prose on high-centrality code)
-    + CLI capture (manual entry)
+Sources run in :data:`SOURCE_NAMES` order (inline markers, git archaeology,
+ADRs, PR / squash bodies, comment archaeology, conventions) and can be disabled
+per repo via ``decisions.sources`` in ``.repowise/config.yaml``. ADRs are parsed
+structurally before any LLM call.
 
-Sources can be disabled per-repo via ``decisions.sources`` in
-``.repowise/config.yaml`` (see :data:`SOURCE_NAMES` /
-:meth:`DecisionExtractor.extract_all`).
+``code_comment``, ``readme_mining`` and ``changelog`` are retired: they mined
+prose that describes a repo rather than evidence of a choice made in it. Their
+names stay in ``SOURCE_RANK`` so older rows still rank, and
+:data:`RETIRED_SOURCES` drives the purge on the persist path.
 
-Three sources have been retired, all for the same reason: they mined prose that
-describes a repo rather than evidence of a choice made in it, and the records
-they produced were never acted on. ``code_comment`` went first (#751) — the
-query-time live-grep miner serves the same comments fresh, so persisting them
-only flooded the proposed queue. ``readme_mining`` and ``changelog`` follow:
-between them they produced 153 records in this project's own store and **zero**
-that ever became active, while accounting for most of a 214-deep review queue.
-Retired source names are kept in ``SOURCE_RANK`` so rows written before the
-removal still rank, and :data:`RETIRED_SOURCES` drives the one-shot purge on the
-persist path. The ADR miner still borrows ``README_MINING_PROMPT`` for its
-unstructured-file fallback; that is the prompt, not the source.
-
-Determinism-first: ADRs are parsed structurally before any LLM call.
-Every extracted decision passes an anti-hallucination substring gate
-(:meth:`DecisionExtractor._apply_substring_gate`) — fields not grounded in the
-verbatim source span are dropped, and evidence-less decisions are rejected.
-
-All LLM calls are wrapped in try/except - failures never propagate.
+Every decision passes the anti-hallucination substring gate before it is
+returned, and a source that fails is reported in the result, never raised.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import re
 from collections.abc import Collection, Iterator, Sequence
-from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import structlog
 
 from repowise.core.analysis.decisions.gate import apply_substring_gate
-from repowise.core.analysis.decisions.lifecycle import ARCHITECTURAL_KIND
 from repowise.core.analysis.decisions.policy import (
     INDEX_SOURCE_KEYS,
     DecisionPolicy,
     resolve_policy,
 )
-from repowise.core.analysis.decisions.scope import (
-    SCOPE_BASIS_SELECTED,
-    commit_scope_basis,
-    commit_scope_files,
-    resolve_module_nodes,
-    selected_scope_files,
-)
+from repowise.core.analysis.decisions.scope import resolve_module_nodes
 
 from .adr import _ADR_STATUS_MAP, bullets, find_adr_files, read_front_matter, split_headings
-from .commit_signals import count_decision_signals
+from .commit_mining import (
+    _BATCH_MAX_TOKENS,
+    _MAX_PR_BODIES,
+    _attribute_to_commit,
+    git_commit_block,
+    pr_candidates,
+    pr_commit_block,
+    signal_commits,
+)
 from .markers import (  # noqa: F401  (MARKER_RE re-exported)
     MARKER_RE,
     find_markers,
     strip_code_blocks,
+)
+from .model_answers import (  # noqa: F401  (_coerce_paths, _collect_batches re-exported)
+    _coerce_paths,
+    _collect_batches,
+    _run_batches,
+    parse_decisions_json,
 )
 from .prompts import (
     _SYSTEM_PROMPT,
@@ -76,11 +62,18 @@ from .prompts import (
     PR_BODY_MINING_PROMPT,
     README_MINING_PROMPT,
 )
+from .records import (  # noqa: F401  (the two errors are re-exported)
+    DecisionExtractionReport,
+    DecisionSourceError,
+    EmptyModelResponseError,
+    ExtractedDecision,
+)
 from .source_files import (
     _BINARY_EXTENSIONS,
     extract_leading_prose,
     iter_source_files,
 )
+from .staleness import _as_aware_utc, compute_staleness, last_code_change  # noqa: F401
 
 logger = structlog.get_logger(__name__)
 
@@ -98,208 +91,9 @@ def _truncate_title(text: str, limit: int) -> str:
     window = text[:limit]
     cut = window.rfind(" ")
     if cut <= 0:
-        # Single over-long word — hard cut, still signal truncation.
+        # Single over-long word: hard cut, still signal truncation.
         return window.rstrip() + "…"
     return window[:cut].rstrip() + "…"
-
-
-def _coerce_line(value: object) -> int | None:
-    """Read an LLM-reported line number, or ``None`` if it isn't one.
-
-    Models answer ``12``, ``"12"`` and ``"line 12"`` interchangeably; anything
-    that isn't a positive integer is no attribution at all and must not be
-    guessed at.
-    """
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value if value > 0 else None
-    if isinstance(value, str):
-        digits = re.search(r"\d+", value)
-        if digits:
-            line = int(digits.group())
-            return line if line > 0 else None
-    return None
-
-
-def _as_aware_utc(value: datetime) -> datetime:
-    """Return ``value`` as a timezone-aware UTC datetime.
-
-    SQLite drops timezone information from ``DateTime(timezone=True)`` columns,
-    but Repowise writes those values as UTC. Treat naive values as UTC so they
-    can be compared with git metadata timestamps, which are already aware UTC.
-    """
-    if value.tzinfo is None or value.utcoffset() is None:
-        return value.replace(tzinfo=UTC)
-    return value.astimezone(UTC)
-
-
-def _coerce_dt(value: datetime | str) -> datetime:
-    """Parse an ISO string into a datetime, passing datetimes through.
-
-    Both shapes reach staleness: the ORM hands back datetimes, while the git
-    metadata map carries whatever was persisted, which for SQLite is a string.
-    """
-    if isinstance(value, str):
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    return value
-
-
-# ---------------------------------------------------------------------------
-# Data models
-# ---------------------------------------------------------------------------
-
-
-#: The output budget for one batch of either commit prompt. Reasoning tokens
-#: are charged to it, so a budget that only fits the answer buys an empty
-#: body rather than a short one. Roughly twice the largest completion measured
-#: on this repository; see decision ``1c228ed8``.
-_BATCH_MAX_TOKENS = 8000
-
-#: How many of a commit's files either commit prompt will show. The model has
-#: to read the list to pick from it, and a commit that touched ninety files is
-#: not one whose decisions can be assigned by reading the list anyway.
-#:
-#: Sorted before truncating at both call sites, so which files the model is
-#: allowed to choose from is a property of the commit rather than of the order
-#: ``_git_meta_map`` happened to be built in.
-_MAX_PROMPT_FILES = 20
-
-
-def _coerce_paths(value: object) -> list[str] | None:
-    """A list of path-ish strings out of whatever the model returned.
-
-    ``None`` for an absent *or malformed* key, so that a model which answered
-    ``[]`` is told apart from one that never usefully answered: the first is a
-    decision about none of the commit's files, which binds the record to
-    nothing, and the second is a provider that has not seen the new prompt,
-    which falls back to the commit list. A list of dicts or numbers is the
-    second case, not the first -- reading it as "chose nothing" would silently
-    make the record govern nothing forever on a shape error.
-
-    Models return a bare string for a one-element list often enough to be
-    worth handling.
-    """
-    if value is None:
-        return None
-    if isinstance(value, str):
-        value = [value]
-    if not isinstance(value, list):
-        return None
-    kept = [v.strip() for v in value if isinstance(v, str) and v.strip()]
-    if value and not kept:
-        return None
-    return kept
-
-
-@dataclass
-class ExtractedDecision:
-    title: str
-    context: str = ""
-    decision: str = ""
-    rationale: str = ""
-    alternatives: list[str] = field(default_factory=list)
-    consequences: list[str] = field(default_factory=list)
-    affected_files: list[str] = field(default_factory=list)
-    #: What the mining model named, before the commit's own file list has
-    #: validated it. Mining-time only: the two commit miners intersect it into
-    #: :attr:`affected_files` and clear it, so nothing downstream ever reads a
-    #: path the model produced and the commit does not list.
-    #:
-    #: ``None`` means the model was never asked or did not answer, which is
-    #: not the same as an empty list. An empty list is the model saying this
-    #: decision is about none of the commit's files, and that answer binds the
-    #: record to nothing; ``None`` falls back to the old breadth rule.
-    proposed_files: list[str] | None = None
-    affected_modules: list[str] = field(default_factory=list)
-    tags: list[str] = field(default_factory=list)
-    source: str = "inline_marker"
-    #: See :class:`~repowise.core.persistence.models.DecisionRecord.scope_basis`.
-    #: Set by the commit-derived miners, which are the only ones that take a
-    #: file list they did not choose per file.
-    scope_basis: str = ""
-    evidence_commits: list[str] = field(default_factory=list)
-    evidence_file: str | None = None
-    evidence_line: int | None = None
-    confidence: float = 0.5
-    status: str = "proposed"
-    # Which of the two nouns this is. Defaulted rather than classified per
-    # extractor: every other source reads an artifact already written about the
-    # code, and only the session lane mines the prose where an agreement about
-    # conducting the work gets stated.
-    kind: str = ARCHITECTURAL_KIND
-    # The verbatim claimed quote (LLM/parser output) and the verdict from the
-    # anti-hallucination substring gate (Phase 1D).
-    source_quote: str = ""
-    verification: str = "unverified"  # exact | fuzzy | unverified
-    # Transient: the verbatim source span this decision was drawn from. Set by
-    # each extractor, consumed by the substring gate, then cleared before
-    # persistence (the persistence layer ignores unknown dict keys anyway).
-    source_text: str = ""
-    # ``source`` alone cannot separate the two session lanes. Blank and False
-    # mean the lane said nothing, not that it said no.
-    lane: str = ""
-    needs_split: bool = False
-    # A source that measures its own conformance writes it; None means the
-    # git-diff recompute owns it.
-    staleness_score: float | None = None
-
-
-class DecisionSourceError(RuntimeError):
-    """Every batch of a decision source failed.
-
-    Raised so :meth:`DecisionExtractor.extract_all` records the source as
-    failed rather than empty. A source that loses *some* batches still
-    returns what it has and only logs, because partial supply beats none.
-    """
-
-
-class EmptyModelResponseError(DecisionSourceError):
-    """The model returned no body at all for one batch.
-
-    Distinct from ``[]``, which is a real answer and the common one. Raised so
-    the batch lands in :func:`_collect_batches` as a failure rather than as a
-    source with nothing in it.
-    """
-
-
-def _collect_batches(
-    source: str,
-    results: list[Any],
-) -> list[ExtractedDecision]:
-    """Flatten ``asyncio.gather(..., return_exceptions=True)`` output.
-
-    Exceptions are logged per batch. If nothing survived and there was work
-    to do, the source failed outright and says so instead of returning a
-    zero that reads like an empty repository.
-    """
-    decisions: list[ExtractedDecision] = []
-    errors: list[str] = []
-    for result in results:
-        if isinstance(result, list):
-            decisions.extend(result)
-        else:
-            errors.append(f"{type(result).__name__}: {result}")
-            logger.warning(
-                "decision_extractor.batch_failed",
-                source=source,
-                error=str(result),
-            )
-    if errors and len(errors) == len(results):
-        raise DecisionSourceError(f"all {len(errors)} batch(es) failed — {errors[0]}")
-    return decisions
-
-
-@dataclass
-class DecisionExtractionReport:
-    total_found: int
-    decisions: list[ExtractedDecision]
-    by_source: dict[str, int]
-    # Sources that raised, {source name: error text}. A source that fails
-    # returns an empty list, so without this a total outage and an honestly
-    # empty repo are the same number on screen. Callers render it; nothing
-    # else can tell the two apart.
-    failures: dict[str, str] = field(default_factory=dict)
 
 
 # Every index-time capture source, in progress order. The CLI derives its
@@ -316,31 +110,6 @@ def enabled_source_names(repo_config: dict[str, Any] | None) -> tuple[str, ...]:
     """
     return resolve_policy(repo_config).policy.enabled_index_sources()
 
-
-# ---------------------------------------------------------------------------
-# Comment marker detection
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# ADR / PR / comment source configuration
-# ---------------------------------------------------------------------------
-
-# PR/squash body markers — a body containing any of these reads like a PR
-# description worth mining (vs an incidental multi-line commit message).
-_PR_BODY_MARKERS = (
-    "## why",
-    "## motivation",
-    "## what",
-    "## changes",
-    "## context",
-    "## summary",
-    "closes #",
-    "fixes #",
-    "resolves #",
-    "before:",
-    "after:",
-)
-_MAX_PR_BODIES = 25
 
 # Prose that signals rationale in a block comment / docstring (beyond the
 # explicit WHY:/DECISION: markers already covered by inline_marker).
@@ -365,149 +134,99 @@ _MAX_COMMENT_NODES = 30
 # with more markers is sent in several calls rather than truncated.
 _MARKERS_PER_CALL = 5
 
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# Main extractor
-# ---------------------------------------------------------------------------
+
+def _adr_title(front_matter_title: str, body: str) -> str:
+    """The ADR's title: front matter, else its first H1, less any ``ADR-0007:`` prefix."""
+    title = front_matter_title
+    if not title:
+        m = re.search(r"^#\s+(.+)$", body, re.MULTILINE)
+        if m:
+            title = m.group(1).strip()
+    return re.sub(r"^ADR[-\s]*\d+[:\s-]*", "", title, flags=re.IGNORECASE).strip() or title
 
 
-def _scope_from_selection(
-    decision: ExtractedDecision,
-    commit_files: Sequence[str] | None,
-) -> tuple[list[str], str]:
-    """The files and basis for one decision mined out of one commit.
+def _first_section(sections: dict[str, str], *headings: str) -> str:
+    """The body of the first of *headings* the ADR fills in, else ``""``."""
+    for heading in headings:
+        if sections.get(heading):
+            return sections[heading]
+    return ""
 
-    Returns the model's own selection, validated against the commit's file
-    list, under :data:`SCOPE_BASIS_SELECTED`. Falling back to the commit's
-    whole footprint when the model selected nothing would reinstate exactly
-    what this replaces, so an empty selection stays empty: the record keeps
-    its commit, its evidence and its place in repository-wide answers, and
-    stops answering "what governs this file". Roughly one record in six lands
-    here, and every one of them measured as a record whose subject was not in
-    the commit's list to begin with.
 
-    The old breadth rule is the fallback for a *missing* answer rather than an
-    empty one -- a provider that ignored the new key, or a cached response
-    written before it existed. There the record is scoped as it always was and
-    the legacy basis says so.
+def _adr_status(declared: str) -> str:
+    """The record status for an ADR's declared status.
+
+    An undeclared status stays ``proposed``: a committed ADR is the one
+    artifact allowed to accept its own decision, so a draft must not.
     """
-    if decision.proposed_files is None:
-        return (commit_scope_files(commit_files), commit_scope_basis(commit_files))
-    chosen = selected_scope_files(decision.proposed_files, commit_files)
-    decision.proposed_files = None
-    return (chosen, SCOPE_BASIS_SELECTED)
+    status_key = declared.strip().lower().split()[0] if declared.strip() else ""
+    return _ADR_STATUS_MAP.get(status_key, "proposed")
 
 
+_TAG_KEYWORDS = {
+    "auth": ["auth", "jwt", "oauth", "token", "session", "login"],
+    "database": ["database", "sql", "postgres", "sqlite", "redis", "mongo", "db"],
+    "api": ["api", "rest", "graphql", "endpoint", "route"],
+    "performance": ["performance", "cache", "speed", "latency", "optimize"],
+    "security": ["security", "encrypt", "hash", "cors", "csrf", "xss"],
+    "infra": ["docker", "kubernetes", "deploy", "ci", "cd", "terraform"],
+    "testing": ["test", "mock", "fixture", "assert"],
+}
 
-def _signal_commit_info(commit: dict) -> dict | None:
-    """The prompt-ready record of a commit with decision signals, else None."""
-    msg = commit.get("message", "")
-    body = commit.get("body", "")
-    # Scan subject + body for signals — squash-merge repos carry the
-    # decision rationale in the body, not the one-line subject.
-    signal_count = count_decision_signals(f"{msg}\n{body}".lower())
-    if signal_count <= 0:
-        return None
-    return {
-        "sha": commit.get("sha", ""),
-        "message": msg,
-        "body": body,
-        "author": commit.get("author", ""),
-        "date": commit.get("date", ""),
-        "signal_count": signal_count,
-    }
 
-async def _run_batches(
-    source: str,
-    items: Sequence[Any],
-    size: int,
-    process: Any,
-) -> list[ExtractedDecision]:
-    """Run *process* over *items* in batches of *size*, concurrently.
+def _infer_tags(text: str) -> list[str]:
+    """Infer tags from decision text."""
+    text_lower = text.lower()
+    return [
+        tag for tag, keywords in _TAG_KEYWORDS.items() if any(kw in text_lower for kw in keywords)
+    ]
 
-    Each batch's failure is contained and counted by :func:`_collect_batches`,
-    which raises only when every batch failed.
+
+def _snippet_for(
+    decision: ExtractedDecision, batch: Sequence[tuple[str, str]]
+) -> tuple[str, str]:
+    """The ``(file, prose)`` a comment decision came from, by file stem in its text.
+
+    Best effort: the batch's first snippet when no stem matches.
     """
-    batches = [items[i : i + size] for i in range(0, len(items), size)]
-    results = await asyncio.gather(*[process(b) for b in batches], return_exceptions=True)
-    return _collect_batches(source, list(results))
+    hay = (decision.title + " " + decision.decision).lower()
+    for fp, prose in batch:
+        stem = Path(fp).stem.lower()
+        if stem and stem in hay:
+            return fp, prose
+    return batch[0]
 
 
-def _attribute_to_commit(
-    decision: ExtractedDecision,
-    batch: list[dict],
-    subject_key: str,
-    files_by_sha: dict[str, list[str]],
-    source_by_sha: dict[str, str],
-) -> str:
-    """Bind a decision mined from a batch of commits to the commit it came from.
-
-    Prefers the sha the model reported, else the first commit whose subject
-    (``batch[i][subject_key]``, first 40 chars) appears in the title. Scopes
-    the decision to that commit's files and returns the sha, or ``""`` when
-    nothing matched.
-    """
-    sha = decision.evidence_commits[0] if decision.evidence_commits else ""
-    if not sha:
-        # Try to match back to a commit
-        for c in batch:
-            if c[subject_key][:40].lower() in decision.title.lower():
-                sha = c["sha"]
-                break
-    if sha:
-        decision.evidence_commits = [sha]
-        decision.affected_files, decision.scope_basis = _scope_from_selection(
-            decision, files_by_sha.get(sha)
-        )
-        decision.source_text = source_by_sha.get(sha, "")
-    # Cleared whether or not the sha resolved: an unattributed decision has no
-    # commit to validate paths against, so the model's list is unusable rather
-    # than merely unused.
-    decision.proposed_files = None
-    return sha
+# Above this node count, rank by degree (O(nodes)) instead of solving PageRank:
+# comment archaeology only needs a rough "most depended-on files" ranking.
+_PAGERANK_NODE_CEILING = 20_000
 
 
-def _load_json_payload(content: str) -> Any | None:
-    """Decode a model's JSON answer, tolerating code fences and surrounding prose."""
-    if content.startswith("```"):
-        # Remove markdown code fences
-        lines = content.split("\n")
-        content = "\n".join(line for line in lines if not line.strip().startswith("```"))
+def _pagerank(g: Any) -> dict[str, float]:
+    """PageRank for a graph small enough to solve, else empty."""
     try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        pass
-    # Try to find JSON array in the response
-    match = re.search(r"\[.*\]", content, re.DOTALL)
-    if not match:
-        return None
+        node_count = g.number_of_nodes()
+    except Exception:
+        node_count = 0
+    if not 0 < node_count <= _PAGERANK_NODE_CEILING:
+        return {}
     try:
-        return json.loads(match.group())
-    except json.JSONDecodeError:
-        return None
+        import networkx as nx
+
+        return nx.pagerank(g, max_iter=50, tol=1e-4)
+    except Exception:
+        return {}
 
 
-def _decision_from_item(item: dict) -> ExtractedDecision:
-    """One decision from one object of a model's JSON answer."""
-    return ExtractedDecision(
-        title=item.get("title", ""),
-        context=item.get("context", ""),
-        decision=item.get("decision", ""),
-        rationale=item.get("rationale", ""),
-        alternatives=item.get("alternatives", []),
-        consequences=item.get("consequences", []),
-        tags=item.get("tags", []),
-        # Only the two commit prompts ask for this. Every other prompt omits
-        # the key, so this stays None and the miner that owns those decisions
-        # keeps scoping them its own way.
-        proposed_files=_coerce_paths(item.get("affected_files")),
-        evidence_commits=[item["commit_sha"]] if "commit_sha" in item else [],
-        # Which marker this came from, for the inline-marker miner's per-marker
-        # attribution. Absent (and left None) for every other prompt; they
-        # scope by sha or by file instead.
-        evidence_line=_coerce_line(item.get("marker_line")),
-        source_quote=item.get("source_quote", ""),
-    )
+def _centrality_scores(g: Any) -> dict[str, float]:
+    """Node centrality: PageRank where affordable, else degree; empty when unreadable."""
+    scores = _pagerank(g)
+    if scores:
+        return scores
+    try:
+        return {node: float(g.degree(node)) for node in g.nodes}
+    except Exception:
+        return {}
 
 
 class DecisionExtractor:
@@ -525,17 +244,13 @@ class DecisionExtractor:
     ) -> None:
         self._repo_path = Path(repo_path)
         self._provider = provider
-        # Per-source model gate. ``None`` means "no policy supplied", which
-        # keeps the provider available to every source, as before this existed.
+        # Per-source model gate; ``None`` lets every source use the provider.
         self._policy = policy
         self._graph = graph
         self._git_meta_map = git_meta_map or {}
         self._parsed_files = parsed_files or []
-        # ``source_map`` is ingestion's already-computed {rel_path: bytes} for
-        # the indexed file set. When present, the inline-marker scan reuses it
-        # for both discovery and reads instead of re-walking the tree and
-        # re-reading every file from disk (redundant with ingestion). ``None``
-        # keeps the legacy self-walk fallback for callers that don't thread it.
+        # Ingestion's {rel_path: bytes} for the indexed set. When given, the
+        # marker scan reads it instead of walking and re-reading the tree.
         self._source_map = source_map
 
     def _llm(self, source: str) -> Any | None:
@@ -589,10 +304,8 @@ class DecisionExtractor:
         self, file_path: str, markers: list[dict], marker_llm: Any | None
     ) -> list[ExtractedDecision]:
         """One file's markers as decisions: model-structured when possible, else raw."""
-        # Get 1-hop graph neighbors for affected_files
         affected = self._get_neighbors(file_path)
         if not marker_llm:
-            # No LLM — create minimal decisions from raw marker text
             return [self._raw_decision_from_marker(file_path, m, affected) for m in markers]
         try:
             llm_decisions = await self._structure_markers_via_llm(file_path, markers)
@@ -602,7 +315,6 @@ class DecisionExtractor:
                 "decision_extractor.llm_structuring_failed",
                 file=file_path,
             )
-            # Fall through to raw extraction
             return [self._raw_decision_from_marker(file_path, m, affected) for m in markers]
         return llm_decisions
 
@@ -613,18 +325,15 @@ class DecisionExtractor:
         markers: list[dict],
         affected: list[str],
     ) -> None:
-        """Bind each model-structured decision to the marker it was drawn from."""
+        """Bind each model-structured decision to the marker it was drawn from.
+
+        The model reports ``marker_line``, parsed into ``evidence_line``. A
+        decision that names no known marker gets no source span, so the gate
+        leaves it ``unverified`` instead of verifying it against another
+        marker's text.
+        """
         markers_by_line = {m["line"]: m for m in markers}
         for d in decisions:
-            # Attribute the decision to the one marker it was drawn from (the
-            # prompt asks for `marker_line`, which the parser lands in
-            # `evidence_line`). Joining every marker's context into one span
-            # and handing it to all of them let the substring gate stamp a
-            # decision `exact` against a *different* marker's text, and put
-            # marker 1's line number on marker 3's decision. A decision we
-            # cannot attribute gets no source span at all: the gate then leaves
-            # it `unverified`, which is the honest verdict, rather than
-            # verifying it against a neighbour.
             marker = markers_by_line.get(d.evidence_line)
             if marker is None and len(markers) == 1:
                 marker = markers[0]  # unambiguous without the hint
@@ -647,10 +356,8 @@ class DecisionExtractor:
         return ExtractedDecision(
             title=_truncate_title(marker["text"], 100),
             decision=marker["text"],
-            # No context. This lane has only the marker's own text, and
-            # `evidence_file`/`evidence_line` below already say where it was
-            # found, so the location string it used to carry was a restatement
-            # that made a record with no stated reason read as having one.
+            # No context: the marker's text is all this lane has, and its
+            # location is already in evidence_file / evidence_line.
             source="inline_marker",
             status="active",
             confidence=0.7,
@@ -658,7 +365,7 @@ class DecisionExtractor:
             evidence_line=marker["line"],
             affected_files=list({file_path} | set(affected)),
             affected_modules=self._infer_modules([file_path, *affected]),
-            tags=self._infer_tags(marker["text"]),
+            tags=_infer_tags(marker["text"]),
             source_quote=marker["text"],
             source_text=marker.get("context", marker["text"]),
         )
@@ -668,12 +375,7 @@ class DecisionExtractor:
     ) -> list[ExtractedDecision]:
         """Use LLM to structure inline markers into decision records.
 
-        Markers are sent five per call. The batch size caps prompt length;
-        it is not a cap on how many markers a file may have. ``markers[:5]``
-        alone dropped every marker past the fifth: the caller invokes this
-        once per file, and the raw-marker fallback below only runs on an
-        exception, so those markers were never structured and never fell
-        back — they left no record and no log line.
+        Every marker is sent, ``_MARKERS_PER_CALL`` per call.
         """
         provider = self._llm("inline_marker")
         decisions: list[ExtractedDecision] = []
@@ -695,7 +397,7 @@ class DecisionExtractor:
             response = await provider.generate(
                 _SYSTEM_PROMPT, prompt, max_tokens=2000, temperature=0.2
             )
-            decisions.extend(self._parse_decisions_json(response.content))
+            decisions.extend(parse_decisions_json(response.content))
         return decisions
 
     # ------------------------------------------------------------------
@@ -708,7 +410,7 @@ class DecisionExtractor:
         if not provider or not self._git_meta_map:
             return []
 
-        commit_map, commit_files = self._signal_commits()
+        commit_map, commit_files = signal_commits(self._git_meta_map)
         if not commit_map:
             return []
 
@@ -724,25 +426,15 @@ class DecisionExtractor:
             commits_block = ""
             source_by_sha: dict[str, str] = {}
             for c in batch:
-                files = commit_files.get(c["sha"], [])
                 body = (c.get("body") or "").strip()
-                body_block = f"Body: {body[:1500]}\n" if body else ""
-                commits_block += (
-                    f"\n--- Commit {c['sha'][:8]} ---\n"
-                    f"Message: {c['message']}\n"
-                    f"{body_block}"
-                    f"Author: {c['author']}\n"
-                    f"Date: {c['date']}\n"
-                    f"Files changed: "
-                    f"{', '.join(sorted(files)[:_MAX_PROMPT_FILES])}\n"
-                )
+                commits_block += git_commit_block(c, body, commit_files.get(c["sha"], []))
                 source_by_sha[c["sha"]] = f"{c['message']}\n{body}".strip()
 
             prompt = GIT_ARCHAEOLOGY_PROMPT.format(commits_block=commits_block)
             response = await provider.generate(
                 _SYSTEM_PROMPT, prompt, max_tokens=_BATCH_MAX_TOKENS, temperature=0.2
             )
-            extracted = self._parse_decisions_json(response.content)
+            extracted = parse_decisions_json(response.content)
 
             # Enrich with commit metadata
             for d in extracted:
@@ -759,34 +451,6 @@ class DecisionExtractor:
             return extracted
 
         return await _run_batches("git_archaeology", ranked, 5, _process_batch)
-
-    def _signal_commits(self) -> tuple[dict[str, dict], dict[str, list[str]]]:
-        """Unique significant commits carrying decision signals, and each one's files.
-
-        Returns ``(sha -> commit info, sha -> files it touched)``.
-        """
-        commit_map: dict[str, dict] = {}  # sha → commit info
-        commit_files: dict[str, list[str]] = {}  # sha → files
-
-        for file_path, meta in self._git_meta_map.items():
-            commits_json = meta.get("significant_commits_json", "[]")
-            if isinstance(commits_json, str):
-                try:
-                    commits = json.loads(commits_json)
-                except (json.JSONDecodeError, TypeError):
-                    continue
-            else:
-                commits = commits_json
-
-            for commit in commits:
-                sha = commit.get("sha", "")
-                if sha and sha not in commit_map:
-                    info = _signal_commit_info(commit)
-                    if info is None:
-                        continue
-                    commit_map[sha] = info
-                commit_files.setdefault(sha, []).append(file_path)
-        return commit_map, commit_files
 
     # ------------------------------------------------------------------
     # Source 3: ADR auto-discovery (deterministic-first)
@@ -808,40 +472,47 @@ class DecisionExtractor:
 
         decisions: list[ExtractedDecision] = []
         for path in adr_paths:
-            try:
-                content = path.read_text(encoding="utf-8", errors="replace")
-            except (OSError, UnicodeDecodeError):
+            loaded = self._read_adr(path)
+            if loaded is None:
                 continue
-            if len(content) > 50_000:
-                content = content[:50_000]
-            try:
-                rel = str(path.relative_to(self._repo_path))
-            except ValueError:
-                rel = str(path)
-
+            rel, content = loaded
             parsed = self._parse_adr(content, rel)
             if parsed is not None:
                 decisions.append(parsed)
             elif provider:
-                try:
-                    stripped = strip_code_blocks(content)
-                    prompt = README_MINING_PROMPT.format(file_path=rel, content=stripped[:15_000])
-                    response = await provider.generate(
-                        _SYSTEM_PROMPT, prompt, max_tokens=2000, temperature=0.2
-                    )
-                    for d in self._parse_decisions_json(response.content):
-                        d.source = "adr"
-                        d.status = "proposed"
-                        d.confidence = 0.80
-                        d.evidence_file = rel
-                        d.source_text = stripped
-                        d.affected_modules = self._infer_modules_from_text(
-                            d.title + " " + d.decision
-                        )
-                        decisions.append(d)
-                except Exception:
-                    logger.warning("decision_extractor.adr_llm_failed", file=rel)
+                decisions.extend(await self._mine_unstructured_adr(provider, rel, content))
 
+        return decisions
+
+    def _read_adr(self, path: Path) -> tuple[str, str] | None:
+        """An ADR's repo-relative path and its first 50k chars, or None when unreadable."""
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except (OSError, UnicodeDecodeError):
+            return None
+        return self._rel_path(path), content[:50_000]
+
+    async def _mine_unstructured_adr(
+        self, provider: Any, rel: str, content: str
+    ) -> list[ExtractedDecision]:
+        """The LLM fallback for a file named like an ADR that has no ADR structure."""
+        decisions: list[ExtractedDecision] = []
+        try:
+            stripped = strip_code_blocks(content)
+            prompt = README_MINING_PROMPT.format(file_path=rel, content=stripped[:15_000])
+            response = await provider.generate(
+                _SYSTEM_PROMPT, prompt, max_tokens=2000, temperature=0.2
+            )
+            for d in parse_decisions_json(response.content):
+                d.source = "adr"
+                d.status = "proposed"
+                d.confidence = 0.80
+                d.evidence_file = rel
+                d.source_text = stripped
+                d.affected_modules = self._infer_modules_from_text(d.title + " " + d.decision)
+                decisions.append(d)
+        except Exception:
+            logger.warning("decision_extractor.adr_llm_failed", file=rel)
         return decisions
 
     def _parse_adr(self, content: str, rel_path: str) -> ExtractedDecision | None:
@@ -853,50 +524,35 @@ class DecisionExtractor:
         """
         status, title, body = read_front_matter(content)
         sections = split_headings(body)
-        if not title:
-            m = re.search(r"^#\s+(.+)$", body, re.MULTILINE)
-            if m:
-                title = m.group(1).strip()
-        # Strip an "ADR-0007:" style prefix from the title.
-        title = re.sub(r"^ADR[-\s]*\d+[:\s-]*", "", title, flags=re.IGNORECASE).strip() or title
+        title = _adr_title(title, body)
 
-        context = sections.get("context") or sections.get("context and problem statement", "")
-        decision_txt = sections.get("decision") or sections.get("decision outcome", "")
-        rationale = sections.get("rationale") or sections.get("decision drivers", "")
-        consequences = sections.get("consequences", "")
-        if not status:
-            status = sections.get("status", "")
+        context = _first_section(sections, "context", "context and problem statement")
+        decision_txt = _first_section(sections, "decision", "decision outcome")
+        rationale = _first_section(sections, "rationale", "decision drivers")
 
-        # Require recognizable ADR structure — at minimum a Decision or Context
-        # section — otherwise let the LLM fallback handle it.
+        # Require a Decision or Context section; anything less goes to the LLM
+        # fallback.
         if not (decision_txt or context):
             return None
-
-        # A document with no Status section has not said it is accepted, and a
-        # committed ADR is the one artifact allowed to accept its own decision.
-        # Defaulting to ``active`` therefore let any draft under docs/adr/ grant
-        # itself authority.
-        status_key = status.strip().lower().split()[0] if status.strip() else ""
-        mapped_status = _ADR_STATUS_MAP.get(status_key, "proposed")
 
         return ExtractedDecision(
             title=_truncate_title(title or rel_path, 200),
             context=context.strip(),
             decision=decision_txt.strip(),
             rationale=rationale.strip(),
-            consequences=bullets(consequences),
+            consequences=bullets(sections.get("consequences", "")),
             source="adr",
-            status=mapped_status,
+            status=_adr_status(status or sections.get("status", "")),
             confidence=0.90,
             evidence_file=rel_path,
             source_quote=(decision_txt or context).strip()[:500],
             source_text=content,
-            tags=self._infer_tags(f"{title} {decision_txt}"),
+            tags=_infer_tags(f"{title} {decision_txt}"),
             affected_modules=self._infer_modules_from_text(f"{title} {decision_txt}"),
         )
 
     # ------------------------------------------------------------------
-    # Source 4: PR / squash-body mining (consumes commit bodies from 1A)
+    # Source 4: PR / squash-body mining
     # ------------------------------------------------------------------
 
     async def mine_pr_bodies(self) -> list[ExtractedDecision]:
@@ -905,28 +561,7 @@ class DecisionExtractor:
         if not provider or not self._git_meta_map:
             return []
 
-        candidates: dict[str, dict] = {}
-        files_by_sha: dict[str, list[str]] = {}
-        for fp, meta in self._git_meta_map.items():
-            for c in self._loads_commits(meta.get("significant_commits_json")):
-                sha = c.get("sha", "")
-                if not sha:
-                    continue
-                files_by_sha.setdefault(sha, []).append(fp)
-                body = (c.get("body") or "").strip()
-                if sha in candidates or not body:
-                    continue
-                low = body.lower()
-                is_prish = c.get("pr_number") is not None or any(m in low for m in _PR_BODY_MARKERS)
-                has_signal = count_decision_signals(low) > 0
-                if is_prish and has_signal:
-                    candidates[sha] = {
-                        "sha": sha,
-                        "subject": c.get("message", ""),
-                        "body": body,
-                        "pr": c.get("pr_number"),
-                    }
-
+        candidates, files_by_sha = pr_candidates(self._git_meta_map)
         if not candidates:
             return []
 
@@ -936,29 +571,16 @@ class DecisionExtractor:
             bodies_block = ""
             source_by_sha: dict[str, str] = {}
             for c in batch:
-                pr_label = f" (PR #{c['pr']})" if c.get("pr") else ""
-                # The file list is what makes "affected_files" answerable.
-                # This miner asked for a decision without ever showing which
-                # files the commit touched, and scored 20% on topic against
-                # git archaeology's 45% on the same store.
-                files = files_by_sha.get(c["sha"], [])
-                bodies_block += (
-                    f"\n--- Commit {c['sha'][:8]}{pr_label} ---\n"
-                    f"Subject: {c['subject']}\n"
-                    f"Body:\n{c['body'][:2000]}\n"
-                    f"Files changed: {', '.join(sorted(files)[:_MAX_PROMPT_FILES])}\n"
-                )
+                # The file list is what lets the model answer "affected_files".
+                bodies_block += pr_commit_block(c, files_by_sha.get(c["sha"], []))
                 source_by_sha[c["sha"]] = f"{c['subject']}\n{c['body']}"
             prompt = PR_BODY_MINING_PROMPT.format(bodies_block=bodies_block)
-            # Let this propagate to the gather below. Swallowed here, a total
-            # provider outage returned five empty lists, so ``_collect_batches``
-            # saw no errors and the run reported "Nothing found in: pull
-            # requests" — the exact zero-that-means-failure this change exists
-            # to remove.
+            # Not caught: _run_batches counts a failed batch, so an outage is
+            # reported rather than read as nothing found.
             response = await provider.generate(
                 _SYSTEM_PROMPT, prompt, max_tokens=_BATCH_MAX_TOKENS, temperature=0.2
             )
-            extracted = self._parse_decisions_json(response.content)
+            extracted = parse_decisions_json(response.content)
             for d in extracted:
                 _attribute_to_commit(d, batch, "subject", files_by_sha, source_by_sha)
                 d.source = "pr"
@@ -1002,23 +624,13 @@ class DecisionExtractor:
             for fp, prose in batch:
                 comments_block += f"\n--- {fp} ---\n{prose[:1500]}\n"
             prompt = COMMENT_ARCHAEOLOGY_PROMPT.format(comments_block=comments_block)
-            # Was a bare ``except Exception: return []`` here with no log at
-            # all — the quietest of the three swallows, and the one that made
-            # "comment: 0" unfalsifiable. Let it propagate to the gather
-            # below, which counts it.
+            # Not caught: _run_batches counts a failed batch.
             response = await provider.generate(
                 _SYSTEM_PROMPT, prompt, max_tokens=2500, temperature=0.2
             )
-            extracted = self._parse_decisions_json(response.content)
-            # Best-effort attribution to the originating file by token overlap.
+            extracted = parse_decisions_json(response.content)
             for d in extracted:
-                best_fp, best_prose = batch[0]
-                hay = (d.title + " " + d.decision).lower()
-                for fp, prose in batch:
-                    stem = Path(fp).stem.lower()
-                    if stem and stem in hay:
-                        best_fp, best_prose = fp, prose
-                        break
+                best_fp, best_prose = _snippet_for(d, batch)
                 d.source = "comment"
                 d.status = "proposed"
                 d.confidence = 0.55
@@ -1044,12 +656,6 @@ class DecisionExtractor:
             self._graph, self._parsed_files, self._source_map, self._repo_path
         )
 
-    # Above this node count, skip the iterative PageRank solve and use degree
-    # centrality (O(nodes)) instead — comment archaeology only needs a rough
-    # "most depended-on files" ranking, not exact PageRank, and the iterative
-    # solve would otherwise add seconds on very large graphs.
-    _PAGERANK_NODE_CEILING = 20_000
-
     def _top_central_files(self, n: int) -> list[str]:
         """Top-*n* file nodes by centrality (existing on disk).
 
@@ -1057,26 +663,9 @@ class DecisionExtractor:
         centrality on very large graphs (or if networkx is unavailable) so this
         never becomes an ingestion bottleneck.
         """
-        g = self._graph
-        if g is None:
+        if self._graph is None:
             return []
-        scores: dict[str, float] = {}
-        try:
-            node_count = g.number_of_nodes()
-        except Exception:
-            node_count = 0
-        if 0 < node_count <= self._PAGERANK_NODE_CEILING:
-            try:
-                import networkx as nx
-
-                scores = nx.pagerank(g, max_iter=50, tol=1e-4)
-            except Exception:
-                scores = {}
-        if not scores:
-            try:
-                scores = {node: float(g.degree(node)) for node in g.nodes}
-            except Exception:
-                return []
+        scores = _centrality_scores(self._graph)
         ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
         out: list[str] = []
         for node, _score in ranked:
@@ -1086,22 +675,8 @@ class DecisionExtractor:
             if p.is_file() and p.suffix.lower() not in _BINARY_EXTENSIONS:
                 out.append(node)
         return out
-
-    @staticmethod
-    def _loads_commits(value: Any) -> list[dict]:
-        """Parse a ``significant_commits_json`` blob into a list of dicts."""
-        if isinstance(value, list):
-            return value
-        if isinstance(value, str):
-            try:
-                data = json.loads(value)
-            except (json.JSONDecodeError, TypeError):
-                return []
-            return data if isinstance(data, list) else []
-        return []
-
     # ------------------------------------------------------------------
-    # Anti-hallucination substring gate (Phase 1D)
+    # Anti-hallucination substring gate
     # ------------------------------------------------------------------
 
     def _apply_substring_gate(
@@ -1109,84 +684,14 @@ class DecisionExtractor:
     ) -> tuple[list[ExtractedDecision], int]:
         """Run the shared anti-hallucination gate over extracted decisions.
 
-        Thin wrapper around :func:`decision_gate.apply_substring_gate` — the
-        gate orchestration is factored out so the Phase-2 LLM-docs harvest path
-        enforces the *same* grounding rules. See that module for the contract.
+        Thin wrapper around :func:`decision_gate.apply_substring_gate`, which
+        the docs harvest path shares so both enforce the same grounding rules.
         """
         return apply_substring_gate(decisions)
 
-    # ------------------------------------------------------------------
-    # Staleness computation (static method)
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def compute_staleness(
-        decision_created_at: datetime,
-        affected_files: list[str],
-        git_meta_map: dict[str, dict],
-        decision_text: str = "",
-    ) -> float:
-        """Fraction of *affected_files* that have changed since the record's birth.
-
-        A fact about the code, not a judgement about the record: 0.0 means
-        nothing it governs has moved, 1.0 means all of it has. There is no
-        tuned constant left in it, which is the point — the previous formula
-        was ``commit_count / 15 * 0.7 + age_days / 365 * 0.3``, whose divisors
-        were fitted to one repository's history and produced ~0 for almost
-        every record here regardless of whether the code had moved.
-
-        Also gone: a keyword boost that read recent commit *messages* for words
-        like "migrate away". That inferred intent from English prose, which
-        does not travel, and it mixed a guess into a value other surfaces
-        store and compare.
-
-        *decision_text* is accepted and unused, so the two call sites keep
-        working; it goes when they do.
-
-        A file with no git metadata **after** the caller's gap fill counts as
-        changed: the record names something the repository does not track, so
-        it cannot be shown to still hold.
-        """
-        if not affected_files:
-            # No scope, so the question cannot be asked. Callers distinguish
-            # this from a genuine 0.0 by the empty file list, and
-            # `decision health` reports it as unscoped rather than fresh.
-            return 0.0
-
-        created = _as_aware_utc(_coerce_dt(decision_created_at)) if decision_created_at else None
-        changed = 0
-        for fp in affected_files:
-            meta = git_meta_map.get(fp)
-            if meta is None:
-                changed += 1  # named but not tracked — cannot be shown to hold
-                continue
-            last_commit = meta.get("last_commit_at")
-            if not last_commit or created is None:
-                continue
-            if _as_aware_utc(_coerce_dt(last_commit)) > created:
-                changed += 1
-
-        return round(changed / len(affected_files), 3)
-
-    @staticmethod
-    def last_code_change(
-        affected_files: list[str],
-        git_meta_map: dict[str, dict],
-    ) -> datetime | None:
-        """When the code a decision governs last moved, or None.
-
-        Reduces the same inputs :meth:`compute_staleness` reads: that counts
-        how many files moved since the record was born, this reports when the
-        most recent of them moved. None where the question cannot be answered,
-        meaning no scope or no git metadata for anything the record names.
-        """
-        dates: list[datetime] = []
-        for file_path in affected_files:
-            meta = git_meta_map.get(file_path)
-            last_commit = meta.get("last_commit_at") if meta else None
-            if last_commit:
-                dates.append(_as_aware_utc(_coerce_dt(last_commit)))
-        return max(dates) if dates else None
+    # Kept on the class: callers read staleness as ``DecisionExtractor.compute_staleness``.
+    compute_staleness = staticmethod(compute_staleness)
+    last_code_change = staticmethod(last_code_change)
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -1223,7 +728,7 @@ class DecisionExtractor:
         none.
 
         Every extracted decision is then put through the anti-hallucination
-        substring gate (:meth:`_apply_substring_gate`) before being returned —
+        substring gate (:meth:`_apply_substring_gate`) before being returned:
         ungrounded LLM fields are dropped and evidence-less decisions rejected.
         """
 
@@ -1236,9 +741,8 @@ class DecisionExtractor:
                 logger.info("decision_extractor.finished", source=name, count=len(result))
                 return result
             except Exception as exc:
-                # Recorded as well as logged: the CLI pins core to ERROR, so
-                # a source that dies here used to reach the user as a plain
-                # zero indistinguishable from "this repo has no ADRs".
+                # Recorded as well as logged: the CLI pins core logging to
+                # ERROR, so the report is where a failed source shows up.
                 failures[name] = f"{type(exc).__name__}: {exc}"
                 logger.warning("decision_extractor.source_failed", source=name, error=str(exc))
                 return []
@@ -1246,7 +750,7 @@ class DecisionExtractor:
                 if on_step:
                     on_step(name)
 
-        # (source name, bound coroutine factory) — order is the progress order.
+        # (source name, bound coroutine factory), in progress order.
         all_sources: list[tuple[str, Any]] = [
             ("inline_marker", self.scan_inline_markers),
             ("git_archaeology", self.mine_git_archaeology),
@@ -1305,12 +809,9 @@ class DecisionExtractor:
           Text comes from ``source_map`` when the file was just ingested, else a
           targeted disk read; deleted / unreadable paths are skipped.
         * ``source_map`` (init path): ingestion's already-decoded indexed set.
-          Discovery AND reads are free — no tree walk, no per-file ``read_text``.
-          Paths are POSIX (``FileInfo.path``), matching the graph node keys the
-          neighbour lookup joins against.
-        * legacy self-walk (``source_map is None``): the original ``os.walk`` +
-          git-tracked filter, kept so callers that don't thread ``source_map``
-          behave exactly as before.
+          No tree walk and no per-file read. Paths are POSIX (``FileInfo.path``),
+          matching the graph node keys the neighbour lookup joins against.
+        * the tree walk, for callers that pass no ``source_map``.
         """
         if restrict_to_files:
             for rel_path in restrict_to_files:
@@ -1324,6 +825,10 @@ class DecisionExtractor:
                 yield rel_path, source.decode("utf-8", errors="replace")
             return
 
+        yield from self._iter_walked_files()
+
+    def _iter_walked_files(self) -> Iterator[tuple[str, str]]:
+        """``(rel_path, text)`` for every readable file the legacy tree walk finds."""
         for file_path in iter_source_files(self._repo_path):
             if not file_path.is_file():
                 continue
@@ -1331,11 +836,14 @@ class DecisionExtractor:
                 text = file_path.read_text(encoding="utf-8", errors="replace")
             except (OSError, UnicodeDecodeError):
                 continue
-            try:
-                rel_path = str(file_path.relative_to(self._repo_path))
-            except ValueError:
-                rel_path = str(file_path)
-            yield rel_path, text
+            yield self._rel_path(file_path), text
+
+    def _rel_path(self, path: Path) -> str:
+        """*path* relative to the repo root, or as given when it lies outside it."""
+        try:
+            return str(path.relative_to(self._repo_path))
+        except ValueError:
+            return str(path)
 
     def _read_source_text(self, rel_path: str) -> str | None:
         """Decode one file's text, preferring ingestion's in-memory bytes.
@@ -1393,44 +901,3 @@ class DecisionExtractor:
         # ``packages/core/.../decisions`` should not also claim every ancestor.
         deepest = {d for d in matched if not any(o != d and o.startswith(d + "/") for o in matched)}
         return sorted(deepest, key=lambda d: (-d.count("/"), d))[:5]
-
-    def _infer_tags(self, text: str) -> list[str]:
-        """Infer tags from decision text."""
-        tag_keywords = {
-            "auth": ["auth", "jwt", "oauth", "token", "session", "login"],
-            "database": ["database", "sql", "postgres", "sqlite", "redis", "mongo", "db"],
-            "api": ["api", "rest", "graphql", "endpoint", "route"],
-            "performance": ["performance", "cache", "speed", "latency", "optimize"],
-            "security": ["security", "encrypt", "hash", "cors", "csrf", "xss"],
-            "infra": ["docker", "kubernetes", "deploy", "ci", "cd", "terraform"],
-            "testing": ["test", "mock", "fixture", "assert"],
-        }
-        text_lower = text.lower()
-        tags = []
-        for tag, keywords in tag_keywords.items():
-            if any(kw in text_lower for kw in keywords):
-                tags.append(tag)
-        return tags
-
-    def _parse_decisions_json(self, content: str) -> list[ExtractedDecision]:
-        """Parse LLM response as JSON array of decisions.
-
-        A blank body raises :class:`EmptyModelResponseError`; every caller
-        sits inside a gather or a fallback that counts that as a lost batch.
-        """
-        # Extract JSON from response (may be wrapped in markdown code blocks)
-        content = content.strip()
-        if not content:
-            raise EmptyModelResponseError(
-                "the model returned no content for this batch"
-            )
-        data = _load_json_payload(content)
-        if isinstance(data, dict):
-            data = [data]
-        if not isinstance(data, list):
-            return []
-        return [
-            _decision_from_item(item)
-            for item in data
-            if isinstance(item, dict) and item.get("title", "")
-        ]
