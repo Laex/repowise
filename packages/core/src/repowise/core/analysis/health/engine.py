@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import time
 from datetime import UTC, datetime
 from typing import Any
 
@@ -38,7 +37,7 @@ from ...ingestion.package_roots import package_roots_from_paths as _package_root
 from ...ingestion.package_roots import scan_package_roots as _scan_package_roots
 from ...test_paths import paired_test_names
 from ..graph_view import HasEdge, ImportEdgeView
-from ..test_reachability import files_reached_by_tests
+from ..test_reachability import files_reached_by_tests, files_with_paired_tests
 from .asserts.lexicon import AssertVocabulary
 from .asserts.oracle_reach import collect_cross_file_oracles
 from .biomarkers import FileContext, detect_all
@@ -111,6 +110,19 @@ log = structlog.get_logger(__name__)
 # ``with atomic(), pytest.raises(E):`` counted one. Each item is classified now,
 # and a declining call's arguments are not scanned, so an assertion passed as an
 # argument still does not stand in for the header's oracle.
+#
+# v34: ``hidden_coupling`` is advisory: still detected and stored, it no longer
+# deducts from the defect score, so every stored score that carried one moves.
+#
+# v33: git history windows are measured from the indexed commit's committer
+# date instead of wall-clock time, by default. ``code_age_volatility`` and the
+# per-function blame rollup read line ages from the same anchor, so a store
+# scored against wall-clock time holds different windowed findings for any repo
+# whose last commit is not today.
+#
+# v32: the history (organizational) cap follows the file's structure half,
+# ``history_cap(structure)`` in scoring.py, so every stored score that carries
+# a history deduction, and the refactoring impact figures, move.
 #
 # v31: Pascal opts into assertion detection (``assert_call_kinds``): DUnit's
 # ``Check``/``CheckEquals``/``Fail`` family (a new ``asserts/lexicon.py`` row,
@@ -303,7 +315,7 @@ log = structlog.get_logger(__name__)
 # forms. Files that were counted untested and are not become tested, which
 # moves untested-hotspot findings and the scores that carry them, on every
 # language with a prefix or spec convention rather than Ruby alone.
-HEALTH_ANALYZER_VERSION = 31
+HEALTH_ANALYZER_VERSION = 34
 
 
 def walked_functions(
@@ -560,6 +572,21 @@ class HealthAnalyzer:
             self._tests_reach_cache = files_reached_by_tests(index or CallGraphIndex(), test_files)
         return self._tests_reach_cache
 
+    def _paired_tests(self, analyzed_paths: set[str]) -> set[str]:
+        """Analyzed files a test is paired with; see ``files_with_paired_tests``.
+
+        Test files come from the graph as well as this pass, so an incremental
+        run that re-parses only the changed files still sees every test.
+        """
+        test_files = {pf.file_info.path for pf in self.parsed_files if pf.file_info.is_test}
+        if self.graph is not None:
+            test_files.update(
+                node
+                for node, data in self.graph.nodes(data=True)
+                if data.get("is_test") and data.get("node_type") != "symbol"
+            )
+        return files_with_paired_tests(self.graph, analyzed_paths, test_files)
+
     def _package_boundaries(self, analyzed_paths: set[str]) -> set[str]:
         """Package roots for this repo, decided once per analyzer.
 
@@ -641,7 +668,7 @@ class HealthAnalyzer:
         # is symbol-level; we use file-level in-degree as the dependents
         # signal (cheap, deterministic, conservative).
         analyzed_paths = {pf.file_info.path for pf in self.parsed_files}
-        path_basenames = _path_basenames(analyzed_paths)
+        paired_tests = self._paired_tests(analyzed_paths)
         package_roots = self._package_boundaries(analyzed_paths)
         graph_view: HasEdge | None = ImportEdgeView(self.graph) if self.graph is not None else None
 
@@ -749,7 +776,7 @@ class HealthAnalyzer:
             file_metric, file_findings, file_suggestions = self._evaluate_file(
                 pf,
                 fcx,
-                path_basenames,
+                paired_tests,
                 package_roots,
                 disabled=file_disabled,
                 dup_report=dup_report,
@@ -850,7 +877,7 @@ class HealthAnalyzer:
         changed_set: set[str] | None = set(changed_files) if changed_files is not None else None
 
         analyzed_paths = {pf.file_info.path for pf in self.parsed_files}
-        path_basenames = _path_basenames(analyzed_paths)
+        paired_tests = self._paired_tests(analyzed_paths)
         package_roots = self._package_boundaries(analyzed_paths)
         graph_view: HasEdge | None = ImportEdgeView(self.graph) if self.graph is not None else None
 
@@ -959,7 +986,7 @@ class HealthAnalyzer:
             file_metric, file_findings, file_suggestions = self._evaluate_file(
                 pf,
                 fcx,
-                path_basenames,
+                paired_tests,
                 package_roots,
                 disabled=file_disabled,
                 dup_report=dup_report,
@@ -1154,9 +1181,7 @@ class HealthAnalyzer:
         try:
             from .function_blame_rollup import build_function_blame_rows
 
-            return build_function_blame_rows(
-                list(walked), self.git_meta_map, now_ts=int(time.time())
-            )
+            return build_function_blame_rows(list(walked), self.git_meta_map)
         except Exception as exc:
             log.debug("function_blame_rollup_failed", error=str(exc))
             return []
@@ -1241,7 +1266,7 @@ class HealthAnalyzer:
         self,
         pf: Any,
         fcx: FileComplexity,
-        path_basenames: set[str],
+        paired_tests: set[str],
         package_roots: set[str],
         *,
         disabled: list[str],
@@ -1301,12 +1326,12 @@ class HealthAnalyzer:
             # re-derive from the path string (#1103). The coverage check stays
             # because it also sniffs framework imports out of the source, which
             # a path cannot tell you.
-            has_test_file=_has_paired_test_file(file_path, path_basenames)
+            has_test_file=file_path in paired_tests
             or pf.file_info.is_test
             or _coverage_is_test_file(file_path)
             or fcx.has_inline_tests,
             # Kept separate from ``has_test_file`` on purpose. That flag means
-            # "a file named like this one's test exists"; this one means "the
+            # "a test imports this file, or is named for it"; this one means "the
             # call graph records a test reaching this file". They disagree
             # often, and collapsing them would leave no way to say which signal
             # answered, or that one of them over-claims.
