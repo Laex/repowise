@@ -143,9 +143,12 @@ export function extractSources(
     }
 
     if (tc.name === "get_dead_code") {
+      const tiers = (result.tiers as Record<string, { findings?: Array<Record<string, unknown>> }>) ?? {};
+      const lookup = result.finding as Record<string, unknown> | null | undefined;
       const rows = [
-        ...((result.high_confidence as Array<Record<string, unknown>>) ?? []),
-        ...((result.medium_confidence as Array<Record<string, unknown>>) ?? []),
+        ...(lookup ? [lookup] : []),
+        ...(tiers.high?.findings ?? []),
+        ...(tiers.medium?.findings ?? []),
       ];
       for (const r of rows.slice(0, 10)) pushFile(tc.id, tc.name, r.file_path);
     }
@@ -218,10 +221,10 @@ export function SourceCitations({
   if (sources.length === 0) return null;
 
   return (
-    <details className="group mt-5 border-t border-[var(--color-border-default)] pt-3">
+    <details className="group/cites mt-5 border-t border-[var(--color-border-default)] pt-3">
       <summary className="flex min-h-8 cursor-pointer list-none items-center gap-2 font-mono text-[10px] uppercase tracking-[0.12em] text-[var(--color-text-tertiary)] marker:hidden focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-accent-primary)] [&::-webkit-details-marker]:hidden">
         <span>Sources · {sources.length}</span>
-        <span aria-hidden className="transition-transform group-open:rotate-90">›</span>
+        <span aria-hidden className="transition-transform group-open/cites:rotate-90">›</span>
       </summary>
       {/* Links, not chips. Each one goes somewhere, so the accent is earned on
           hover; a border and a ground on every entry turned a list of eight

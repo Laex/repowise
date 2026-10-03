@@ -145,6 +145,17 @@ _HEDGE_MARKERS = (
     "not shown here",
     "material shown",
     "not visible in",
+    # Scoped to the retrieved material: bare, they read behaviour
+    # ("the validator does not show an error") as a hedge.
+    "evidence does not identify",
+    "evidence does not show",
+    "evidence does not specify",
+    "material does not identify",
+    "material does not show",
+    "material does not specify",
+    "excerpts do not identify",
+    "excerpts do not show",
+    "excerpts do not specify",
     "unable to determine",
     "not contain sufficient",
     "not contain enough",
@@ -260,7 +271,17 @@ _HIGH_CONFIDENCE_SCORE_FLOOR = 1.5
 # Degraded (no-provider / synthesis-failed) payloads are never cached, so changes
 # confined to them need no bump; a needless bump costs every keyed install a
 # round of provider spend.
-_ANSWER_SCHEMA_VERSION = 17
+# 18: rows carry ``candidate_files``, the ranked paths-only list.
+_ANSWER_SCHEMA_VERSION = 18
+
+# How many paths ``candidate_files`` serves: the knee of measured coverage
+# gained per extra file, past which each path mostly costs precision. A high
+# answer already names its files, so it keeps fewer.
+_CANDIDATE_FILES_HIGH = 3
+_CANDIDATE_FILES_MAX = 5
+# The raw list is longer than either cap, so paths the citations already name
+# can be removed without leaving the served list short.
+_CANDIDATE_FILES_POOL = 10
 
 # Backstop TTL for cache rows. Commit stamping is the primary freshness gate;
 # this covers rows without a stamp (older rows, repos without git metadata).

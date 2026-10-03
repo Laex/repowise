@@ -31,6 +31,7 @@ from repowise.core.providers.llm.base import (
     GeneratedResponse,
     ProviderError,
     ProviderModelOption,
+    SdkClientOwner,
     ensure_reasoning_supported,
     fallback_model_option,
     normalize_stop_reason,
@@ -103,7 +104,7 @@ def _anthropic_model_options(
     return tuple(options)
 
 
-class AnthropicProvider(BaseProvider):
+class AnthropicProvider(SdkClientOwner, BaseProvider):
     """Anthropic Claude provider with automatic prompt caching.
 
     Args:
@@ -131,7 +132,9 @@ class AnthropicProvider(BaseProvider):
         resolved_base_url = base_url or os.environ.get("ANTHROPIC_BASE_URL")
         self._api_key = resolved_key
         self._base_url = resolved_base_url or _DEFAULT_BASE_URL
-        self._client = AsyncAnthropic(api_key=resolved_key, base_url=resolved_base_url)
+        self._open_client(
+            lambda: AsyncAnthropic(api_key=resolved_key, base_url=resolved_base_url)
+        )
         self._model = model
         self._rate_limiter = rate_limiter
         self._cost_tracker = cost_tracker
@@ -210,7 +213,16 @@ class AnthropicProvider(BaseProvider):
                 **temperature_kwargs(self._model, temperature),
             )
 
-        cached = getattr(response.usage, "cache_read_input_tokens", 0) or 0
+        uncached_input_tokens = response.usage.input_tokens or 0
+        cached_tokens = getattr(response.usage, "cache_read_input_tokens", 0) or 0
+        cache_creation_tokens = (
+            getattr(response.usage, "cache_creation_input_tokens", 0) or 0
+        )
+
+        # The three are disjoint, so their sum is the prompt total represented by
+        # input_tokens. cached_tokens remains the cache-read portion.
+        input_tokens = uncached_input_tokens + cached_tokens + cache_creation_tokens
+
         stop_reason, provider_stop_reason = normalize_stop_reason(response.stop_reason)
 
         text_content = ""
@@ -221,19 +233,16 @@ class AnthropicProvider(BaseProvider):
 
         result = GeneratedResponse(
             content=text_content,
-            input_tokens=response.usage.input_tokens,
+            input_tokens=input_tokens,
             output_tokens=response.usage.output_tokens,
-            cached_tokens=cached,
+            cached_tokens=cached_tokens,
             stop_reason=stop_reason,
             provider_stop_reason=provider_stop_reason,
             usage={
-                "input_tokens": response.usage.input_tokens,
+                "input_tokens": input_tokens,
                 "output_tokens": response.usage.output_tokens,
-                "cache_creation_input_tokens": getattr(
-                    response.usage, "cache_creation_input_tokens", 0
-                )
-                or 0,
-                "cache_read_input_tokens": cached,
+                "cache_creation_input_tokens": cache_creation_tokens,
+                "cache_read_input_tokens": cached_tokens,
             },
         )
         log.debug(

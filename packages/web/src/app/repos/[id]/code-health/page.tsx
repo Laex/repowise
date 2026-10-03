@@ -440,6 +440,8 @@ export default function CodeHealthPage() {
       const sp = new URLSearchParams(searchParams.toString());
       if (next === "triage") sp.delete("tab");
       else sp.set("tab", next);
+      // The document filter belongs to the drift tab; it must not ride along.
+      if (next !== "doc-drift") sp.delete("document");
       const qs = sp.toString();
       router.replace(qs ? `?${qs}` : "?", { scroll: false });
     },
@@ -532,15 +534,17 @@ export default function CodeHealthPage() {
         </div>
       }
     >
-      {/* Keyed by id alone: this notice is about one scoring change, so it is
-          dismissible for good and a later change introduces its own. */}
-      <ReleaseNotice id="health-cochange-scoring">
+      {/* Replaced each release that moves health scores, and keyed with that
+          release's version so a reader who dismissed an earlier one sees it. */}
+      <ReleaseNotice id="health-scoring" version="0.55.0">
         <span className="font-medium text-[var(--color-text-primary)]">
           Health scores changed in this release.
         </span>{" "}
-        Co-change coupling is now measured relative to your repository and decays with
-        commit history rather than calendar time, so roughly one file in ten moves a
-        band. Scores are not comparable to snapshots taken before this release.
+        Most files score higher: cohesion, duplication, hotspot and complexity findings
+        that did not hold up are gone, and test code no longer counts against production files. Files in languages health cannot analyse used
+        to count as 10.0; they now read &quot;Not analysed&quot; and leave the average, so a
+        repository with many of them can read lower. Scores are not comparable to
+        snapshots taken before this release.
       </ReleaseNotice>
 
       {meta ? (
@@ -600,7 +604,12 @@ export default function CodeHealthPage() {
         {activeTab === "performance" && <PerformanceTab repoId={repoId} />}
         {activeTab === "coverage" && <CoverageTab repoId={repoId} />}
         {activeTab === "dead-code" && <DeadCodeTab repoId={repoId} />}
-        {activeTab === "doc-drift" && <DocDriftTab repoId={repoId} />}
+        {activeTab === "doc-drift" && (
+          <DocDriftTab
+            repoId={repoId}
+            initialDocument={searchParams.get("document") ?? undefined}
+          />
+        )}
         {activeTab === "security" && <SecurityTab repoId={repoId} />}
         {activeTab === "impact" && <ImpactTab repoId={repoId} />}
       </ViewTabs>

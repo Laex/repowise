@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from repowise.core.analysis.finding_registry import verification_label
 from repowise.core.analysis.health.finding_identity import finding_public_id
 from repowise.core.analysis.health.grading import TARGET_SCORE
 from repowise.core.analysis.health.perf.opportunity_rank import observation_rank
@@ -98,7 +99,9 @@ def _legacy_health_finding_id(f: Any, repository: str) -> str:
     )
 
 
-def _serialize_finding(f: HealthFinding, repository: str = "default") -> dict[str, Any]:
+def _serialize_finding(
+    f: HealthFinding, repository: str = "default", lower_priority: str | None = None
+) -> dict[str, Any]:
     try:
         details = json.loads(f.details_json) if f.details_json else {}
     except Exception:
@@ -107,6 +110,7 @@ def _serialize_finding(f: HealthFinding, repository: str = "default") -> dict[st
     rank = (
         {"perf_rank": _perf_rank(f.biomarker_type, details)} if dimension == "performance" else {}
     )
+    label = verification_label(f.biomarker_type)
     return {
         "id": _health_finding_id(f, repository),
         "repository": repository,
@@ -124,6 +128,10 @@ def _serialize_finding(f: HealthFinding, repository: str = "default") -> dict[st
         "dimension": dimension,
         # Performance rows only: a zero elsewhere would read as measured.
         **rank,
+        # Provisional types only, and only when the caller opted into them.
+        **({"verification": label} if label else {}),
+        # Why it can wait, on a finding listed after those worth doing first.
+        **({"lower_priority": lower_priority} if lower_priority else {}),
     }
 
 
