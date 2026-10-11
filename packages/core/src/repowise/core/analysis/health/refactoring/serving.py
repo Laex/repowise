@@ -13,9 +13,11 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any
 
-from repowise.core.analysis.health.queue_rules import FilterRule
+from repowise.core.analysis.health import queue_rules
+from repowise.core.analysis.health.effort import EFFORT_ORDER
+from repowise.core.analysis.health.queue_rules import Facet, FilterRule, SortKeys
 from repowise.core.analysis.health.rows import detail_map, field
 
 from .recommendations import _loads_dict
@@ -38,15 +40,11 @@ _VIEW_ORDERS: dict[str, str] = {
 CANONICAL_VIEWS = tuple(_VIEW_ORDERS)
 DEFAULT_VIEW = "diversified"
 
-# The legacy plan list has no notion of the diversified order, so the new
-# default resolves to the value that list has always defaulted to.
-_PLAN_VIEWS = {"canonical": "canonical", "file_spread": "file_spread", "diversified": "canonical"}
-
 # Which open opportunities a queue lists:
 #
 # - ``fix_first``  the default for a repository-wide open queue: only the
-#   opportunities Fix first would take (its eligibility and exclusion rules,
-#   read from the same builder), with the rest counted by reason.
+#   opportunities Fix first would take (the judgement the index stored on each
+#   row), with the rest counted by reason.
 # - ``all``  the full inventory. The default when the caller names files (a
 #   file surface asks for its own work) or lists a triaged status, which Fix
 #   first never reads.
@@ -57,7 +55,6 @@ DEFAULT_SCOPE = "fix_first"
 _STATUSES = ("open", "acknowledged", "resolved", "false_positive")
 
 _CONFIDENCES = ("low", "medium", "high")
-_EFFORTS = ("S", "M", "L", "XL")
 _TYPES = (
     "break_cycle",
     "extract_class",
@@ -80,7 +77,7 @@ UNAVAILABLE: dict[str, Any] = {
 #: Orders the queue can be read in, as ``(field, descending)`` keys. Every one
 #: ends in a unique column so the total order is deterministic and a deep
 #: offset cannot repeat or skip a row. A descending field must be numeric.
-SORTS: dict[str, tuple[tuple[str, bool], ...]] = {
+SORTS: dict[str, SortKeys] = {
     "queue": (("queue_position", False),),
     "rank": (("rank_position", False),),
     "health": (("recoverable_health", True), ("rank_position", False)),
@@ -93,8 +90,9 @@ CANONICAL_ORDERS = tuple(SORTS)
 #: In the order the store has always emitted its predicates.
 FILTERS: tuple[FilterRule, ...] = (
     FilterRule("status", "status", "eq", "always"),
-    # A scope resolved in Python (Fix first's eligible set).
     FilterRule("opportunity_ids", "opportunity_id", "in", "set"),
+    # The ``fix_first`` scope: the judgement stored at index time.
+    FilterRule("queue_eligible", "queue_eligible", "is", "set"),
     # A list is how the board's "Structural" tab asks for four types at once.
     FilterRule("lead_types", "lead_refactoring_type", "in", "truthy"),
     FilterRule("confidence", "confidence", "eq", "set"),
@@ -108,82 +106,59 @@ FILTERS: tuple[FilterRule, ...] = (
     FilterRule("addresses_primary", "addresses_primary_problem", "is", "set"),
 )
 
-#: Facet name -> the field it counts.
-FACETS: tuple[tuple[str, str], ...] = (
-    ("lead_type", "lead_refactoring_type"),
-    ("effort", "effort_bucket"),
-    ("confidence", "confidence"),
+#: Facet name, the field it counts, and the filter that narrows it. Each facet
+#: is counted under every other filter, so choosing a type keeps the other
+#: types' counts.
+FACETS: tuple[Facet, ...] = (
+    ("lead_type", "lead_refactoring_type", "lead_types"),
+    ("effort", "effort_bucket", "effort"),
+    ("confidence", "confidence", "confidence"),
 )
+FACET_FIELDS = tuple(column for _, column, _ in FACETS)
+#: The filters a facet cross-filters by, applied after grouping, not in SQL.
+FACET_PARAMS = frozenset(param for _, _, param in FACETS if param)
 
 
-def active_filters(params: Any) -> list[tuple[FilterRule, Any]]:
-    """The rules *params* (a query or a mapping) actually narrows by, with values."""
-    active: list[tuple[FilterRule, Any]] = []
-    for rule in FILTERS:
-        value = field(params, rule.param)
-        if rule.applies == "set" and value is None:
-            continue
-        if rule.applies == "truthy" and not value:
-            continue
-        active.append((rule, value))
-    return active
-
-
-def _matches(rule: FilterRule, value: Any, actual: Any) -> bool:
-    if rule.op == "eq":
-        return actual == value
-    if rule.op == "in":
-        return actual in value
-    if rule.op == "contains":
-        # Ceiling: SQLite folds ASCII case only, Python folds Unicode; the two
-        # differ only on a non-ASCII path fragment.
-        return actual is not None and value.lower() in actual.lower()
-    if rule.op == "prefix":
-        # Case-sensitive, as PostgreSQL's LIKE is. SQLite's LIKE folds ASCII
-        # case; paths differing only in case are not a case the queue meets.
-        return actual is not None and actual.startswith(value)
-    if rule.op == "positive":
-        return (actual or 0) > 0
-    # ``is``: SQL ``IS true/false``, so a NULL never matches either.
-    return actual is not None and bool(actual) is bool(value)
+def sort_keys(order: str | None) -> SortKeys:
+    """The keys for *order*; an unknown order reads as the default."""
+    return SORTS.get(order or DEFAULT_ORDER, SORTS[DEFAULT_ORDER])
 
 
 def keep(row: Any, params: Any) -> bool:
     """Whether *row* passes every filter *params* sets (a query or a mapping)."""
-    return all(
-        _matches(rule, value, field(row, rule.field)) for rule, value in active_filters(params)
-    )
+    return queue_rules.keep(FILTERS, row, params)
 
 
 def row_sort_key(row: Any, order: str | None = None) -> tuple[Any, ...]:
     """The sort key for *order*; an unknown order reads as the default."""
-    key: list[Any] = []
-    for name, descending in SORTS.get(order or DEFAULT_ORDER, SORTS[DEFAULT_ORDER]):
-        value = field(row, name)
-        key.append(-value if descending else value)
-    return tuple(key)
+    return queue_rules.sort_key(sort_keys(order), row)
 
 
-def fold_facets(groups: Iterable[Sequence[Any]]) -> dict[str, dict[str, int]]:
-    """Fold ``(*facet values, count)`` groups into per-facet counts; a NULL is skipped."""
-    facets: dict[str, dict[str, int]] = {name: {} for name, _ in FACETS}
-    for group in groups:
-        count = int(group[-1])
-        for (name, _), key in zip(FACETS, group[:-1], strict=True):
-            if key is not None:
-                facets[name][str(key)] = facets[name].get(str(key), 0) + count
-    return facets
+def split_facet_params(params: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """``(row filters, facet selection)``: the filters every count applies,
+    and the ones each facet applies to the others only."""
+    rows = {k: v for k, v in params.items() if k not in FACET_PARAMS}
+    return rows, {k: v for k, v in params.items() if k in FACET_PARAMS}
 
 
-def facet_counts(
-    rows: Iterable[Any], *, status: str = "open", opportunity_ids: Sequence[str] | None = None
+def fold_facets(
+    groups: Iterable[Sequence[Any]], selection: Mapping[str, Any] | None = None
 ) -> dict[str, dict[str, int]]:
-    """Counts for every facet over the rows a status (and scope) selects."""
-    params = {"status": status, "opportunity_ids": opportunity_ids}
+    """Fold ``(*facet values, count)`` groups into per-facet counts, each
+    cross-filtered by the *selection* of the others; a NULL is skipped."""
+    return queue_rules.fold_facets(groups, FACETS, rules=FILTERS, selection=selection)
+
+
+def facet_counts(rows: Iterable[Any], **params: Any) -> dict[str, dict[str, int]]:
+    """Counts for every facet over *rows*, under the queue filters in *params*."""
+    row_params, selection = split_facet_params({"status": "open", **params})
     return fold_facets(
-        (*(field(row, column) for _, column in FACETS), 1)
-        for row in rows
-        if keep(row, params)
+        (
+            (*(field(row, column) for column in FACET_FIELDS), 1)
+            for row in rows
+            if keep(row, row_params)
+        ),
+        selection,
     )
 
 
@@ -284,7 +259,7 @@ def parse_query(
             lead_types=admit_many("refactoring_type", lead_type, _TYPES),
             status=resolved_status,
             confidence=admit("confidence", confidence, _CONFIDENCES),
-            effort=admit("effort", effort, _EFFORTS),
+            effort=admit("effort", effort, EFFORT_ORDER),
             mechanical_only=bool(mechanical),
             addresses_primary=addresses_primary,
             # ``is not None``, not truthiness: an empty sequence is a scope that
@@ -302,11 +277,6 @@ def parse_query(
         ),
         ignored,
     )
-
-
-def plan_view(view: str | None) -> Literal["canonical", "file_spread"]:
-    """The legacy plan list's view for a caller's ``refactoring_view``."""
-    return _PLAN_VIEWS.get(view or DEFAULT_VIEW, "canonical")  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------------------
@@ -472,6 +442,8 @@ def serialize(
     for key in ("file_nloc", "dependents"):
         if isinstance(details.get(key), int):
             payload[key] = details[key]
+    if details.get("leaves_above_bar"):
+        payload["leaves_above_bar"] = details["leaves_above_bar"]
     if steps_limit is not None:
         kept = steps[: max(steps_limit, 0)]
         payload["steps"] = kept
@@ -560,12 +532,12 @@ __all__ = [
     "DEFAULT_SCOPE",
     "DEFAULT_VIEW",
     "FACETS",
+    "FACET_FIELDS",
     "FILTERS",
     "SCOPES",
     "SORTS",
     "UNAVAILABLE",
     "RefactoringQuery",
-    "active_filters",
     "directive_from_summary",
     "evidence_block",
     "facet_counts",
@@ -574,9 +546,9 @@ __all__ = [
     "next_actions",
     "parse_query",
     "plan_payload",
-    "plan_view",
     "row_sort_key",
     "serialize",
+    "sort_keys",
     "stored_validation",
     "summary_payload",
     "validation_from_profile",

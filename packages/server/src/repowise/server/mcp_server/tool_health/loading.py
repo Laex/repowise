@@ -8,6 +8,7 @@ projection gates the work as well as the payload.
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -18,13 +19,9 @@ from repowise.core.analysis.health.churn_complexity import churn_complexity_poin
 from repowise.core.analysis.health.fix_first import FixFirstQueue
 from repowise.core.analysis.health.grading import TARGET_SCORE
 from repowise.core.analysis.health.perf.coverage import PerfCoverage, coverage_for_metrics
+from repowise.core.analysis.health.queue.eligibility import path_verdict
 from repowise.core.analysis.health.ranking import deduction_by_path, sort_metrics_worst_first
-from repowise.core.analysis.health.refactoring.recommendations import (
-    Recommendation,
-    detail_recommendations,
-    hydrate_recommendations,
-)
-from repowise.core.analysis.health.refactoring.serving import plan_view
+from repowise.core.analysis.health.refactoring.serving import parse_query as parse_refactoring_query
 from repowise.core.analysis.health.signals import file_signals
 from repowise.core.analysis.health.trends import project_scope
 from repowise.core.ingestion.models import FILE_DEPENDENCY_EDGE_TYPES
@@ -36,13 +33,13 @@ from repowise.core.persistence.crud import (
     get_git_metadata_bulk,
     get_hotspot_file_paths,
     get_node_degree_counts_bulk,
-    get_refactoring_suggestions,
     get_test_file_paths,
     list_health_snapshots,
     load_coverage_for_repo,
     load_coverage_history,
 )
-from repowise.core.persistence.crud.analysis.fix_first import load_fix_first
+from repowise.core.persistence.crud.analysis.fix_first import load_fix_first, queue_view
+from repowise.core.persistence.crud.analysis.queue_counts import unit_counts
 from repowise.core.persistence.models import HealthFileMetric
 from repowise.server.mcp_server._helpers import filter_rows_by_attr
 from repowise.server.mcp_server.tool_health.findings import (
@@ -61,11 +58,10 @@ from repowise.server.mcp_server.tool_health.population import Population, load_p
 from repowise.server.mcp_server.tool_health.request import HealthRequest
 from repowise.server.mcp_server.tool_health.summary import _leads_by_file
 from repowise.server.services.performance_health import PerformanceHealthService
-from repowise.server.services.refactoring_health import RefactoringHealthService
-
-FIX_FIRST_CAP = 5
-"""Items in the dashboard's ``fix_first`` block, however large ``limit`` is.
-The rest are one ``get_health(fix_id=...)`` or REST page away."""
+from repowise.server.services.refactoring_health import (
+    RefactoringHealthService,
+    RefactoringPlanPage,
+)
 
 
 @dataclass
@@ -87,8 +83,9 @@ class HealthData:
     perf_coverage: PerfCoverage | None = None
     perf_findings_count: int = 0
     accuracy_rows: list[Any] = field(default_factory=list)
-    refactoring_rows: list[Any] = field(default_factory=list)
-    refactoring_recommendations: list[Recommendation] = field(default_factory=list)
+    #: The queue's plans, read only when ``refactoring_plans`` is named.
+    refactoring_plans: RefactoringPlanPage | None = None
+    refactoring_plans_ignored: dict[str, str] = field(default_factory=dict)
     coverage_rows: list[Any] = field(default_factory=list)
     coverage_summary: dict[str, Any] = field(default_factory=dict)
     coverage_history: list[dict[str, Any]] = field(default_factory=list)
@@ -98,9 +95,15 @@ class HealthData:
     churn_points: list[dict[str, Any]] = field(default_factory=list)
     snapshots: list[Any] = field(default_factory=list)
     fix_first: FixFirstQueue | None = None
+    #: The whole queue the page was cut from: its lead and its counts.
+    fix_first_full: FixFirstQueue | None = None
+    #: The findings' count vocabulary, read only when ``top_findings`` is named.
+    finding_counts: dict[str, Any] | None = None
     # Dashboard only: the worst-first test files, ranked apart from
     # ``metric_rows`` so a test never heads the production worklist.
     test_metric_rows: list[HealthFileMetric] = field(default_factory=list)
+    #: Dashboard only: files in neither list, by the scope reason that left them out.
+    worst_files_hidden: dict[str, int] = field(default_factory=dict)
 
 
 async def load_health_data(
@@ -122,12 +125,13 @@ async def load_health_data(
     # input order, so every block must see the same order as ``worst_files``.
     pop.all_metrics = sort_metrics_worst_first(pop.all_metrics, deductions)
     targets = set(pop.effective_targets)
-    # Targeted mode keeps what was named. The dashboard's ranked lists are
-    # production files; tests get their own list.
+    # Targeted mode keeps what was named. The dashboard's ranked lists hold the
+    # files Fix first and refactoring keep in scope; tests get their own list.
+    reasons = {} if pop.scoped else _scope_reasons(pop.all_metrics)
     metric_rows = (
         [m for m in pop.all_metrics if m.file_path in targets]
         if pop.scoped
-        else [m for m in pop.all_metrics if not _is_test(m, test_paths)]
+        else [m for m in pop.all_metrics if reasons[m.file_path] is None]
     )
     data = HealthData(
         repository=repository,
@@ -142,7 +146,10 @@ async def load_health_data(
         by_leverage=[],
         leads={},
         test_metric_rows=(
-            [] if pop.scoped else [m for m in pop.all_metrics if _is_test(m, test_paths)]
+            [] if pop.scoped else [m for m in pop.all_metrics if reasons[m.file_path] == "test"]
+        ),
+        worst_files_hidden=dict(
+            Counter(r for r in reasons.values() if r is not None and r != "test")
         ),
     )
     data.hotspot_paths = await _read_hotspot_paths(session, repository, pop, req)
@@ -150,8 +157,8 @@ async def load_health_data(
         session, repository, pop, req, findings.lead_rows
     )
     data.accuracy_rows = await read_accuracy_rows(session, repository, pop, req)
-    data.refactoring_rows, data.refactoring_recommendations = await _read_refactoring_plans(
-        session, repository, pop, req
+    data.refactoring_plans, data.refactoring_plans_ignored = await _read_refactoring_plans(
+        session, repository, reference_repository, pop, req
     )
     data.refactoring, data.performance = await _read_pillars(
         session, repository, reference_repository, pop, req
@@ -168,13 +175,24 @@ async def load_health_data(
     data.by_leverage, data.leads = _rank_leverage_and_leads(
         pop, metric_rows, findings, req, data.test_metric_rows
     )
-    data.fix_first = await _read_fix_first(session, repository, pop, req)
+    data.fix_first, data.fix_first_full = await _read_fix_first(session, repository, pop, req)
+    if "top_findings" in req.only_set and not pop.nothing_resolved:
+        counts = await unit_counts(session, repository.id, "findings", file_paths=pop.target_paths)
+        data.finding_counts = counts.as_dict()
     return data
 
 
-def _is_test(m: HealthFileMetric, test_paths: set[str]) -> bool:
-    """Test material by the metric's own flag or the graph's, whichever is read."""
-    return bool(m.is_test) or m.file_path in test_paths
+def _scope_reasons(metrics: list[HealthFileMetric]) -> dict[str, str | None]:
+    """Each file's scope exclusion (``test``, ``tooling``, ``generated``...), ``None``
+    in scope: Fix first's rule on Fix first's inputs, the row's flag and origin.
+
+    Ceiling: recomputed per process (about 0.3 s cold on 5k files, 1.2 s on 18k; 0.02 s
+    warm). Upgrade path: persist the verdict per file when the health pass finalizes.
+    """
+    return {
+        m.file_path: path_verdict(m.file_path, m.is_test, origin=m.code_origin).reason
+        for m in metrics
+    }
 
 
 async def _read_test_paths(
@@ -220,37 +238,27 @@ async def _read_perf_headline(
 
 
 async def _read_refactoring_plans(
-    session: Any, repository: Any, pop: Population, req: HealthRequest
-) -> tuple[list[Any], list[Recommendation]]:
-    """Plans scoped to the same targets, exclude-filtered like findings."""
+    session: Any, repository: Any, reference_repository: str, pop: Population, req: HealthRequest
+) -> tuple[RefactoringPlanPage | None, dict[str, str]]:
+    """The queue's plans, scoped, filtered and ordered as the queue is.
+
+    ``refactoring_scope`` resolves as on the opportunity queue: ``fix_first``
+    for the repository, ``all`` once targets are named.
+    """
     if not req.plans_requested or pop.nothing_resolved:
-        return [], []
-    rows = pop.in_scope_rows(
-        await get_refactoring_suggestions(
-            session,
-            repository.id,
-            file_paths=list(pop.effective_targets) if pop.scoped else None,
-        ),
-        "file_path",
+        return None, {}
+    query, ignored = parse_refactoring_query(
+        view=req.refactoring_view,
+        lead_type=req.refactoring_type,
+        confidence=req.refactoring_confidence,
+        effort=req.refactoring_effort,
+        scope=req.refactoring_scope,
+        file_paths=pop.target_paths,
+        limit=req.plans_cap,
+        offset=req.cursor,
     )
-    recommendations = await hydrate_recommendations(
-        session,
-        repository.id,
-        rows,
-        metric_rows=pop.all_metrics,
-        view=plan_view(req.refactoring_view),
-        rank_only=True,
-    )
-    # Every row is ranked; only the page the response emits, and the lede's
-    # lead plan, need the evidence that orders their tests.
-    shown = {0, *range(req.cursor, req.cursor + req.plans_cap)}
-    indexes = [index for index in sorted(shown) if index < len(recommendations)]
-    detailed = await detail_recommendations(
-        session, repository.id, [recommendations[index] for index in indexes]
-    )
-    for index, item in zip(indexes, detailed, strict=True):
-        recommendations[index] = item
-    return rows, recommendations
+    service = RefactoringHealthService(session, repository.id, reference_repository)
+    return await service.plan_page(query), ignored
 
 
 async def _read_pillars(
@@ -433,12 +441,15 @@ def _rank_leverage_and_leads(
 
 async def _read_fix_first(
     session: Any, repository: Any, pop: Population, req: HealthRequest
-) -> FixFirstQueue | None:
-    """The dashboard's one lead: the Fix-first queue core builds from stored rows.
+) -> tuple[FixFirstQueue | None, FixFirstQueue | None]:
+    """The dashboard's one lead: the Fix-first queue core builds from stored rows,
+    as the page this call emits and the whole queue.
 
     Always the production population, whatever ``scope`` says: a test file is
-    never the first thing to fix.
+    never the first thing to fix. The full queue is cached per store write, so
+    the page and the whole queue cost one build.
     """
     if pop.scoped or not req.wants("fix_first"):
-        return None
-    return await load_fix_first(session, repository.id, limit=min(req.limit, FIX_FIRST_CAP))
+        return None, None
+    full = await load_fix_first(session, repository.id, limit=None)
+    return queue_view(full, limit=req.fix_first_cap, offset=req.fix_first_cursor), full

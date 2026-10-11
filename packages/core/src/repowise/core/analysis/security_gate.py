@@ -41,15 +41,27 @@ from repowise.core.support_paths import DOC_EXTENSIONS
 
 from .change_risk.features import GIT_TIMEOUT_SECONDS, _git, revspec_head, split_revspec
 from .changed_lines import DIFF_ARGS, parse_unified_diff
-from .security_scan import SECRET_KINDS, masked_snippet, scan_source, source_lines
+from .security_scan import (
+    SECRET_KINDS,
+    _detect_secrets_allowlisted,
+    _mask_comments_and_strings,
+    masked_snippet,
+    scan_source,
+    source_lines,
+)
 
 #: Severities from least to most severe; ``--fail-on`` names the lowest that fails.
 SEVERITIES = ("low", "med", "high")
 _RANK = {s: i for i, s in enumerate(SEVERITIES)}
 
 #: Secret kinds matched by the value's own vendor format rather than a variable
-#: name; see :func:`fingerprint_of`.
-_KEY_SHAPE_KINDS = SECRET_KINDS - {"hardcoded_password", "hardcoded_secret"}
+#: name; see :func:`fingerprint_of`. A remote URL password can be as weak as
+#: any other, so it stays out.
+_KEY_SHAPE_KINDS = SECRET_KINDS - {
+    "hardcoded_password",
+    "hardcoded_secret",
+    "git_url_credentials",
+}
 
 
 class ShallowHistoryError(ValueError):
@@ -92,6 +104,9 @@ _RULE_TEXT: dict[str, str] = {
     "slack_token": "A Slack token.",
     "google_api_key": "A Google API key.",
     "stripe_key": "A Stripe secret or restricted key.",
+    "gitlab_token": "A GitLab token (personal, deploy, runner, trigger, CI job or OAuth).",
+    "azure_devops_pat": "An Azure DevOps personal access token.",
+    "git_url_credentials": "A password or token embedded in a git remote URL.",
     "private_key_pem": "A PEM private key with its body.",
     "fstring_sql": "An f-string holding SQL and an interpolation.",
     "concat_sql": "SQL built by string concatenation.",
@@ -432,7 +447,17 @@ def _scoped(
         if (entry := _builtin_entry(text, f, lines, secrets_only)) is not None
     ]
     custom, long_lines = _custom_entries(text, lines)
-    return [_row(text, entry) for entry in [*found, *custom]], long_lines
+    uncommented = (
+        source_lines(_mask_comments_and_strings(source, strings=False))
+        if "pragma: allowlist" in source
+        else text.lines
+    )
+    return [
+        _row(text, entry)
+        for entry in [*found, *custom]
+        if (entry[1] not in SECRET_KINDS and not entry[1].startswith("custom:"))
+        or not _detect_secrets_allowlisted(text.lines, uncommented, entry[0])
+    ], long_lines
 
 
 #: ``(line, kind, severity, snippet shown, fingerprint)``

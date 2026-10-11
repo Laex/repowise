@@ -1,6 +1,7 @@
 import {
   PERF_BOUNDARY_LABEL,
   type PerformanceActionabilityState,
+  type PerformanceCostProof,
   type PerformanceExecutionContext,
   type PerformanceFacetKey,
   type PerformanceOpportunity,
@@ -63,10 +64,21 @@ export const FACET_LABEL: Record<PerformanceFacetKey, string> = {
   confidence: "Evidence confidence",
   actionability: "Actionability",
   plan_state: "Plan",
+  proof: "Cost",
+  role: "Runs in",
 };
 
+const PROOF_LABEL: Record<PerformanceCostProof, string> = {
+  proven: "Measured",
+  unproven: "Unproven: loop size unknown",
+  background_unproven: "Unproven: scheduled job, growth not shown",
+};
+
+// "Stored plan", not "Plan ready": that name belongs to the actionability
+// state, which the Plan ready tile counts. A stored plan is counted by the
+// "With a stored plan" tile, so the row mark and its tile share one predicate.
 const PLAN_STATE_LABEL: Record<string, string> = {
-  available: "Plan ready",
+  available: "Stored plan",
   no_safe_plan: "No safe plan",
   not_persisted: "Needs an index refresh",
 };
@@ -180,6 +192,8 @@ export function facetValueLabel(facet: PerformanceFacetKey, value: string): stri
   if (facet === "confidence") return CONFIDENCE_LABEL[value as PerformanceOpportunityConfidence] ?? humanizeToken(value);
   if (facet === "actionability")
     return ACTIONABILITY_LABEL[value as PerformanceActionabilityState] ?? humanizeToken(value);
+  if (facet === "proof") return PROOF_LABEL[value as PerformanceCostProof] ?? humanizeToken(value);
+  if (facet === "role") return humanizeToken(value);
   return PLAN_STATE_LABEL[value] ?? humanizeToken(value);
 }
 
@@ -252,6 +266,13 @@ export function affectedSummary(opportunity: PerformanceOpportunity): string {
   return `${sitePart} across ${filePart}`;
 }
 
+const ROLE_PHRASE: Record<string, string> = {
+  request: "runs on every request",
+  event_consumer: "runs on every message",
+  scheduled_job: "runs on a schedule",
+  unknown: "no evidence of what runs it",
+};
+
 const MULTIPLIER_PHRASE: Record<string, string> = {
   io_in_loop: "runs once per loop iteration",
   serial_await_in_loop: "awaited one at a time",
@@ -280,6 +301,8 @@ export function whyRankedPhrase(factor: PerformanceWhyRanked): string {
       return `${contextLabel(String(value) as PerformanceExecutionContext).toLowerCase()} code`;
     case "entry_reachability":
       return "reachable from an entry point";
+    case "execution_role":
+      return ROLE_PHRASE[String(value)] ?? humanizeToken(String(value));
     case "loop_magnitude":
       return value === "grows_with_data" ? "grows with the data" : humanizeToken(String(value));
     case "provenance":
@@ -314,7 +337,7 @@ export interface PlanPresentation {
 export function planPresentation(opportunity: PerformanceOpportunity): PlanPresentation {
   if (opportunity.plan_status === "available" && opportunity.plan_id) {
     return {
-      label: "Structured plan ready",
+      label: PLAN_STATE_LABEL.available!,
       detail: opportunity.plan_reason,
       actionable: true,
     };

@@ -138,11 +138,11 @@ the page that answers it.
 |---|---|
 | *What should we fix first?* | A ranked queue weighing impact against effort, using churn, fan-in, coverage and bug history. [Fix first](docs/layers/CODE_HEALTH.md#fix-first) |
 | *Where is the debt?* | A 1 to 10 score for every file from 53 deterministic detectors, split into defect risk, maintainability and performance, validated against real bug history. [Code health](docs/layers/CODE_HEALTH.md) |
-| *Why is this slow?* | N+1 queries, I/O in loops, blocking calls inside async code and quadratic loops, traced across function and file boundaries. [Performance](docs/layers/CODE_HEALTH.md#performance-findings) |
+| *Why is this slow?* | N+1 queries, I/O in loops, blocking calls inside async code and quadratic loops, traced across function and file boundaries. [Performance](docs/layers/PERFORMANCE.md) |
 | *How do I break this up safely?* | Concrete refactoring plans: Extract Method, Extract Class, Move Method, Split File, Break Cycle, with the exact symbols that move and what moves with them. Ready to hand to an agent. [Refactoring](docs/layers/REFACTORING.md) |
 | *What can we delete?* | Unreachable files, unused exports and unused packages, each with a confidence tier and the evidence behind it. [Dead code](docs/layers/DEAD_CODE.md) |
 | *Where do bugs keep landing?* | Bug-fix commits traced to files and symbols, and a warning when your agent edits a bug magnet. [Bug history](docs/layers/BUG_HISTORY.md) |
-| *Are our tests testing anything?* | Tests with no assertions, tests that only check their own mocks, and untested hotspots. [Test-quality smells](docs/layers/CODE_HEALTH.md#test-quality-smells) |
+| *Are our tests testing anything?* | Tests with no assertions, tests that only check their own mocks, and untested hotspots. [Test-quality smells](docs/layers/CODE_HEALTH.md#findings) |
 
 <details>
 <summary><strong>Things people do not expect it to do</strong></summary>
@@ -527,7 +527,7 @@ languages moving up the ladder: **[roadmap →](ROADMAP.md#languages)**
 
 ## Supported agents and editors
 
-**Six agents wired end to end · two at the Full tier · every other MCP host one
+**Eight agents wired end to end · two at the Full tier · every other MCP host one
 paste away.**
 
 <p>
@@ -541,12 +541,14 @@ paste away.**
   <img src="https://img.shields.io/badge/Cursor-000000?style=flat-square&logo=cursor&logoColor=white" alt="Cursor" />
   <img src="https://img.shields.io/badge/OpenCode-000000?style=flat-square&logo=opencode&logoColor=white" alt="OpenCode" />
   <img src="https://img.shields.io/badge/Hermes-000000?style=flat-square&logoColor=white" alt="Hermes" />
+  <img src="https://img.shields.io/badge/GitHub_Copilot_CLI-000000?style=flat-square&logo=githubcopilot&logoColor=white" alt="GitHub Copilot CLI" />
+  <img src="https://img.shields.io/badge/Kiro-790ECB?style=flat-square&logoColor=white" alt="Kiro" />
 </p>
 
 **Full** is every surface Repowise has: MCP tools, skills, slash commands, a managed
 instructions file, hook-level interception of tool calls, and transcript mining after
-the session. **Good** is MCP tools and the config to reach them, without hooks or
-transcript mining. Anything else that speaks MCP is one snippet away:
+the session. **Good** is MCP tools plus an instructions file or skills, without transcript mining
+(hooks only where the matrix says). **Basic** is the MCP config alone. Anything else that speaks MCP is one snippet away:
 `repowise agents print-config claude-code` prints a server entry for Cline, Windsurf,
 Zed, Gemini CLI or any host that reads `mcpServers`.
 [Integration matrix →](docs/agent/INTEGRATIONS.md)

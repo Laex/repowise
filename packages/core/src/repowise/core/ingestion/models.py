@@ -247,6 +247,11 @@ class NamedBinding:
     is_module_alias: bool = False  # True for "import x" / "import * as ns"
     is_global: bool = False  # C# `global using` — applies to every file in the project
     is_static_import: bool = False  # C# `using static` / Java static import — pulls members
+    # Position of the local name (1-based line, byte column), set where a
+    # binding can sit inside a function body (``require``, ``import()``), so
+    # it is not read as a shadowing local.
+    line: int | None = None
+    column: int | None = None
 
 
 @dataclass
@@ -262,6 +267,9 @@ class Import:
     is_reexport: bool = False  # True for `pub use` (Rust) or re-export patterns
     # Rust ``mod child;``: declares the child module, uses nothing from it.
     is_module_declaration: bool = False
+    type_only: bool = False  # True when the statement is purely type-level (e.g. TypeScript import type)
+    # Inside a function or lambda body: runs on first call, not at module load.
+    deferred: bool = False
 
     @property
     def local_names(self) -> list[str]:
@@ -326,6 +334,9 @@ class CallSite:
     # ``obj.m()``, Ruby ``obj.m(x)``). Its bare-name reading is asked only
     # when no receiver strategy answers, never beside one.
     bare_name_fallback: bool = False
+    # Handed straight to a task scheduler (``asyncio.create_task(f())``): it runs
+    # later, beside its caller, so the caller neither waits for it nor repeats it.
+    spawned: bool = False
 
 
 # Raw extractor kinds, not the TS ``HeritageKind`` (a different payload);
@@ -619,6 +630,15 @@ EXECUTION_EDGE_TYPES: frozenset[str] = SYMBOL_USE_EDGE_TYPES - {"references"}
 REACHABILITY_USE_EDGE_TYPES: frozenset[str] = SYMBOL_USE_EDGE_TYPES | {"type_use"}
 
 
+# ``hint_source`` of a ``references`` edge from a registering decorator to a
+# function it decorates (see ``python_registrars``). The fact sits on the
+# decorated (target) side, so incremental persistence rewrites these edges by
+# target file, and role seeding skips them: a registry says nothing about how
+# the function runs.
+REGISTRATION_HINT = "decorator_registration"
+TARGET_OWNED_HINTS: frozenset[str] = frozenset({REGISTRATION_HINT})
+
+
 def is_dynamic_edge(edge_type: str | None) -> bool:
     """Whether *edge_type* is a dynamic-dispatch hint.
 
@@ -630,6 +650,22 @@ def is_dynamic_edge(edge_type: str | None) -> bool:
     future ``dynamically_*`` type would match by accident.
     """
     return edge_type is not None and edge_type.startswith("dynamic_")
+
+
+def combine_load_kinds(
+    first: tuple[bool, bool], second: tuple[bool, bool]
+) -> tuple[bool, bool]:
+    """``(type_only, deferred)`` for two imports of one target folded together.
+
+    Each side is runtime ``R`` (neither flag), type-only ``T`` or deferred
+    ``D``; the result is the one that runs earliest::
+
+        T + T -> T      T + D -> D      D + T -> D
+        D + D -> D      D + R -> R      R + D -> R      T + R -> R
+    """
+    type_only = first[0] and second[0]
+    deferred = not type_only and any(first) and any(second)
+    return type_only, deferred
 
 
 @dataclass
@@ -684,6 +720,9 @@ class ParsedFile:
     # Python only; lets the dead-code unused-export pass rescue symbols whose
     # only use is intra-module. See ``python_local_refs``.
     local_refs: frozenset[str] = field(default_factory=frozenset)
+    # Top-level functions that store and return the function they decorate
+    # (Python only); see ``python_registrars``.
+    registrars: frozenset[str] = field(default_factory=frozenset)
     # C/C++ sites that name a function without calling it: a dispatch table
     # entry, a callback field, an argument to a registration macro. Reuses
     # ``CallSite`` because resolving one is the identical problem — a name, the

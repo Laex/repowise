@@ -3,6 +3,7 @@
 import { useMemo, useState } from "react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
+import { useTranslations } from "next-intl";
 import useSWR from "swr";
 import useSWRInfinite from "swr/infinite";
 import { Users } from "lucide-react";
@@ -10,6 +11,7 @@ import {
   OwnerDirectory,
   type OwnerDirectoryFilters,
 } from "@repowise-dev/ui/owners/owner-directory";
+import { ApiError } from "@repowise-dev/ui/shared/api-error";
 import { PageShell } from "@repowise-dev/ui/shared/page-shell";
 import { useDebounce } from "@/lib/hooks/use-debounce";
 import { listAllOwners, listOwnersPage } from "@/lib/api/owners";
@@ -21,6 +23,8 @@ const LIMIT = 30;
 const DISTRIBUTION_PREFETCH_CAP = 120;
 
 export default function OwnersDirectoryPage() {
+  const t = useTranslations("views.contributors");
+  const tCommon = useTranslations("common");
   const { id } = useParams<{ id: string }>();
   const router = useRouter();
   const [filters, setFilters] = useState<OwnerDirectoryFilters>({
@@ -34,7 +38,7 @@ export default function OwnersDirectoryPage() {
     [debouncedQ, filters.sort],
   );
 
-  const { data, size, setSize, isLoading, isValidating } = useSWRInfinite<
+  const { data, error, mutate, size, setSize, isLoading, isValidating } = useSWRInfinite<
     Paginated<OwnerListEntry>
   >(
     (pageIndex, previous) => {
@@ -74,9 +78,9 @@ export default function OwnersDirectoryPage() {
 
   return (
     <PageShell
-      icon={<Users className="h-5 w-5 text-[var(--color-accent-primary)]" />}
-      title="Contributors"
-      description="Who knows what, mined from full git history. Ownership follows whoever wrote the surviving lines, not whoever committed last."
+      icon={<Users />}
+      title={t("title")}
+      description={t("description")}
     >
       <OwnerDirectory
         owners={items}
@@ -91,6 +95,16 @@ export default function OwnersDirectoryPage() {
         base={`/repos/${id}`}
         hrefFor={(o) => `/repos/${id}/owners/${encodeURIComponent(o.key)}`}
         LinkComponent={Link}
+        error={
+          error ? (
+            <ApiError
+              title={t("loadFailedTitle")}
+              message={t("loadFailed")}
+              retryLabel={tCommon("retry")}
+              onRetry={() => void mutate()}
+            />
+          ) : undefined
+        }
         onSelect={(o) =>
           router.push(`/repos/${id}/owners/${encodeURIComponent(o.key)}`)
         }

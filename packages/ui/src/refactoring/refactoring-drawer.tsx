@@ -22,14 +22,16 @@
 import type { ReactNode } from "react";
 import { Layers, Sparkles, TrendingUp, Wand2 } from "lucide-react";
 
+import { CollapsibleSection } from "../shared/collapsible-section";
 import { Sheet, SheetContent, SheetTitle } from "../ui/sheet";
 import { Skeleton, SkeletonRegion } from "../ui/skeleton";
 import { formatNumber } from "../lib/format";
 import { PlanComparison } from "./plan-comparison";
 import { GenerateCodePanel } from "./generate-code-panel";
+import { RefactoringModelToggle, type RefactoringModelToggleProps } from "./refactoring-settings-card";
 import { PriorityExplanation } from "./priority-explanation";
 import { ValidationSummary } from "./validation-summary";
-import { CONFIDENCE_LABEL, EFFORT_LABEL, typeMeta } from "./meta";
+import { CONFIDENCE_LABEL, EFFORT_LABEL, planBlurb, typeMeta } from "./meta";
 import { blastCount, blastFiles, evidenceRows, planWins } from "./types";
 import type {
   Confidence,
@@ -50,6 +52,8 @@ export interface RefactoringDrawerProps {
   /** Opt-in LLM code generation. Omit to hide the section entirely. */
   onGenerateCode?: ((plan: RefactoringPlan) => Promise<GeneratedCode>) | undefined;
   settingsHref?: string | undefined;
+  /** The code-generation switch, offered in place of the action while it is off. */
+  modelSetting?: RefactoringModelToggleProps | undefined;
   fileHref?: ((path: string, line?: number | null) => string | undefined) | undefined;
 }
 
@@ -63,6 +67,7 @@ export function RefactoringDrawer({
   onAiPrompt,
   onGenerateCode,
   settingsHref,
+  modelSetting,
   fileHref,
 }: RefactoringDrawerProps) {
   return (
@@ -81,6 +86,7 @@ export function RefactoringDrawer({
             onAiPrompt={onAiPrompt}
             onGenerateCode={onGenerateCode}
             settingsHref={settingsHref}
+            modelSetting={modelSetting}
             fileHref={fileHref}
             contextSlot={contextSlot}
           />
@@ -114,6 +120,7 @@ function DrawerBody({
   onAiPrompt,
   onGenerateCode,
   settingsHref,
+  modelSetting,
   fileHref,
   contextSlot,
 }: {
@@ -121,10 +128,12 @@ function DrawerBody({
   onAiPrompt?: ((plan: RefactoringPlan) => void) | undefined;
   onGenerateCode?: ((plan: RefactoringPlan) => Promise<GeneratedCode>) | undefined;
   settingsHref?: string | undefined;
+  modelSetting?: RefactoringModelToggleProps | undefined;
   fileHref?: ((path: string, line?: number | null) => string | undefined) | undefined;
   contextSlot?: ReactNode;
 }) {
   const meta = typeMeta(plan.refactoring_type);
+  const blurb = planBlurb(plan);
   const effort = (plan.effort_bucket || "M") as EffortBucket;
   const confidence = (plan.confidence || "medium") as Confidence;
   const evidence = evidenceRows(plan);
@@ -170,30 +179,35 @@ function DrawerBody({
 
       <div className="flex-1 space-y-6 overflow-y-auto px-5 py-5">
         {contextSlot}
-        <p className="text-sm leading-relaxed text-[var(--color-text-secondary)]">{meta.blurb}</p>
+        <p className="text-sm leading-relaxed text-[var(--color-text-secondary)]">{blurb}</p>
+
+        {plan.risks && plan.risks.length > 0 ? (
+          <section>
+            <h4 className="mb-2.5 font-mono text-[10px] uppercase tracking-[0.12em] text-[var(--color-text-tertiary)]">
+              Before you start
+            </h4>
+            <ul className="space-y-1">
+              {plan.risks.map((risk) => (
+                <li
+                  key={`${risk.kind}:${risk.ref ?? risk.text}`}
+                  className="flex items-start gap-2 text-sm text-[var(--color-text-secondary)]"
+                >
+                  <span
+                    className="mt-[7px] h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--color-warning)]"
+                    aria-hidden
+                  />
+                  {risk.text}
+                </li>
+              ))}
+            </ul>
+          </section>
+        ) : null}
 
         <section>
           <h4 className="mb-3 font-mono text-[10px] uppercase tracking-[0.12em] text-[var(--color-text-tertiary)]">
             The change
           </h4>
           <PlanComparison plan={plan} fileHref={fileHref} />
-        </section>
-
-        <section>
-          <h4 className="mb-3 font-mono text-[10px] uppercase tracking-[0.12em] text-[var(--color-text-tertiary)]">
-            Priority
-          </h4>
-          <PriorityExplanation plan={plan} />
-        </section>
-
-        <section>
-          <h4 className="mb-3 font-mono text-[10px] uppercase tracking-[0.12em] text-[var(--color-text-tertiary)]">
-            Validation
-          </h4>
-          <ValidationSummary
-            validation={plan.validation}
-            fileHref={(path) => fileHref?.(path, null)}
-          />
         </section>
 
         {onGenerateCode ? (
@@ -213,6 +227,10 @@ function DrawerBody({
               ) : null}
             </div>
             <GenerateCodePanel plan={plan} onGenerate={onGenerateCode} />
+          </section>
+        ) : modelSetting ? (
+          <section className="border-t border-[var(--color-border-default)] pt-4">
+            <RefactoringModelToggle {...modelSetting} />
           </section>
         ) : null}
 
@@ -244,10 +262,7 @@ function DrawerBody({
         ) : null}
 
         {evidence.length > 0 ? (
-          <section>
-            <h4 className="mb-1 font-mono text-[10px] uppercase tracking-[0.12em] text-[var(--color-text-tertiary)]">
-              Why this was flagged
-            </h4>
+          <CollapsibleSection title="Why this was flagged">
             <dl className="grid grid-cols-2 sm:grid-cols-4">
               {evidence.map((row) => (
                 <div
@@ -263,15 +278,19 @@ function DrawerBody({
                 </div>
               ))}
             </dl>
-          </section>
+          </CollapsibleSection>
         ) : null}
 
         {blast.length > 0 ? (
-          <section>
-            <h4 className="mb-2 flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-[0.12em] text-[var(--color-text-tertiary)]">
-              <Layers className="h-3.5 w-3.5" />
-              Also affected
-            </h4>
+          <CollapsibleSection
+            title={
+              <span className="flex items-center gap-1.5">
+                <Layers className="h-3.5 w-3.5" aria-hidden="true" />
+                Also affected
+              </span>
+            }
+            hint={formatNumber(blast.length)}
+          >
             <ul className="space-y-1">
               {blast.map((f) => {
                 const href = fileHref?.(f, null);
@@ -293,8 +312,29 @@ function DrawerBody({
                 );
               })}
             </ul>
-          </section>
+          </CollapsibleSection>
         ) : null}
+
+        <CollapsibleSection
+          title="Validation"
+          hint={
+            plan.validation
+              ? plan.validation.total > 0
+                ? `${formatNumber(plan.validation.total)} tests`
+                : "none guarding"
+              : undefined
+          }
+          defaultOpen={plan.validation?.total === 0}
+        >
+          <ValidationSummary
+            validation={plan.validation}
+            fileHref={(path) => fileHref?.(path, null)}
+          />
+        </CollapsibleSection>
+
+        <CollapsibleSection title="Priority">
+          <PriorityExplanation plan={plan} />
+        </CollapsibleSection>
       </div>
 
       {onAiPrompt ? (

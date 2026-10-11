@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -282,22 +283,40 @@ def get_db_url_for_repo(repo_path: Path) -> str:
     return resolve_db_url(repo_path)
 
 
-@contextlib.asynccontextmanager
-async def repo_index_session(
-    root: Path, *, reconcile: bool = True
-) -> AsyncIterator[tuple[AsyncSession, str] | None]:
-    """Open the repo-local store, yielding ``(session, repo_id)`` or ``None``.
+STALE_INDEX_MESSAGE = (
+    "This index was written by an older version of repowise; run `repowise update`."
+)
 
-    A scoring or scanning command must never fail because the index is absent,
-    stale or locked, so every storage error yields ``None`` instead.
-    ``reconcile=False`` skips the schema reconcile, so a caller that only reads
-    writes nothing to the store.
+
+class StaleIndexError(click.ClickException):
+    """The store lacks a table or column this version reads, and could not be repaired."""
+
+    def __init__(self) -> None:
+        super().__init__(STALE_INDEX_MESSAGE)
+
+
+@contextlib.asynccontextmanager
+async def repo_index_session(root: Path) -> AsyncIterator[tuple[AsyncSession, str] | None]:
+    """Open the repo-local store for reading, yielding ``(session, repo_id)`` or ``None``.
+
+    A scoring or scanning command must never fail because the index is absent
+    or locked, so every storage error yields ``None`` instead. The schema is
+    reconciled only when a catalogue read finds it behind the models: the
+    reconcile costs a read command 0.3 s and writes to the store, so a current
+    store skips it. A store still behind after it raises :class:`StaleIndexError`,
+    since every answer read from it would be missing what it lacks.
     """
+    from sqlalchemy import select
     from sqlalchemy.exc import SQLAlchemyError
 
     from repowise.core.persistence import create_engine, create_session_factory, get_session
     from repowise.core.persistence.crud import get_repository_by_path
-    from repowise.core.persistence.database import has_db_store
+    from repowise.core.persistence.database import (
+        get_configured_db_url,
+        has_db_store,
+        schema_behind,
+    )
+    from repowise.core.persistence.models import Repository
 
     # The configured store, which may live outside the repo (REPOWISE_DB_URL).
     if not has_db_store(root):
@@ -309,13 +328,22 @@ async def repo_index_session(
         opened: tuple[AsyncSession, str] | None = None
         try:
             url = get_db_url_for_repo(root)
-            if reconcile:
-                await reconcile_schema_best_effort(url)
             engine = create_engine(url)
             stack.push_async_callback(engine.dispose)
+            if await schema_behind(engine):
+                await reconcile_schema_best_effort(url)
+                if await schema_behind(engine):
+                    raise StaleIndexError
             factory = create_session_factory(engine)
             session = await stack.enter_async_context(get_session(factory))
             repo = await get_repository_by_path(session, str(root))
+            if repo is None and get_configured_db_url() is None:
+                # A moved repo carries its local store but retains the old
+                # local_path. Never infer identity in a configured/shared store
+                # or when the local store contains more than one repository.
+                repos = (await session.scalars(select(Repository).limit(2))).all()
+                if len(repos) == 1:
+                    repo = repos[0]
             if repo is not None:
                 opened = (session, repo.id)
         except (SQLAlchemyError, OSError, LookupError):
@@ -340,8 +368,9 @@ async def reconcile_schema_best_effort(db_url: str) -> None:
     have gained since, and the ORM then fails with a raw ``no such column`` on
     the first query — which for a read command means every read. ``init_db``
     back-fills those columns in place and is idempotent, so the CLI pairs it
-    with ``create_engine`` everywhere it opens a store, the way the MCP server,
-    the workspace registry and the FastAPI app already do in their lifespans.
+    with ``create_engine`` where a command opens a store, the way the MCP
+    server, the workspace registry and the FastAPI app already do in their
+    lifespans. :func:`repo_index_session` runs it only on a store found behind.
 
     Opportunistic, not a precondition, which is the part worth having in one
     place. Reconciling needs a write, and a store can be read-only or
@@ -611,12 +640,14 @@ def _pending_commit_still_ahead(
         return False
     import subprocess
 
+    if as_commit_id(indexed_head) is None or as_commit_id(pending_head) is None:
+        return False
     try:
         # ``indexed_head`` is an ancestor of ``pending_head`` => pending is
         # newer than what we indexed and worth keeping. A non-zero exit
         # (including an unresolvable pending commit) means "not ahead".
         result = subprocess.run(
-            ["git", "merge-base", "--is-ancestor", indexed_head, pending_head],
+            ["git", "merge-base", "--is-ancestor", "--end-of-options", indexed_head, pending_head],
             cwd=str(repo_path),
             capture_output=True,
             timeout=10,
@@ -687,6 +718,22 @@ def rotate_update_log_if_needed(repo_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # Git helpers
 # ---------------------------------------------------------------------------
+
+
+_COMMIT_ID_RE = re.compile(r"[0-9a-fA-F]{7,40}")
+
+
+def as_commit_id(value: object) -> str | None:
+    """*value* when it is a full or abbreviated hex commit id, else ``None``.
+
+    Commit ids read back from ``.repowise/state.json`` (or a file beside it)
+    can be edited by anyone who can commit that file, so they are checked
+    before they reach a ``git`` argument list, where a leading ``-`` would be
+    read as an option.
+    """
+    if isinstance(value, str) and _COMMIT_ID_RE.fullmatch(value):
+        return value
+    return None
 
 
 def get_head_commit(repo_path: Path) -> str | None:
@@ -878,6 +925,11 @@ def save_config(
     existing["embedder"] = embedder
     if embedding_model:
         existing["embedding_model"] = embedding_model
+    else:
+        # No model was resolved this run: dropping the key beats leaving a
+        # stale one that names a different provider's model, or one this
+        # embedder was not actually built with (#2627).
+        existing.pop("embedding_model", None)
     if exclude_patterns is not None:
         existing["exclude_patterns"] = exclude_patterns
     if commit_limit is not None:
@@ -919,8 +971,19 @@ def save_config_partial(
     keyword arguments. ``None`` values are skipped so callers can forward
     optional flags without clobbering existing keys.
 
-    No scalar-only fallback like :func:`save_config`: it would silently drop
-    ``exclude_patterns``, and PyYAML is a hard dependency anyway.
+    ``embedding_model`` is the one exception to "None is skipped": passed
+    explicitly as ``None``, it clears any pinned model instead of leaving it
+    alone, because that is the caller saying the model changed (or is no
+    longer known) for whatever embedder this call names. Merely *omitting*
+    ``embedding_model`` is not the same claim, so it does not clear anything
+    on its own -- ``reindex_cmd`` calls this after every reindex with only
+    ``embedder=``, having never had a model to pass, and a bare ``in extra``
+    check on ``embedder`` used to read that silence as "no model" and wipe a
+    real pin on every routine reindex (#2627, caught in review on the fix
+    itself). Distinguishing "not passed" from "passed as ``None``" needs the
+    raw ``extra`` dict, since a keyword default cannot do it: ``in extra``
+    only reports that once, but ``get`` cannot tell the two shapes apart
+    afterwards.
     """
     import yaml  # type: ignore[import-untyped]
 
@@ -930,13 +993,16 @@ def save_config_partial(
     if commit_limit is not None:
         updates["commit_limit"] = commit_limit
     updates.update({k: v for k, v in extra.items() if v is not None})
-    if not updates:
+    clear_embedding_model = "embedding_model" in extra and extra["embedding_model"] is None
+    if not updates and not clear_embedding_model:
         return
 
     ensure_repowise_dir(repo_path)
     config_path = get_repowise_dir(repo_path) / CONFIG_FILENAME
     existing = load_config(repo_path)
     existing.update(updates)
+    if clear_embedding_model:
+        existing.pop("embedding_model", None)
 
     config_path.write_text(
         yaml.dump(existing, default_flow_style=False, sort_keys=False),
@@ -995,14 +1061,6 @@ def config_fingerprint(repo_path: Path) -> str:
 # ---------------------------------------------------------------------------
 # Provider resolution
 # ---------------------------------------------------------------------------
-
-
-def _is_codex_cli_available() -> bool:
-    """Check if the Codex CLI binary is available."""
-
-    import shutil
-
-    return shutil.which("codex") is not None
 
 
 def resolve_provider(
@@ -1262,48 +1320,26 @@ def validate_provider_config(provider_name: str | None = None) -> list[str]:
 
     # Required environment variables per provider, read from the registry that
     # also drives resolution, so a provider added there is validated here without
-    # a second edit. The agent-CLI providers are absent by design: they need no
-    # env var, so they are handled by the binary checks below instead.
-    from repowise.core.providers.llm.registry import (
-        PROVIDER_API_KEY_ENVS,
-        provider_required_envs,
-    )
+    # a second edit. The agent-CLI providers need no env var; the check for them
+    # is whether their CLI is installed.
+    from repowise.core.agents.identity import identity_for_provider
+    from repowise.core.providers.llm.registry import provider_required_envs
+    from repowise.core.providers.llm.specs import PROVIDER_SPECS
 
     provider_env_vars = {
-        name: list(provider_required_envs(name)) for name in (*PROVIDER_API_KEY_ENVS, "ollama")
+        name: list(provider_required_envs(name))
+        for name in PROVIDER_SPECS
+        if provider_required_envs(name)
     }
 
     if provider_name:
-        if provider_name == "codex_cli":
-            if not _is_codex_cli_available():
+        agent = identity_for_provider(provider_name)
+        if agent is not None:
+            if not agent.is_installed():
                 warnings.append(
-                    "Provider 'codex_cli' requires the Codex CLI. "
-                    "Install it with: npm install -g @openai/codex"
-                )
-            return warnings
-
-        if provider_name == "claude_cli":
-            import shutil
-
-            if not shutil.which("claude"):
-                warnings.append(
-                    "Provider 'claude_cli' requires the Claude Code CLI.\n"
-                    "  Install:  https://claude.com/claude-code\n"
-                    "  Setup:    run 'claude login' once to authenticate"
-                )
-            return warnings
-
-        if provider_name == "opencode":
-            import shutil
-
-            if not shutil.which("opencode"):
-                warnings.append(
-                    "Provider 'opencode' requires the opencode CLI.\n"
-                    "  Install:  curl -fsSL https://opencode.ai/install | bash\n"
-                    "  Setup:    run 'opencode' once to configure your provider\n"
-                    "  Models:   opencode models (list available models)\n"
-                    "  More:     https://opencode.ai\n"
-                    "  Usage:    repowise init --provider opencode --model opencode/openai/gpt-5"
+                    f"Provider '{provider_name}' requires the {agent.display_name} CLI.\n"
+                    f"  Install:  {agent.install_hint}\n"
+                    f"  Setup:    {agent.login_hint}"
                 )
             return warnings
 
@@ -1312,46 +1348,22 @@ def validate_provider_config(provider_name: str | None = None) -> list[str]:
             warnings.append(f"Unknown provider '{provider_name}' - cannot validate configuration")
             return warnings
 
+        # Any one of a provider's env vars satisfies it (GEMINI_API_KEY or
+        # GOOGLE_API_KEY), the same rule resolution applies.
         env_vars = provider_env_vars[provider_name]
-        missing_vars = []
-
-        if provider_name == "gemini":
-            # Special case: either GEMINI_API_KEY or GOOGLE_API_KEY
-            if not (_is_env_var_set("GEMINI_API_KEY") or _is_env_var_set("GOOGLE_API_KEY")):
-                missing_vars = env_vars
-        else:
-            for var in env_vars:
-                if not _is_env_var_set(var):
-                    missing_vars.append(var)
-
-        if missing_vars:
-            warnings.append(
-                f"Provider '{provider_name}' requires environment variables: {', '.join(missing_vars)}"
-            )
+        if not any(_is_env_var_set(var) for var in env_vars):
+            warnings.append(f"Provider '{provider_name}' requires {' or '.join(env_vars)}")
     else:
         # Check all providers - warn about any that could be configured but are missing keys
         for name, env_vars in provider_env_vars.items():
-            if name == "gemini":
-                if os.environ.get("REPOWISE_PROVIDER") == "gemini" and not (
-                    _is_env_var_set("GEMINI_API_KEY") or _is_env_var_set("GOOGLE_API_KEY")
-                ):
-                    # Only warn if it looks like they might be trying to use gemini
-                    warnings.append(
-                        "Provider 'gemini' requires GEMINI_API_KEY or GOOGLE_API_KEY environment variable"
-                    )
+            if any(_is_env_var_set(var) for var in env_vars):
                 continue
-
-            missing = [var for var in env_vars if not _is_env_var_set(var)]
-            if missing:
-                # Only warn if this provider is explicitly requested OR
-                # if the env var exists but is invalid (empty)
-                env_var_exists = any(_is_env_var_exists(var) for var in env_vars)
-                explicitly_requested = os.environ.get("REPOWISE_PROVIDER") == name
-
-                if explicitly_requested or env_var_exists:
-                    warnings.append(
-                        f"Provider '{name}' requires environment variables: {', '.join(missing)}"
-                    )
+            # Only warn if this provider is explicitly requested OR
+            # if the env var exists but is invalid (empty)
+            env_var_exists = any(_is_env_var_exists(var) for var in env_vars)
+            explicitly_requested = os.environ.get("REPOWISE_PROVIDER") == name
+            if explicitly_requested or env_var_exists:
+                warnings.append(f"Provider '{name}' requires {' or '.join(env_vars)}")
 
     return warnings
 

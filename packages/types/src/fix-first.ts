@@ -7,6 +7,7 @@
  */
 
 import type { ActionCommand } from "./actions.js";
+import type { QueueCounts } from "./queue.js";
 
 export type FixTier = "now" | "next" | "later";
 
@@ -37,10 +38,16 @@ export type FixExclusion =
   | "vendored"
   | "docs_example"
   | "deprecated"
+  | "gated_off"
+  | "cold_path"
+  | "unreachable"
   | "inherent_dispatch"
   | "small_function"
   | "no_concrete_step"
-  | "low_value_kind";
+  | "low_value_kind"
+  | "kind_unaudited"
+  | "terminal_flow"
+  | "moderate_quiet";
 
 /** `all` keeps test files, labelled in `context`. */
 export type FixScope = "production" | "all";
@@ -64,6 +71,19 @@ export interface FixStep {
   file_path: string;
   line: number | null;
   mechanical: boolean;
+  /** An Extract Method helper's header and the statement that replaces the span. */
+  signature?: string | null;
+  call?: string | null;
+  /** The command that checks this step, when it differs from the item's. */
+  command?: string | null;
+}
+
+/** A due item's first edit, inline in the compact projection. */
+export interface FixFirstStep {
+  action: string;
+  line?: number;
+  /** Only when the step edits a file other than the item's target. */
+  file?: string;
 }
 
 export interface FixItem {
@@ -89,6 +109,8 @@ export interface FixItem {
     tests_total: number;
     command: string | null;
     basis: FixFactBasis;
+    /** What to do before the edit when no test reaches it. */
+    prerequisite?: string | null;
   };
   /** History signals: shown beside the item, never ranked on. */
   context: { label: string; value: string }[];
@@ -96,6 +118,8 @@ export interface FixItem {
   next_call: ActionCommand;
   /** The value inputs and the tier reason, so the order is explainable. */
   why_ranked: { factor: string; value: string }[];
+  /** The value band, 0 to 4, Do next ranks the item on; null on an older snapshot. */
+  value?: number | null;
 }
 
 /** The projection a list renders; the full item is one lookup away. */
@@ -109,6 +133,10 @@ export interface FixItemCompact {
   gain: string;
   effort: FixEffort;
   confidence: FixLevel;
+  /** Due items only (tier `now` or `next`). */
+  first_step?: FixFirstStep;
+  /** The item's command, or the step to take first when no test reaches it. */
+  verify?: { command?: string; prerequisite?: string };
   next_call: ActionCommand;
 }
 
@@ -117,7 +145,12 @@ export interface FixFirstTotals {
   eligible: number;
   shown: number;
   excluded: Record<FixExclusion, number>;
+  /** Distinct functions with work kept out as `gated_off`: dormant, not gone. */
+  dormant: number;
 }
+
+/** The count vocabulary (`QueueCounts`) read on the whole Fix first queue. */
+export type FixFirstCounts = QueueCounts;
 
 export interface FixFirstQueue<Item = FixItem> {
   items: Item[];
@@ -128,4 +161,6 @@ export interface FixFirstQueue<Item = FixItem> {
   by_improves: Record<FixImproves, number>;
   model_version: number;
   basis: { analyzed_commit: string | null; health_analyzed_at: string | null };
+  /** The items' counts; `totals` stays for older readers. */
+  counts?: QueueCounts;
 }

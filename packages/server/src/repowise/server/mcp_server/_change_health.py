@@ -16,6 +16,7 @@ from repowise.core.analysis.review_directive import (
     ReviewDirective,
     review_directive,
 )
+from repowise.server.mcp_server._test_selection import UNAVAILABLE_REASON
 
 #: Actionable findings carried in the default response. The rest are counted
 #: and recoverable by an exact call, never silently dropped.
@@ -52,13 +53,13 @@ def _test_evidence(tests: dict[str, Any] | None) -> CoveringTestEvidence:
         # report and nothing to ask for.
         return CoveringTestEvidence()
     to_run = tuple(tests.get("tests_to_run") or ())
-    if to_run:
-        state = "available"
-    elif tests.get("status") in {"no_map", "no_index"}:
-        state = "unavailable"
-    else:
-        state = "available"
-    return CoveringTestEvidence(state=state, tests_to_run=to_run, basis=tests.get("basis"))
+    state = "unavailable" if tests.get("status") == "no_index" else "available"
+    run_all = None
+    if tests.get("run_all"):
+        run_all = (tests.get("reasons") or [UNAVAILABLE_REASON])[0]
+    return CoveringTestEvidence(
+        state=state, tests_to_run=to_run, basis=tests.get("basis"), run_all=run_all
+    )
 
 
 def _render_actions(decided: ReviewDirective) -> list[str]:
@@ -80,7 +81,7 @@ def _render_action(action: ReviewAction, inspected: int) -> str | None:
         if inspected >= _ACTIONABLE_FINDINGS:
             return None
         return f"{action.explanation} ({action.targets[0]})"
-    if action.kind == "run_tests":
+    if action.kind == "run_tests" and action.targets:
         return f"Run: {' '.join(action.targets[:_TESTS_SHOWN])}"
     return action.explanation
 

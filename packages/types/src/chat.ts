@@ -288,7 +288,11 @@ export interface RiskReportArtifactData {
   };
   impacted_tests?: {
     tests_to_run?: string[];
+    /** `selected`, `run_all`, or why nothing was selected (`no_index`, `timeout`, ...). */
     status?: string;
+    /** No subset can be vouched for: every test must run (`reasons` says why). */
+    run_all?: boolean;
+    reasons?: string[];
     summary?: string;
     /** `measured` from stored coverage, `inferred` from the dependency graph. */
     basis?: "measured" | "inferred" | "none";
@@ -399,11 +403,14 @@ export interface ChangeRiskArtifact extends ArtifactEnvelopeIdentity {
 export interface SearchResultsArtifactData {
   query: string;
   results: Array<{
-    title: string;
+    /** Omitted when it only restates `path`/`symbol_id` (a structural title). */
+    title?: string;
     page_type: string;
     page_id?: string;
     /** Openable repo-relative file; absent when the hit names no file. */
     path?: string;
+    /** `path::Symbol` on a symbol page. */
+    symbol_id?: string;
     /** Kept only where it differs from `path` or `path` is absent. */
     target_path?: string;
     snippet?: string;

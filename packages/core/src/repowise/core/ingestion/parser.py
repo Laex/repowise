@@ -61,6 +61,7 @@ from .extractors.bindings.python import expand_bare_relative_imports
 from .extractors.bindings.ts_js import (
     declarator_binds_callable,
     declarator_value_is_module_ref,
+    dynamic_import_bindings,
 )
 from .extractors.synthetic_symbols import extract_synthetic_symbols
 from .extractors.visibility import (
@@ -84,6 +85,7 @@ from .models import (
     ParsedFile,
     Symbol,
     TypeReference,
+    combine_load_kinds,
     compute_content_hash,
 )
 from .parser_helpers import (
@@ -119,9 +121,12 @@ from .parser_helpers import (
     _run_query,
     _rust_shadowed_by_type_param,
     _ts_nested_object_method_owner,
+    import_load_kind,
 )
-from .python_local_refs import extract_python_local_refs
+from .python_local_refs import local_refs_from_tree, parse_python_module
 from .python_overload import is_python_overload as _is_python_overload
+from .python_registrars import registering_functions
+from .python_tasks import is_fire_and_forget
 from .sfc_source import component_call_sites, prepare_source
 from .special_handlers import SPECIAL_HANDLER_LANGUAGES, parse_special
 from .symbol_identity import disambiguate_colliding_ids, symbol_discriminator
@@ -150,8 +155,29 @@ _TS_JS_LANGUAGES = ("typescript", "javascript", "svelte", "vue")
 
 # Languages whose query defines the ``@reference.*`` captures. Every other
 # language would only scan the whole match list to find nothing, so the check
-# is here rather than inside ``_extract_references``.
-_REFERENCE_LANGUAGES = ("cpp", "c", "go", "rust", "kotlin")
+# is here rather than inside ``_extract_references``. The SFC tags reuse the
+# TS captures but stay out: resolution has no local-shadow scan for them.
+_REFERENCE_LANGUAGES = ("cpp", "c", "go", "rust", "kotlin", "typescript", "javascript", "python")
+
+# Languages where a bare name resolves only through the file's own symbols or
+# a name it imports, so any other bare name cannot pass the reference floor.
+_NAMED_BINDING_LANGUAGES = frozenset({"typescript", "javascript", "python"})
+
+
+def _bare_reference_names(
+    language: str, symbols: list[Symbol], imports: list[Import]
+) -> frozenset[str] | None:
+    """Names a receiver-less reference in this file could resolve to, or None for any.
+
+    Most bare identifiers in a value position are locals; dropping them here
+    skips their per-site work. A wildcard import keeps every name.
+    """
+    if language not in _NAMED_BINDING_LANGUAGES:
+        return None
+    imported = {name for imp in imports for name in imp.local_names}
+    if "*" in imported:
+        return None
+    return frozenset(imported.union(s.name for s in symbols))
 
 
 def _call_receiver_from_node(node: Node, src: str) -> CallReceiver | None:
@@ -848,10 +874,16 @@ def _rust_outer_attributes(def_node: Node, src: str) -> list[str]:
 def _leading_child_attributes(
     def_node: Node, node_type: str, opener: str, closer: str, src: str
 ) -> list[str]:
-    """Inner text of the attribute children leading *def_node*, until the first other child."""
+    """Inner text of the attribute children leading *def_node*, until the first other child.
+
+    A comment between attribute lists does not end the run, so an attribute
+    placed after one is still recorded.
+    """
     attrs: list[str] = []
     for child in def_node.children:
         if child.type != node_type:
+            if child.type == "comment":
+                continue
             break
         attr_text = _node_text(child, src).strip()
         if attr_text.startswith(opener) and attr_text.endswith(closer):
@@ -1029,7 +1061,8 @@ def _statement_imports(
         return macro_mod_imports(module_node, raw) if "mod" in raw else []
     if language in _TS_JS_LANGUAGES and _is_dynamic_esm_import(stmt_node):
         # ``import('./mod')`` binds a module namespace at runtime, so it is a
-        # wildcard, which keeps the target's exports live.
+        # wildcard, which keeps the target's exports live. The names it is
+        # destructured into still bind, for call resolution.
         return [
             Import(
                 raw_statement=raw,
@@ -1037,7 +1070,7 @@ def _statement_imports(
                 imported_names=["*"],
                 is_relative=module_text.startswith("."),
                 resolved_file=None,
-                bindings=[],
+                bindings=dynamic_import_bindings(stmt_node, src),
                 is_reexport=False,
             )
         ]
@@ -1178,6 +1211,7 @@ def _generic_import(
         or module_text.startswith("./")
         or module_text.startswith(("self::", "super::", "crate::"))
     )
+    # ``type_only`` / ``deferred`` are set by the caller from ``import_load_kind``.
     return Import(
         raw_statement=raw,
         module_path=module_text,
@@ -1284,6 +1318,58 @@ def _is_reexport_import(stmt_node: Node, raw: str, language: str) -> bool:
     return language == "swift" and raw.startswith("@_exported")
 
 
+def _parse_tree(
+    lang: str, language: Language, grammar_tag: str, source: bytes
+) -> tuple[Node, list[str], str, Language]:
+    """``(root, parse errors, grammar tag, language)``; a JSX-bearing ``.ts`` retries as TSX."""
+    parser = Parser(language)
+    tree = parser.parse(source)
+    root = tree.root_node
+
+    parse_errors = _collect_error_nodes(root)
+
+    # Adaptive TSX grammar fallback: if a .ts file contains JSX markup,
+    # tree-sitter-typescript produces ERROR nodes. Re-parse using the TSX
+    # grammar ONLY IF:
+    #   1. Initial parse yielded error nodes (parse_errors is non-empty)
+    #   2. The file projects to TypeScript and is not already on tsx
+    #   3. Source contains JSX-specific closing tokens (b"/>" or b"</")
+    # A .vue render function may be written in JSX
+    # (``vnodes.push(<i class={c} />)``), which is the single TS parse
+    # failure across a 1,593-file .vue corpus. ``source`` here is the
+    # markup-blanked projection, so the template's own ``</`` and ``/>``
+    # are already spaces — the token test still keys on real JSX only.
+    # The swap is strictly safe: it only takes effect when TSX yields
+    # FEWER errors than the first parse.
+    if (
+        parse_errors
+        and lang in ("typescript", "vue")
+        and grammar_tag != "tsx"
+        and (b"/>" in source or b"</" in source)
+    ):
+        tsx_language = _get_language("tsx")
+        if tsx_language is not None:
+            tsx_tree = Parser(tsx_language).parse(source)
+            tsx_errors = _collect_error_nodes(tsx_tree.root_node)
+            if len(tsx_errors) < len(parse_errors):
+                tree = tsx_tree
+                root = tree.root_node
+                parse_errors = tsx_errors
+                # Both grammar_tag AND language must be reassigned.
+                # grammar_tag is consumed immediately below by
+                # the caller's _get_query(lang, language, grammar_tag), which
+                # appends tsx.scm to the base typescript.scm query.
+                # That append is what supplies the
+                # jsx_opening_element / jsx_self_closing_element captures
+                # that restore JSX component call-site edges.
+                # Reassigning only ``tree`` / ``root`` would fix parse
+                # errors but leave those edges missing — the dead-code
+                # false-positive would remain.
+                grammar_tag = "tsx"
+                language = tsx_language
+    return root, parse_errors, grammar_tag, language
+
+
 class ASTParser:
     """Unified AST parser — works for all languages via .scm query files.
 
@@ -1300,6 +1386,31 @@ class ASTParser:
 
     def __init__(self) -> None:
         pass
+
+    def parse_imports(self, file_info: FileInfo, source: bytes) -> list[Import]:
+        """Only *source*'s imports: :meth:`parse_file`'s grammar, query and import pass.
+
+        Symbols, calls and references are not extracted, which is most of a
+        parse. A language without a tree-sitter path takes the full parse.
+        """
+        lang = file_info.language
+        config = LANGUAGE_CONFIGS.get(lang)
+        grammar_tag = grammar_tag_for(lang, file_info.path)
+        language = _get_language(grammar_tag)
+        signature_file = lang == "fsharp" and file_info.path.endswith(".fsi")
+        if (
+            lang in SPECIAL_HANDLER_LANGUAGES
+            or config is None
+            or language is None
+            or signature_file
+        ):
+            return self.parse_file(file_info, source).imports
+        source = prepare_source(lang, source, path=file_info.path)
+        root, _, grammar_tag, language = _parse_tree(lang, language, grammar_tag, source)
+        query = self._get_query(lang, language, grammar_tag)
+        matches = _run_query(query, root) if query is not None else []
+        src = source.decode("utf-8", errors="replace")
+        return self._extract_imports(matches, config, file_info, src)
 
     def parse_file(self, file_info: FileInfo, source: bytes) -> ParsedFile:
         """Parse *source* bytes and return a fully populated ParsedFile."""
@@ -1367,52 +1478,8 @@ class ASTParser:
         original_source = source
         source = prepare_source(lang, source, path=file_info.path)
 
-        parser = Parser(language)
-        tree = parser.parse(source)
+        root, parse_errors, grammar_tag, language = _parse_tree(lang, language, grammar_tag, source)
         src = source.decode("utf-8", errors="replace")
-        root = tree.root_node
-
-        parse_errors = _collect_error_nodes(root)
-
-        # Adaptive TSX grammar fallback: if a .ts file contains JSX markup,
-        # tree-sitter-typescript produces ERROR nodes. Re-parse using the TSX
-        # grammar ONLY IF:
-        #   1. Initial parse yielded error nodes (parse_errors is non-empty)
-        #   2. The file projects to TypeScript and is not already on tsx
-        #   3. Source contains JSX-specific closing tokens (b"/>" or b"</")
-        # A .vue render function may be written in JSX
-        # (``vnodes.push(<i class={c} />)``), which is the single TS parse
-        # failure across a 1,593-file .vue corpus. ``source`` here is the
-        # markup-blanked projection, so the template's own ``</`` and ``/>``
-        # are already spaces — the token test still keys on real JSX only.
-        # The swap is strictly safe: it only takes effect when TSX yields
-        # FEWER errors than the first parse.
-        if (
-            parse_errors
-            and lang in ("typescript", "vue")
-            and grammar_tag != "tsx"
-            and (b"/>" in source or b"</" in source)
-        ):
-            tsx_language = _get_language("tsx")
-            if tsx_language is not None:
-                tsx_tree = Parser(tsx_language).parse(source)
-                tsx_errors = _collect_error_nodes(tsx_tree.root_node)
-                if len(tsx_errors) < len(parse_errors):
-                    tree = tsx_tree
-                    root = tree.root_node
-                    parse_errors = tsx_errors
-                    # Both grammar_tag AND language must be reassigned.
-                    # grammar_tag is consumed immediately below by
-                    # self._get_query(lang, language, grammar_tag), which
-                    # appends tsx.scm to the base typescript.scm query.
-                    # That append is what supplies the
-                    # jsx_opening_element / jsx_self_closing_element captures
-                    # that restore JSX component call-site edges.
-                    # Reassigning only ``tree`` / ``root`` would fix parse
-                    # errors but leave those edges missing — the dead-code
-                    # false-positive would remain.
-                    grammar_tag = "tsx"
-                    language = tsx_language
 
         query = self._get_query(lang, language, grammar_tag)
 
@@ -1446,7 +1513,7 @@ class ASTParser:
         # every non-SFC language.
         calls.extend(component_call_sites(lang, original_source, symbols))
         references = (
-            self._extract_references(matches, file_info, src, symbols)
+            self._extract_references(matches, file_info, src, symbols, imports)
             if lang in _REFERENCE_LANGUAGES
             else []
         )
@@ -1461,13 +1528,9 @@ class ASTParser:
         # (callable passed as an arg, type annotation, decorator, default)
         # carry no graph edge, so the dead-code unused-export pass would flag
         # them. Stamp the referenced names so the analyzer can rescue them.
-        local_refs: frozenset[str] = frozenset()
-        if lang == "python":
-            top_level_names = {s.name for s in symbols if s.name and not s.parent_name}
-            nested_classes = {
-                (s.parent_name, s.name) for s in symbols if s.kind == "class" and s.parent_name
-            }
-            local_refs = extract_python_local_refs(src, top_level_names, nested_classes)
+        local_refs, registrars = (
+            _python_module_facts(src, symbols) if lang == "python" else (frozenset(), frozenset())
+        )
 
         if len(symbols) > _SYMBOL_COUNT_WARN_THRESHOLD:
             log.warning(
@@ -1491,6 +1554,7 @@ class ASTParser:
             content_hash=content_hash,
             type_refs=type_refs,
             local_refs=local_refs,
+            registrars=registrars,
             references=references,
         )
 
@@ -1831,6 +1895,9 @@ class ASTParser:
         language = file_info.language
         imports: list[Import] = []
         seen_raws: set[str] = set()
+        # Statement key -> the Imports it produced, so a repeat folds its load
+        # kind into them rather than adding a duplicate.
+        seen_imports: dict[str, list[Import]] = {}
         seen_pascal_units: set[str] = set()
         seen_elixir_modules: set[str] = set()
 
@@ -1868,17 +1935,29 @@ class ASTParser:
                 mod_path_attr = _rust_mod_path_attribute(stmt_node, src)
                 if mod_path_attr is not None:
                     dedup_key = f"{raw}|path={mod_path_attr}"
-            if dedup_key in seen_raws:
+            # Two ``import('./m')`` calls share their text but not the names
+            # each one binds.
+            if language in _TS_JS_LANGUAGES and _is_dynamic_esm_import(stmt_node):
+                dedup_key = f"{raw}|at={stmt_node.start_byte}"
+            kind = import_load_kind(stmt_node, language, src)
+            if dedup_key in seen_imports:
+                # A lazy copy must not hide a load-time twin: runtime wins.
+                for imp in seen_imports[dedup_key]:
+                    imp.type_only, imp.deferred = combine_load_kinds(
+                        (imp.type_only, imp.deferred), kind
+                    )
                 continue
-            seen_raws.add(dedup_key)
+            seen_imports[dedup_key] = []
 
             module_text = _node_text(module_nodes[0], src).strip().strip("\"'` ")
             if not module_text:
                 continue
 
-            imports.extend(
-                _statement_imports(stmt_node, module_nodes[0], module_text, raw, language, src)
-            )
+            found = _statement_imports(stmt_node, module_nodes[0], module_text, raw, language, src)
+            for imp in found:
+                imp.type_only, imp.deferred = kind
+            seen_imports[dedup_key] = found
+            imports.extend(found)
 
         if language == "python":
             imports = expand_bare_relative_imports(imports)
@@ -1991,6 +2070,11 @@ class ASTParser:
                             else "calls"
                         ),
                         supplied_props=_jsx_supplied_props(site_node, src),
+                        # Ceiling: schedulers matched by name, the task followed
+                        # within its own function only (see ``python_tasks``).
+                        spawned=(
+                            file_info.language == "python" and is_fire_and_forget(site_node, src)
+                        ),
                     ),
                 )
             )
@@ -2002,6 +2086,7 @@ class ASTParser:
         file_info: FileInfo,
         src: str,
         symbols: list[Symbol],
+        imports: list[Import],
     ) -> list[CallSite]:
         """Extract sites that name a function without calling it.
 
@@ -2011,6 +2096,8 @@ class ASTParser:
         initialiser, and a ``::`` callable reference. Each leaves the named
         function with no inbound edge, which read as a ``safe_to_delete``
         unused export and took out whole handler and interop layers (#1602).
+        TS/JS and Python capture any value position: an argument, a list or
+        object entry, a return, an assignment and a default export.
 
         ``@reference.receiver`` is optional; capturing it is what lets
         ``_add_reference_edges`` restrict a bare name to free functions and
@@ -2045,6 +2132,7 @@ class ASTParser:
             key=lambda t: (t[0], -t[1]),
         )
         callable_ids = {s.id for s in symbols if s.kind in ("function", "method")}
+        bindable = _bare_reference_names(file_info.language, symbols, imports)
 
         references: list[CallSite] = []
         seen: set[tuple[int, str, str | None]] = set()
@@ -2074,6 +2162,8 @@ class ASTParser:
             for name_node, is_table in candidates:
                 name = _node_text(name_node, src).strip()
                 if not name or name in builtins:
+                    continue
+                if bindable is not None and receiver is None and name not in bindable:
                     continue
                 line = name_node.start_point[0] + 1
                 enclosing = _find_enclosing_symbol(line, symbol_ranges)
@@ -2174,6 +2264,26 @@ class ASTParser:
 # ---------------------------------------------------------------------------
 
 _DEFAULT_PARSER: ASTParser | None = None
+
+
+def _python_module_facts(
+    src: str, symbols: list[Symbol]
+) -> tuple[frozenset[str], frozenset[str]]:
+    """``(local_refs, registrars)`` for a Python module, from one ``ast`` parse.
+
+    See ``python_local_refs`` and ``python_registrars``.
+    """
+    top_level_names = {s.name for s in symbols if s.name and not s.parent_name}
+    tree = parse_python_module(src) if top_level_names else None
+    if tree is None:
+        return frozenset(), frozenset()
+    nested_classes = {
+        (s.parent_name, s.name) for s in symbols if s.kind == "class" and s.parent_name
+    }
+    return (
+        local_refs_from_tree(tree, top_level_names, nested_classes),
+        registering_functions(tree),
+    )
 
 
 def parse_file(file_info: FileInfo, source: bytes) -> ParsedFile:

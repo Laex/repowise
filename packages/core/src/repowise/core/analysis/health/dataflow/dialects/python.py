@@ -3,11 +3,13 @@
 Classifies each identifier in a statement as a write (def) or a read (use).
 Python's write sites are: assignment LHS (``x = ...``), augmented-assignment LHS
 (``x += ...`` -- both read and write), tuple/list unpacking (``a, b = ...``),
-the walrus operator (``(x := ...)``), ``for`` targets (statement and
-comprehension), and ``with ... as`` aliases. Attribute and subscript targets
-(``obj.attr = ...`` / ``arr[i] = ...``) bind no *local* variable, so their base
-identifiers are reads, not defs -- the precision-first choice that keeps reaching
-definitions sound for the locals they actually track.
+the walrus operator (``(x := ...)``), ``for`` targets, and ``with ... as``
+aliases. A comprehension's ``for`` targets are scoped to the comprehension
+(Python 3), so they are neither the function's writes nor its reads.
+Attribute and subscript targets (``obj.attr = ...`` / ``arr[i] = ...``) bind
+no *local* variable, so their base identifiers are reads, not defs -- the
+precision-first choice that keeps reaching definitions sound for the locals
+they actually track.
 
 All grammar specifics live here; the core (``defuse.py`` / ``reaching.py``) and
 the reaching-definitions fixpoint are language-agnostic.
@@ -15,9 +17,19 @@ the reaching-definitions fixpoint are language-agnostic.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
-from .base import BaseDefUseDialect, Occurrence, StatementDefUse
+from .base import (
+    NO_RECEIVER,
+    BaseDefUseDialect,
+    Captured,
+    HandlerHead,
+    Occurrence,
+    Receiver,
+    StatementDefUse,
+    node_text,
+)
 
 if TYPE_CHECKING:
     from tree_sitter import Node
@@ -40,15 +52,26 @@ _SPLAT_TARGETS = frozenset({"list_splat_pattern", "dictionary_splat_pattern", "l
 _SUBSCRIPT_KINDS = frozenset({"subscript"})
 # Nested scopes whose identifiers belong to a different function.
 _SCOPE_BOUNDARIES = frozenset({"lambda", "function_definition", "async_function_definition"})
+_COMPREHENSIONS = frozenset(
+    {"list_comprehension", "set_comprehension", "dictionary_comprehension", "generator_expression"}
+)
+# A module path is not a read; an import writes only the names it binds.
+_IMPORT_KINDS = frozenset({"import_statement", "import_from_statement"})
 
 
 class PythonDefUseDialect(BaseDefUseDialect):
     language = "python"
     member_access_kinds = frozenset({"attribute"})
+    receiver_write_kinds = _ASSIGN_KINDS | _AUG_KINDS
+    type_holder_kinds = frozenset({"typed_parameter", "typed_default_parameter", "assignment"})
     keyword_kinds = frozenset({"keyword_argument"})
 
     # A nested ``def`` is visible in the enclosing scope from its statement on.
     enclosing_binder_kinds = frozenset({"function_definition", "async_function_definition"})
+    # Assignment makes a closure-local name; only ``nonlocal`` / ``global``
+    # reach out of a nested scope.
+    closure_writes_outer = False
+    outer_decl_kinds = frozenset({"nonlocal_statement", "global_statement"})
 
     def _is_scope_boundary(self, node: Node) -> bool:
         return node.type in _SCOPE_BOUNDARIES
@@ -76,6 +99,49 @@ class PythonDefUseDialect(BaseDefUseDialect):
             if name_node is not None:
                 out.append(self._occ(name_node))
         return tuple(out)
+
+    def handler_def_use(self, handler: Node) -> StatementDefUse:
+        """``except E as e:`` reads ``E`` and binds ``e``: the same ``value``
+        field shape as a ``with`` item. Python unbinds ``e`` when the handler
+        ends; that is not modelled, so a later read of ``e`` (an error in the
+        original too) sees this binding and a span holding it takes ``e`` in."""
+        defs: list[Occurrence] = []
+        uses: list[Occurrence] = []
+        self._with_item(handler, defs, uses)
+        return StatementDefUse(defs=tuple(defs), uses=tuple(uses))
+
+    def handler_head(self, handler: Node) -> HandlerHead:
+        """``except (A, b.C) as e:`` names ``A`` and ``b.C`` and binds ``e``;
+        a bare ``except:`` catches everything."""
+        value = handler.child_by_field_name("value")
+        if value is None:
+            return None, None
+        alias = None
+        if value.type == "as_pattern":
+            alias = value.child_by_field_name("alias")
+            value = value.named_children[0]
+        grouped = value.type in ("tuple", "parenthesized_expression")
+        names = value.named_children if grouped else [value]
+        return tuple(node_text(n) for n in names), node_text(alias) if alias else None
+
+    def _own_receiver(self, fn_node: Node, lmap: LanguageNodeMap) -> Receiver | None:
+        """A method's first parameter when it is ``self`` / ``cls`` and the
+        function sits in a class body; a nested function reaches ``self`` as a
+        captured name instead, which is already one of its parameters. A
+        ``@staticmethod``'s first parameter is an ordinary argument."""
+        params = self.parameter_defs(fn_node)
+        if not params or params[0].name not in lmap.self_identifiers:
+            return NO_RECEIVER
+        holder = fn_node.parent
+        if holder is not None and holder.type in lmap.decorated_definition_kinds:
+            decorators = (c.text for c in holder.children if c.type in lmap.decorator_kinds)
+            if any(text and text.strip().endswith(b"staticmethod") for text in decorators):
+                return NO_RECEIVER
+            holder = holder.parent
+        owner = holder.parent if holder is not None else None
+        if owner is None or owner.type not in lmap.class_kinds:
+            return NO_RECEIVER
+        return self._receiver(frozenset({params[0].name}))
 
     # -- head (compound construct condition / loop clause) --------------------
 
@@ -128,12 +194,23 @@ class PythonDefUseDialect(BaseDefUseDialect):
             self._targets(node.child_by_field_name("name"), defs, uses)
             self._process(node.child_by_field_name("value"), defs, uses)
             return
-        if t == "for_in_clause":  # comprehension ``for <target> in <iter>``
-            self._targets(node.child_by_field_name("left"), defs, uses)
-            self._process(node.child_by_field_name("right"), defs, uses)
+        if t in _COMPREHENSIONS:
+            self._comprehension(node, defs, uses)
+            return
+        if t in _IMPORT_KINDS:
+            self._import_binds(node, defs)
+            return
+        if t == "future_import_statement":
             return
         if t == "with_item":
             self._with_item(node, defs, uses)
+            return
+        if t == "except_clause":  # a nested scope's handler, walked whole
+            self._with_item(node, defs, uses)
+            value = node.child_by_field_name("value")
+            for child in node.named_children:
+                if value is None or child.id != value.id:
+                    self._process(child, defs, uses)
             return
         if t in self.member_access_kinds:
             self.collect_reads(node, uses)  # receiver is a read; member is not
@@ -149,6 +226,59 @@ class PythonDefUseDialect(BaseDefUseDialect):
             return
         for child in node.named_children:
             self._process(child, defs, uses)
+
+    def _import_binds(self, node: Node, defs: list[Occurrence]) -> None:
+        """``import a.b`` binds ``a``, ``... as c`` binds ``c``, ``from m
+        import n`` binds ``n``; a ``*`` import binds nothing it names."""
+        start = len(defs)
+        for i, child in enumerate(node.children):
+            if node.field_name_for_child(i) != "name":
+                continue
+            bound = child.child_by_field_name("alias") or child
+            if bound.type == "dotted_name" and bound.named_children:
+                bound = bound.named_children[0]
+            if bound.type in self.identifier_kinds:
+                defs.append(replace(self._occ(bound), imports=True))
+        self._declare(defs, start, node, binds=False)
+
+    def _comprehension(self, node: Node, defs: list[Occurrence], uses: list[Occurrence]) -> None:
+        """Only the first iterable runs in the enclosing scope; every other read
+        of a name a ``for`` clause binds is the comprehension's own, nested
+        comprehensions and closures included (``[lambda: v for v in xs]``
+        reads no outer ``v``; see :meth:`collect_captured`). A walrus inside
+        still writes the enclosing scope (PEP 572)."""
+        first_iterable, rest = _split_first_iterable(node)
+        outer: list[Occurrence] = []
+        inner: list[Occurrence] = []
+        self._process(first_iterable, defs, outer)
+        for child in rest:
+            self._process(child, defs, inner)
+        bound = self._comprehension_binders(node)
+        kept = [*outer, *(u for u in inner if u.name not in bound)]
+        uses.extend(sorted(kept, key=lambda u: (u.line, u.column)))
+
+    def _comprehension_binders(self, node: Node) -> set[str]:
+        binders: list[Occurrence] = []
+        for child in node.named_children:
+            if child.type == "for_in_clause":
+                self._targets(child.child_by_field_name("left"), binders, [])
+        return {b.name for b in binders}
+
+    def collect_captured(self, node: Node | None, out: Captured, lmap: LanguageNodeMap) -> None:
+        """Like the base, but a closure inside a comprehension reading one of
+        its binders reads the comprehension's name, not the function's."""
+        if node is None or node.type not in _COMPREHENSIONS:
+            super().collect_captured(node, out, lmap)
+            return
+        first_iterable, rest = _split_first_iterable(node)
+        self.collect_captured(first_iterable, out, lmap)
+        inner = Captured()
+        for child in rest:
+            self.collect_captured(child, inner, lmap)
+        bound = self._comprehension_binders(node)
+        out.reads.extend(o for o in inner.reads if o.name not in bound)
+        out.shared.extend(o for o in inner.shared if o.name not in bound)
+        out.writes.extend(o for o in inner.writes if o.name not in bound)
 
     def _with_item(self, node: Node, defs: list[Occurrence], uses: list[Occurrence]) -> None:
         value = node.child_by_field_name("value")
@@ -199,11 +329,32 @@ class PythonDefUseDialect(BaseDefUseDialect):
         named = node.child_by_field_name("name")
         if named is not None and named.type in self.identifier_kinds:
             return named
-        # typed_parameter / splat: first identifier descendant.
+        # typed_parameter / splat: first identifier descendant (``**kw: Any``
+        # nests the splat in the typed parameter).
         for child in node.named_children:
             if child.type in self.identifier_kinds:
                 return child
+            if child.type in _SPLAT_TARGETS:
+                return self._param_name_node(child)
         return None
+
+
+def _split_first_iterable(node: Node) -> tuple[Node | None, list[Node]]:
+    """A comprehension's first iterable (evaluated in the enclosing scope) and
+    every other part to walk: the body, later ``for`` clauses' iterables, the
+    ``if`` filters. ``for`` targets are left out; they bind, not read."""
+    first: Node | None = None
+    rest: list[Node] = []
+    for child in node.named_children:
+        if child.type != "for_in_clause":
+            rest.append(child)
+            continue
+        right = child.child_by_field_name("right")
+        if first is None:
+            first = right
+        elif right is not None:
+            rest.append(right)
+    return first, rest
 
 
 DIALECT = PythonDefUseDialect()

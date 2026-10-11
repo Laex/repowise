@@ -53,6 +53,13 @@ async def _seed(session) -> str:
                       committed_at=ANCHOR - timedelta(days=2), subject="feat: build step"),
             GitCommit(repository_id=rid, sha="older", author_name="Cy", author_email="cy@x.io",
                       committed_at=ANCHOR - timedelta(days=20), subject="fix: things"),
+            # Older history, outside every window: enough commits to rank by.
+            *(
+                GitCommit(repository_id=rid, sha=f"old{i}", author_name="Ada",
+                          author_email="ada@x.io", committed_at=ANCHOR - timedelta(days=200 + i),
+                          subject="chore: old")
+                for i in range(2)
+            ),
         ]
     )
     add([GitCommitFile(repository_id=rid, sha="older", file_path="src/old.py")])
@@ -292,3 +299,93 @@ async def test_coverage_state_reads_the_ingest_record(async_session) -> None:
     # The row's sha sorts after "head", which `max()` over rows would have picked.
     assert (state.status, state.partial, state.files_measured) == ("measured", True, 1)
     assert (await _coverage(async_session, rid, "newer"))["coverage"].status == "stale"
+
+
+async def test_a_test_reaching_through_a_helper_turns_add_tests_into_simplify(async_session) -> None:
+    """openclaw's attempt.ts: tests load it through a support module two imports away."""
+    from repowise.core.analysis.test_reachability import clear_test_map_cache
+    from repowise.core.persistence.crud.analysis.actions import load_repo_facts
+    from repowise.core.persistence.models import GraphEdge, GraphNode
+
+    rid = await _seed(async_session)
+    facts = await load_repo_facts(async_session, rid)
+    assert facts.history_commits == 5
+    assert facts.files["src/core.py"].tests_reaching == 0
+
+    for path, is_test in (
+        ("src/core.py", False),
+        ("src/core.test-support.py", False),
+        ("tests/test_core.py", True),
+    ):
+        async_session.add(
+            GraphNode(repository_id=rid, node_id=path, node_type="file", is_test=is_test)
+        )
+    for src, dst in (
+        ("tests/test_core.py", "src/core.test-support.py"),
+        ("src/core.test-support.py", "src/core.py"),
+    ):
+        async_session.add(
+            GraphEdge(repository_id=rid, source_node_id=src, target_node_id=dst, edge_type="imports")
+        )
+    await async_session.commit()
+    # The graph changed without an index run, which is what moves the cache stamp.
+    clear_test_map_cache()
+
+    facts = await load_repo_facts(async_session, rid)
+    core = facts.files["src/core.py"]
+    assert (core.tests_reaching, core.tests_reaching_via) == (1, "import-graph")
+
+    # Once production code imports the middle file it is a hub, not test
+    # support, and the second hop no longer counts.
+    async_session.add(GraphNode(repository_id=rid, node_id="src/app.py", node_type="file"))
+    async_session.add(
+        GraphEdge(repository_id=rid, source_node_id="src/app.py",
+                  target_node_id="src/core.test-support.py", edge_type="imports")
+    )
+    await async_session.commit()
+    clear_test_map_cache()
+    facts = await load_repo_facts(async_session, rid)
+    assert facts.files["src/core.py"].tests_reaching == 0
+
+
+async def test_a_failed_test_map_walk_is_unknown_not_zero(async_session, monkeypatch) -> None:
+    from repowise.core.persistence.crud.analysis import actions as loader
+
+    rid = await _seed(async_session)
+
+    async def broken(*_a, **_k):
+        raise RuntimeError("graph_edges unreadable")
+
+    monkeypatch.setattr(loader, "any_tests_reaching", broken)
+    facts = await loader.load_repo_facts(async_session, rid)
+    assert "test_map" in facts.unavailable
+    assert facts.files["src/core.py"].tests_reaching is None
+
+
+async def test_an_index_without_git_has_no_history_count(async_session) -> None:
+    from repowise.core.persistence.crud.analysis.actions import load_repo_facts
+
+    rid = await _seed(async_session)
+    await async_session.execute(text("DELETE FROM git_commits"))
+    await async_session.commit()
+    assert (await load_repo_facts(async_session, rid)).history_commits == 0
+
+    await async_session.execute(text("DELETE FROM git_metadata"))
+    await async_session.commit()
+    facts = await load_repo_facts(async_session, rid)
+    assert facts.history_commits is None
+
+
+async def test_a_one_commit_index_is_flagged_and_history_rules_stand_down(async_session) -> None:
+    rid = await _seed(async_session)
+    await async_session.execute(text("DELETE FROM git_commits WHERE sha != 'head'"))
+    await async_session.commit()
+
+    view = await load_actions_view(async_session, rid, now=NOW)
+    assert view["context"]["history_too_short"] is True
+    status = {r["rule"]: (r["status"], r["reason"]) for r in view["rules"]}
+    for rule in ("fragile_file", "fix_concentration", "knowledge_loss"):
+        assert status[rule][0] == "not_applicable"
+        assert "too few commits" in status[rule][1]
+    # Rules that do not rank by history still run.
+    assert status["live_secret"][0] == "evaluated"

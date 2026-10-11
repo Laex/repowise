@@ -100,6 +100,32 @@ class TestScanFile:
         assert findings == []
 
     @pytest.mark.parametrize(
+        "allowed",
+        [
+            'password = "actualcredential123"  # pragma: allowlist secret\n',
+            '# pragma: allowlist nextline secret\npassword = "actualcredential123"\n',
+        ],
+    )
+    def test_detect_secrets_pragmas_exclude_findings_before_storage(self, allowed: str) -> None:
+        source = allowed + 'password = "anothercredential456"\n'
+        findings = scan_source("config.py", source)
+        assert [(f["kind"], f["line"]) for f in findings] == [
+            ("hardcoded_password", len(allowed.splitlines()) + 1)
+        ]
+
+    def test_detect_secrets_pragma_inside_a_string_does_not_allowlist(self) -> None:
+        source = 'password = "actualcredential123 # pragma: allowlist secret"\n'
+        assert [(f["kind"], f["line"]) for f in scan_source("config.py", source)] == [
+            ("hardcoded_password", 1)
+        ]
+
+    def test_detect_secrets_pragma_does_not_hide_non_secret_calls(self) -> None:
+        source = 'password = "actualcredential123"; eval(payload)  # pragma: allowlist secret\n'
+        assert [(f["kind"], f["line"]) for f in scan_source("config.py", source)] == [
+            ("eval_call", 1)
+        ]
+
+    @pytest.mark.parametrize(
         ("source", "expected"),
         [
             ("eval(payload)\n", {"eval_call"}),
@@ -826,6 +852,9 @@ class TestScanSource:
                     "slack_token",
                     "google_api_key",
                     "stripe_key",
+                    "gitlab_token",
+                    "azure_devops_pat",
+                    "git_url_credentials",
                     "private_key_pem",
                 }
             )
@@ -903,11 +932,22 @@ class TestEverySnippetIsMasked:
     def test_a_repeated_value_masks_in_linear_time(self) -> None:
         import time
 
-        line = " ".join(f'password = "{self.PW}";' for _ in range(5000))
-        started = time.perf_counter()
-        (hit,) = scan_source("a.py", line + "\n")
-        assert time.perf_counter() - started < 1.0
-        _assert_no_raw(hit["snippet"], self.PW)
+        sources = [
+            " ".join(f'password = "{self.PW}";' for _ in range(count)) + "\n"
+            for count in (2500, 10000)
+        ]
+        timings: list[list[float]] = [[], []]
+        # Alternate sizes and take the best of three runs to reduce scheduling noise.
+        for _ in range(3):
+            for source, samples in zip(sources, timings, strict=True):
+                started = time.perf_counter()
+                (hit,) = scan_source("a.py", source)
+                samples.append(time.perf_counter() - started)
+                _assert_no_raw(hit["snippet"], self.PW)
+
+        small, large = (min(samples) for samples in timings)
+        # A 4x input should take about 4x as long, not the 16x of quadratic work.
+        assert large < 8 * small, f"4x input took {large / small:.2f}x as long"
 
     def test_long_github_pat_straddling_the_cut_is_masked(self) -> None:
         pat = "github_pat_" + "".join(chr(ord("A") + (i * 7) % 26) for i in range(82))
@@ -993,6 +1033,143 @@ class TestVendorShapeEdges:
             assert "google_api_key" not in self._kinds(source, "package-lock.json")
 
 
+# Built from parts so no complete token sits in one literal for push protection.
+_BODY = "0123456789abcdefghij"
+_GLPAT = "glpat" + "-" + _BODY
+_AZDO_PAT = "0123456789ABCDEFGHIJ" * 3 + _BODY[:16] + "AZDO" + "0123"
+
+
+class TestForgeSecretShapes:
+    """GitLab and Azure DevOps tokens, and credentials embedded in URLs."""
+
+    @staticmethod
+    def _kinds(source: str, path: str = "config.py") -> list[str]:
+        return [f["kind"] for f in scan_source(path, source)]
+
+    @pytest.mark.parametrize(
+        "token",
+        [
+            _GLPAT,
+            # The routable form: a longer payload, then a version and checksum.
+            "glpat" + "-" + _BODY + "_ABCDEFG" + ".01" + "2abcdef",
+            "gldt" + "-" + _BODY,
+            "glrt" + "-" + _BODY,
+            "glptt" + "-" + "0123456789abcdef" * 2 + "01234567",
+            "gloas" + "-" + _BODY * 4,
+            "glimt" + "-" + _BODY + "ABCDE",
+            "glcbt" + "-" + "64" + "_" + _BODY,
+            "GR1348941" + _BODY,
+        ],
+    )
+    def test_gitlab_tokens_fire(self, token: str) -> None:
+        assert self._kinds(f'client = Gitlab(url, "{token}")\n') == ["gitlab_token"]
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            'tok = "glpat' + '-0123456789"\n',  # too short
+            'tok = "myglpat-' + _BODY + '"\n',  # inside a longer word
+            'tok = "glptt-' + _BODY * 2 + '"\n',  # trigger tokens are hex
+            'tok = "glpat-' + "xxxx" + _BODY + '"\n',  # placeholder
+        ],
+    )
+    def test_gitlab_lookalikes_do_not_fire(self, source: str) -> None:
+        assert "gitlab_token" not in self._kinds(source)
+
+    def test_azure_devops_pat_fires_on_shape_alone(self) -> None:
+        assert len(_AZDO_PAT) == 84
+        assert self._kinds(f'auth = ("", "{_AZDO_PAT}")\n') == ["azure_devops_pat"]
+
+    def test_azure_devops_signature_must_sit_at_its_offset(self) -> None:
+        shifted = "A" + _AZDO_PAT[:-1]
+        assert "azure_devops_pat" not in self._kinds(f'auth = ("", "{shifted}")\n')
+
+    def test_legacy_azure_pat_needs_a_key_name(self) -> None:
+        legacy = "abcdefghijklmnopqrstuvwxyz234567" + "abcdefghijklmnopqrst"
+        assert self._kinds(f'auth = ("", "{legacy}")\n') == []
+        assert self._kinds(f'AZURE_DEVOPS_TOKEN = "{legacy}"\n') == ["hardcoded_secret"]
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://deploy:S3cr3t-Pa55w0rd@gitlab.internal/group/repo.git",
+            "https://ci:Zq8vT2mLw9@github.com/owner/repo",
+            "https://ci:Zq8vT2mLw9@GitLab.com:443/o/r",
+            "git+https://ci:Zq8vT2mLw9@bitbucket.org/o/r",
+            "https://org:Zq8vT2mLw9@dev.azure.com/org/p/_git/r",
+            "https://org:Zq8vT2mLw9@org.visualstudio.com/p/_git/r",
+            "ssh://ci:Zq8vT2mLw9@git.internal:2222/o/r.git",
+            "http://ci:Zq8vT2mLw9@10.0.0.5/o/r.git/info/refs",
+        ],
+    )
+    def test_git_remote_credentials_fire(self, url: str) -> None:
+        hits = [f for f in scan_source("settings.py", f'DB = "{url}"\n')]
+        assert [f["kind"] for f in hits] == ["git_url_credentials"]
+        password = url.split("://")[1].split("@")[0].split(":")[1]
+        _assert_no_raw(hits[0]["snippet"], password)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "git@github.com:owner/repo.git",
+            "ssh://git@github.com/owner/repo.git",
+            "ssh://git@gitlab.com:22/owner/repo.git",
+            "https://user:password@host.com/repo.git",
+            "https://USERNAME:PASSWORD@host.com/repo.git",
+            "https://oauth2:${GITLAB_TOKEN}@gitlab.com/o/r.git",
+            "https://oauth2:$CI_JOB_TOKEN@gitlab.com/o/r.git",
+            "https://user:%AZURE_PAT%@dev.azure.com/org/p/_git/r",
+            "https://user:<token>@host.com/repo.git",
+            "https://user:********@host.com/repo.git",
+            "https://user:your_token_here@host.com/repo.git",
+            "postgres://postgres:postgres@localhost:5432/db",
+            # Not a git remote: connection strings and plain web URLs.
+            "postgres://app:Zq8vT2mLw9@db.internal:5432/app",
+            "amqp://svc:k9Rt2xVb7Lp@[::1]:5672/",
+            "redis://default:Zq8vT2mLw9@cache.internal:6379",
+            "https://ci:Zq8vT2mLw9@api.internal/v1/items",
+            "https://ci:Zq8vT2mLw9@github.company.com/o/r",
+            # Local and documentation hosts.
+            "https://ci:Zq8vT2mLw9@localhost/o/r.git",
+            "https://ci:Zq8vT2mLw9@127.0.0.1:3000/o/r.git",
+            "https://ci:Zq8vT2mLw9@git.example.com/o/r.git",
+            "https://ci:Zq8vT2mLw9@gitea.local/o/r.git",
+            # Words, not tokens.
+            "https://ci:deploykey@github.com/o/r",
+            "https://ci:Sunshine@github.com/o/r",
+            "https://ci:abcdefghijkl@github.com/o/r",
+            "https://user:pass1234@github.com/o/r.git",
+            "https://user:glpat-notreal@gitlab.com/g/p.git",
+            # A constant's name stands in for the token in docs.
+            "https://USERNAME:PERSONAL_ACCESS_TOKEN@dev.azure.com/org/proj/_git/repo",
+            "https://host.com/path:abcdefgh12@other",
+        ],
+    )
+    def test_non_remotes_placeholders_and_ssh_do_not_fire(self, url: str) -> None:
+        assert "git_url_credentials" not in self._kinds(f'REMOTE = "{url}"\n')
+
+    def test_token_in_a_url_is_one_finding_named_by_its_vendor(self) -> None:
+        source = f'token = "https://oauth2:{_GLPAT}@gitlab.com/o/r.git"\n'
+        (hit,) = scan_source("ci.py", source)
+        assert hit["kind"] == "gitlab_token"
+        _assert_no_raw(hit["snippet"], _GLPAT)
+
+    @pytest.mark.parametrize(
+        ("source", "kind"),
+        [
+            ('password = "https://ci:Xk29fjQ81z@gitlab.com/o/r.git"\n', "hardcoded_password"),
+            ('API_KEY = "https://svc:Xk29fjQ81z@github.com/o/r"\n', "hardcoded_secret"),
+        ],
+    )
+    def test_keyword_named_url_credential_keeps_its_kind(self, source: str, kind: str) -> None:
+        # Baselines key on kind, so a finding that predates git_url_credentials must not move.
+        assert self._kinds(source) == [kind]
+
+    def test_url_credentials_in_prose_fire(self) -> None:
+        source = "Clone with `git clone https://ci:Zq8vT2mLw9@git.internal/r.git`.\n"
+        assert self._kinds(source, "README.md") == ["git_url_credentials"]
+
+
 class TestCallKindsIgnoreProseAndText:
     """pickle.loads / os.system / shell=True only count as code, not as text."""
 
@@ -1054,6 +1231,9 @@ class TestSecretPrecision:
             ("README.md", 'export OPENAI_API_KEY="your-key-here"\n'),
             ("README.md", 'API_KEY="sk-<your key>"\n'),
             ("README.md", 'SECRET="$(op read op://vault/app/secret)"\n'),
+            ("deploy.sh", 'TOKEN="$(kubectl get secret app -o jsonpath=\x27{.data.t}\x27 | base64 -d)"\n'),
+            ("src/app.py", 'API_KEY = "prefix-${VAR}-suffix"\n'),
+            ("src/app.py", 'TOKEN = "prefix-{{var}}-suffix"\n'),
             ("src/app.py", 'TOKEN = "xxxxxxxxxxxx"\n'),
         ],
     )
@@ -1072,6 +1252,35 @@ class TestSecretPrecision:
     )
     def test_dummy_values_are_not_secrets(self, source: str) -> None:
         assert self._kinds(source, "src/client.tsx") == set()
+
+    @pytest.mark.parametrize(
+        ("path", "source"),
+        [
+            ("src/Conn.kt", 'const val DISCOVERY_TOKEN = "discoveryToken"\n'),
+            ("src/Conn.kt", 'const val KEY_STORE_PASSWORD = "keystorePassword"\n'),
+            ("src/tokens.ts", "export const LANGUAGE_SERVER_WS_ADDRESS_TOKEN = 'LANGUAGE_SERVER_WS_ADDRESS_TOKEN';\n"),
+            ("src/AuthScheme.kt", 'const val MASKED_PASSWORD = "**************"\n'),
+            ("src/Auth.kt", 'val bearerToken = "Bearer ${auth.token.tokenValue}"\n'),
+            ("src/auth.ts", 'const token = "Basic ${btoa(user)}";\n'),
+            ("README.md", '--spring.datasource.password="DB PASSWORD"\n'),
+            ("README.md", 'DB_PASSWORD="YOUR DB PASSWORD"\n'),
+        ],
+    )
+    def test_additional_placeholders_are_not_secrets(self, path: str, source: str) -> None:
+        assert self._kinds(source, path) == set()
+
+    @pytest.mark.parametrize(
+        ("source", "kind"),
+        [
+            ('TOKEN = "xQzRmWpLkVnBtYcH"\n', "hardcoded_secret"),
+            ('TOKEN = "Bearer eyJhbGciOiJIUzI1NiJ9abc"\n', "hardcoded_secret"),
+            ('const val API_TOKEN = "productionAccessKey"\n', "hardcoded_secret"),
+            ('password="Tr0ub4dor 3xyz"\n', "hardcoded_password"),
+            ('password = "plain$password123"\n', "hardcoded_password"),
+        ],
+    )
+    def test_credential_like_values_still_fire(self, source: str, kind: str) -> None:
+        assert self._kinds(source) == {kind}
 
     @pytest.mark.parametrize(
         "source",

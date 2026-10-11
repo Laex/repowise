@@ -20,6 +20,8 @@ from typing import Any
 
 import structlog
 
+from repowise.core.forges import detect_forge
+
 from ._constants import (
     _DEEP_WALK_COMMIT_LIMIT,
     _DEEP_WALK_MIN_FALLBACK,
@@ -44,6 +46,23 @@ from .records import (
     capture_repo_totals,
 )
 from .tiers import GitIndexTier
+
+# Silence GitPython's _CatFileContentStream.__del__ ValueError spam.
+# When git cat-file streams are GC'd after the subprocess pipe is closed,
+# their __del__ tries to drain remaining bytes and hits a closed file.
+# This is harmless but floods stderr with tracebacks.
+try:
+    from git.cmd import _CatFileContentStream
+
+    _orig_del = _CatFileContentStream.__del__
+
+    def _quiet_del(self: Any) -> None:
+        with contextlib.suppress(ValueError, OSError):
+            _orig_del(self)
+
+    _CatFileContentStream.__del__ = _quiet_del  # type: ignore[assignment]
+except Exception:
+    pass  # git not installed — nothing to patch
 
 logger = structlog.get_logger(__name__)
 
@@ -187,6 +206,8 @@ class GitIndexer:
         # naming files the repo excludes, and those rows outlive every prune.
         self.record_episodes = record_episodes
         self.max_workers = max_workers
+        # Read once: which forge's merge messages name a commit's PR or MR.
+        self.forge = detect_forge(self.repo_path)
 
         import pathspec
 
@@ -333,6 +354,7 @@ class GitIndexer:
                     thread_repo,
                     file_path,
                     repo_path=self.repo_path,
+                    forge=self.forge,
                     commit_limit=self.commit_limit,
                     follow_renames=self.follow_renames,
                     include_blame=include_blame,
@@ -689,6 +711,7 @@ class GitIndexer:
                     thread_repo,
                     file_path,
                     repo_path=self.repo_path,
+                    forge=self.forge,
                     commit_limit=self.commit_limit,
                     follow_renames=self.follow_renames,
                     include_blame=include_blame,
@@ -873,6 +896,7 @@ class GitIndexer:
                 repo,
                 fp,
                 repo_path=self.repo_path,
+                forge=self.forge,
                 commit_limit=self.commit_limit,
                 follow_renames=self.follow_renames,
                 include_blame=False,
@@ -1362,6 +1386,7 @@ class GitIndexer:
             repo,
             file_path,
             repo_path=self.repo_path,
+            forge=self.forge,
             commit_limit=self.commit_limit,
             follow_renames=self.follow_renames,
             include_blame=self.tier.includes_blame,

@@ -8,7 +8,8 @@ increment / decrement (``x++`` is a read-modify-write), and the loop variables o
 a ``range`` clause. Selector targets (``obj.field = ...``) and index targets
 (``arr[i] = ...``) bind no *local*, so their base identifiers are reads -- the
 precision-first choice that keeps reaching definitions sound for the locals they
-actually track. The method ``receiver`` (``func (s *Server) m()``) is seeded as a
+actually track. The base is a write as well where the variable holds the value
+itself, a struct or an array, which Go copies (:func:`written_value`). The method ``receiver`` (``func (s *Server) m()``) is seeded as a
 parameter so a span that reads it infers it as an IN.
 
 A Go ``block`` nests its statements in a ``statement_list``; the CFG builder
@@ -19,7 +20,15 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from .base import BaseDefUseDialect, Occurrence, StatementDefUse
+from .base import (
+    NO_RECEIVER,
+    BaseDefUseDialect,
+    Occurrence,
+    Receiver,
+    StatementDefUse,
+    node_text,
+)
+from .go_values import written_value
 
 if TYPE_CHECKING:
     from tree_sitter import Node
@@ -45,6 +54,8 @@ _SCOPE_BOUNDARIES = frozenset({"func_literal"})
 class GoDefUseDialect(BaseDefUseDialect):
     language = "go"
     member_access_kinds = frozenset({"selector_expression"})
+    receiver_write_kinds = _ASSIGN_KINDS | _INC_DEC_KINDS
+    type_holder_kinds = frozenset({"parameter_declaration", "var_spec"})
     keyword_kinds = frozenset()  # Go has no keyword arguments.
 
     def _is_scope_boundary(self, node: Node) -> bool:
@@ -79,6 +90,23 @@ class GoDefUseDialect(BaseDefUseDialect):
                         out.append(self._occ(child))
         return tuple(out)
 
+    def receiver_decl(self, fn_node: Node) -> str | None:
+        """The method's receiver list, ``(s *S)``, which a helper method repeats."""
+        plist = fn_node.child_by_field_name("receiver")
+        return node_text(plist) if plist is not None else None
+
+    def _own_receiver(self, fn_node: Node, lmap: LanguageNodeMap) -> Receiver | None:
+        """The method receiver's own name; a value receiver (``s T``, not
+        ``s *T``) is a copy. An unnamed receiver is unreachable from the body."""
+        plist = fn_node.child_by_field_name("receiver")
+        decl = plist.named_children[0] if plist is not None and plist.named_children else None
+        name = decl.child_by_field_name("name") if decl is not None else None
+        if name is None or not name.text or name.text == b"_":
+            return NO_RECEIVER
+        kind = decl.child_by_field_name("type")
+        copy = kind is not None and kind.type != "pointer_type"
+        return self._receiver(frozenset({name.text.decode("utf-8", "replace")}), copy=copy)
+
     # -- head (loop clause / if condition) ------------------------------------
 
     def _head(
@@ -86,23 +114,30 @@ class GoDefUseDialect(BaseDefUseDialect):
     ) -> None:
         if node.type in lmap.loop_kinds:  # for_statement: range / clause / cond
             for child in node.named_children:
-                t = child.type
-                if t in lmap.block_kinds:
-                    continue  # the body lives in successor blocks
-                if t == _RANGE_CLAUSE:
-                    self._targets(child.child_by_field_name("left"), defs, uses)
-                    self._process(child.child_by_field_name("right"), defs, uses)
-                elif t == _FOR_CLAUSE:
-                    self._process(child.child_by_field_name("initializer"), defs, uses)
-                    self._process(child.child_by_field_name("condition"), defs, uses)
-                    self._process(child.child_by_field_name("update"), defs, uses)
-                else:  # bare condition (while-style ``for cond {}``)
-                    self._process(child, defs, uses)
-        elif node.type in lmap.branch_kinds:  # if_statement: init + condition
+                if child.type not in lmap.block_kinds:  # the body is in successor blocks
+                    self._loop_clause(child, defs, uses)
+            return
+        if node.type in lmap.branch_kinds:  # if_statement: init + condition
             self._process(node.child_by_field_name("initializer"), defs, uses)
             self._process(node.child_by_field_name("condition"), defs, uses)
-        else:
-            self._process(node, defs, uses)
+            return
+        self._process(node, defs, uses)
+
+    def _loop_clause(self, child: Node, defs: list[Occurrence], uses: list[Occurrence]) -> None:
+        """One header child of a ``for``: a range clause, a three-part clause,
+        or a bare condition (while-style ``for cond {}``)."""
+        if child.type == _RANGE_CLAUSE:
+            start = len(defs)
+            self._targets(child.child_by_field_name("left"), defs, uses)
+            if any(tok.type == ":=" for tok in child.children):
+                self._loop_scoped(defs, start)
+            self._process(child.child_by_field_name("right"), defs, uses)
+            return
+        if child.type == _FOR_CLAUSE:
+            for field_name in ("initializer", "condition", "update"):
+                self._process(child.child_by_field_name(field_name), defs, uses)
+            return
+        self._process(child, defs, uses)
 
     # -- the unified expression / statement walk ------------------------------
 
@@ -171,6 +206,9 @@ class GoDefUseDialect(BaseDefUseDialect):
             return
         if t in (_SELECTOR, _INDEX):  # ``obj.f = ...`` / ``a[i] = ...``: base is a read
             self.collect_reads(node, uses)
+            base = written_value(node)
+            if base is not None:  # ... and a write too, where the variable holds the value
+                defs.append(self._occ(base))
             return
         for child in node.named_children:
             self._targets(child, defs, uses)

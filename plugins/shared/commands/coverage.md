@@ -1,7 +1,7 @@
 ---
 frontmatter: |
     description: Ingest or inspect test-coverage reports (LCOV, Cobertura, Clover, Go cover profiles, JaCoCo, repowise JSON, or coverage.py .coverage; builds the per-test map when contexts are present), or gate a change on its patch coverage in CI.
-    allowed-tools: Bash, Read
+    allowed-tools: Bash(repowise coverage:*), Read
 ---
 
 # Repowise Coverage
@@ -59,4 +59,4 @@ repowise coverage check origin/main...HEAD --report coverage/lcov.info --fail-un
   when the report carries per-test contexts — e.g. a coverage.py `.coverage`
   written with `coverage run --contexts=test`, or a per-test lcov. Reports
   without contexts ingest aggregates only; say so plainly.
-- After ingesting, suggest `repowise health` so untested-hotspot markers update.
+- After ingesting, suggest `repowise health --recompute` so untested-hotspot markers update.

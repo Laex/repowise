@@ -101,9 +101,9 @@ def contrast(fg: str, bg: str) -> float:
 LIGHT = {
     "bg-root": "#FBF6F1",
     "bg-surface": "#FFFFFF",
-    "bg-elevated": "#FBF4EE",
-    "bg-inset": "#F4EAE1",
-    "bg-canvas": "#F4EAE1",  # --color-bg-canvas → var(--color-bg-inset)
+    "bg-elevated": "#F7F4F1",
+    "bg-inset": "#F0EBE6",
+    "bg-canvas": "#F0EBE6",  # --color-bg-canvas → var(--color-bg-inset)
     "text-primary": "#241B2C",
     "text-secondary": "#5E5360",
     "text-tertiary": "#8C7F88",
@@ -115,7 +115,7 @@ LIGHT = {
     "border-default": "rgba(88,67,108,0.12)",
     "border-active": "rgba(176,107,18,0.90)",
     "success": "#1D8155",
-    "warning": "#9A6614",
+    "warning": "#856700",
     "error": "#B23A2E",
     "info": "#58436C",
     # Blueprint diagram ink (light) — KG canvas + mermaid.
@@ -138,14 +138,18 @@ LIGHT = {
     "community-4": "#6B7A3D",  "community-5": "#B06A86",  "community-6": "#4A5D7A",
     "community-7": "#A8821F",  "community-8": "#8A7A66",  "community-9": "#7A2F4A",
     "community-10": "#B85A38", "community-11": "#2F6B66", "community-12": "#5E5360",
+    # Share steps (light): --color-text-primary mixed into --color-bg-inset at
+    # 86/74/63/54/47%. The tail (20%) is exempt: it is always named.
+    "share-1": "#413846", "share-2": "#59515C", "share-3": "#6F6871",
+    "share-4": "#827B82", "share-5": "#90898F",
 }
 
 DARK = {
-    "bg-root": "#17131D",
-    "bg-surface": "#211B29",
-    "bg-elevated": "#2A2335",
-    "bg-inset": "#110D17",
-    "bg-canvas": "#110D17",  # --color-bg-canvas → var(--color-bg-inset)
+    "bg-root": "#0E0E0F",
+    "bg-surface": "#141416",
+    "bg-elevated": "#191A1C",
+    "bg-inset": "#0A0A0B",
+    "bg-canvas": "#0A0A0B",  # --color-bg-canvas → var(--color-bg-inset)
     "text-primary": "#EEEAF4",
     "text-secondary": "#A79DB3",
     "text-tertiary": "#786F84",
@@ -157,7 +161,7 @@ DARK = {
     "border-default": "rgba(213,197,232,0.10)",
     "border-active": "rgba(245,149,32,0.55)",
     "success": "#34D399",
-    "warning": "#F2A03D",
+    "warning": "#E8B339",
     "error": "#E06A5A",
     "info": "#A98FC4",
     # Blueprint diagram ink (dark) — border carries canvas separation.
@@ -179,6 +183,9 @@ DARK = {
     "community-4": "#A9BB6F",  "community-5": "#D795B1",  "community-6": "#8FA3C0",
     "community-7": "#D9B04A",  "community-8": "#B8A68E",  "community-9": "#C4708F",
     "community-10": "#EBA585", "community-11": "#6FB3AB", "community-12": "#A79DB3",
+    # Share steps (dark): 86/71/58/48/40%; tail (18%) exempt.
+    "share-1": "#D2D2D3", "share-2": "#AFAFB0", "share-3": "#919192",
+    "share-4": "#79797A", "share-5": "#676768",
 }
 
 # (fg, bg, floor, label)  — floor is the WCAG ratio the pair must meet.
@@ -196,6 +203,8 @@ CHECKS = [
     ("text-inverse", "accent-primary", 4.5, "Text on accent-primary fill"),
     ("success", "bg-surface", 4.5, "Success text on card"),
     ("warning", "bg-surface", 4.5, "Warning text on card"),
+    ("warning", "bg-root", 4.5, "Warning text on page"),
+    ("warning", "bg-elevated", 4.5, "Warning text on elevated"),
     ("error", "bg-surface", 4.5, "Error text on card"),
     ("info", "bg-surface", 4.5, "Info text on card"),
     ("border-active", "bg-surface", 3.0, "Active border on card"),
@@ -214,6 +223,12 @@ CHECKS = [
     *[
         (f"community-{n}", "bg-canvas", 3.0, f"Community {n} hub on canvas")
         for n in range(1, 13)
+    ],
+    # Share-bar segments and legend swatches are non-text UI on page and card.
+    *[
+        (f"share-{n}", bg, 3.0, f"Share step {n} on {where}")
+        for n in range(1, 6)
+        for bg, where in (("bg-root", "page"), ("bg-surface", "card"))
     ],
 ]
 

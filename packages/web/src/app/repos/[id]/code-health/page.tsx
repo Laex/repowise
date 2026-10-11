@@ -17,8 +17,9 @@
  * symbol-drawer deep links point at it) but is labelled for what it is.
  *
  * Tabs carry their count where one is cheap to get, so a clean repo says so
- * before you spend a click. Findings rides on the overview request the page
- * already makes and dead code dedupes onto the key its own tab uses. Security
+ * before you spend a click. Dead code dedupes onto the key its own tab uses.
+ * Findings is not numbered: the overview's queue inventory is not the list the
+ * tab opens on, and that list's own total is a multi-second query. Security
  * has no count endpoint (only a findings list), and blast radius is a tool you
  * operate rather than a pile you read, so neither is numbered.
  */
@@ -86,6 +87,7 @@ import {
   type HealthOverviewResponse,
   type HealthTrendResponse,
 } from "@/lib/api/code-health";
+import { useTranslations } from "next-intl";
 
 const TABS = [
   "triage",
@@ -99,15 +101,15 @@ const TABS = [
 ] as const;
 type TabId = (typeof TABS)[number];
 
-const TAB_LABELS: Record<TabId, string> = {
-  triage: "Overview",
-  performance: "Performance",
-  findings: "Findings",
-  coverage: "Tests",
-  "dead-code": "Dead code",
-  "doc-drift": "Doc drift",
-  security: "Security",
-  impact: "Blast radius",
+const TAB_LABEL_KEYS: Record<TabId, string> = {
+  triage: "tabs.triage",
+  performance: "tabs.performance",
+  findings: "tabs.findings",
+  coverage: "tabs.coverage",
+  "dead-code": "tabs.deadCode",
+  "doc-drift": "tabs.docDrift",
+  security: "tabs.security",
+  impact: "tabs.impact",
 };
 
 /**
@@ -155,9 +157,9 @@ const OVERLAYS: CodeHealthOverlay[] = ["health", "maintainability", "performance
  */
 const SCOPED_TABS: TabId[] = ["triage", "findings"];
 
-const SCOPE_LABEL: Record<HealthScope, string> = {
-  all: "All code",
-  production: "Production",
+const SCOPE_LABEL_KEYS: Record<HealthScope, string> = {
+  all: "scopeAll",
+  production: "scopeProduction",
 };
 
 /**
@@ -207,9 +209,9 @@ function ViewSelect({
   );
 }
 
-const COUNTS_LABEL: Record<HealthCounts, string> = {
-  everything: "Everything",
-  code_shape: "Code shape only",
+const COUNTS_LABEL_KEYS: Record<HealthCounts, string> = {
+  everything: "countsEverything",
+  code_shape: "countsCodeShape",
 };
 
 /**
@@ -237,6 +239,8 @@ const MAP_CAP = 2000;
 const CHURN_POINT_LIMIT = 5000;
 
 export default function CodeHealthPage() {
+  const t = useTranslations("views.codeHealth");
+  const tc = useTranslations("common");
   const params = useParams<{ id: string }>();
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -288,8 +292,7 @@ export default function CodeHealthPage() {
   const selectedPath = searchParams.get("file");
   const opportunityId = searchParams.get("opportunity");
 
-  // Shares the SWR key with TriageView — the meta line and the findings count
-  // cost no extra request.
+  // Shares the SWR key with TriageView, so the meta line costs no extra request.
   const { data: overview } = useSWR<HealthOverviewResponse>(
     `code-health-overview:${repoId}${viewKey}`,
     () => getHealthOverview(repoId, 25, scope, counts),
@@ -317,6 +320,7 @@ export default function CodeHealthPage() {
     data: trend,
     isLoading: trendLoading,
     error: trendError,
+    mutate: mutateTrend,
   } = useSWR<HealthTrendResponse>(
     `code-health-trend:${repoId}${scopeKey}`,
     () => getHealthTrend(repoId, 20, scope),
@@ -423,12 +427,6 @@ export default function CodeHealthPage() {
   );
 
   const badges: Partial<Record<TabId, number | string>> = {};
-  // Performance has its own tab and is out of the findings list, so counting
-  // it here would put a bigger number on the tab than the tab can show.
-  if (overview) {
-    badges.findings =
-      overview.summary.open_findings - (overview.summary.performance_findings ?? 0);
-  }
   if (deadCode) badges["dead-code"] = deadCode.total_findings;
   // No badge when the drift pass has not run: the response carries a cause
   // rather than a summary, and a 0 there would read as clean documentation.
@@ -494,8 +492,8 @@ export default function CodeHealthPage() {
 
   return (
     <PageShell
-      title="Code health"
-      icon={<HeartPulse className="h-5 w-5 text-[var(--color-success)]" />}
+      title={t("title")}
+      icon={<HeartPulse />}
       // No description: the lede below opens with what the score is built from,
       // and a header that says it first only says it twice.
       //
@@ -511,49 +509,55 @@ export default function CodeHealthPage() {
         <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-2">
           {SCOPED_TABS.includes(activeTab) && (
             <ViewSelect
-              label="Files"
+              label={t("scopeFiles")}
               value={scope}
               onValueChange={setScope}
-              options={HEALTH_SCOPES.map((id) => ({ id, label: SCOPE_LABEL[id] }))}
+              options={HEALTH_SCOPES.map((id) => ({
+                id,
+                label: t(SCOPE_LABEL_KEYS[id]),
+              }))}
             />
           )}
           {COUNTED_TABS.includes(activeTab) && (
             <ViewSelect
-              label="Counts"
+              label={t("scopeCounts")}
               value={counts}
               onValueChange={setCounts}
-              options={HEALTH_COUNTS.map((id) => ({ id, label: COUNTS_LABEL[id] }))}
+              options={HEALTH_COUNTS.map((id) => ({
+                id,
+                label: t(COUNTS_LABEL_KEYS[id]),
+              }))}
             />
           )}
           <Button size="sm" variant="outline" onClick={refresh} disabled={refreshing}>
             <RotateCw
               className={`mr-1.5 h-3.5 w-3.5 ${refreshing ? "motion-safe:animate-spin" : ""}`}
             />{" "}
-            {refreshing ? "Refreshing…" : "Refresh"}
+            {refreshing ? t("refreshing") : t("refresh")}
           </Button>
         </div>
       }
     >
       {/* Replaced each release that moves health scores, and keyed with that
           release's version so a reader who dismissed an earlier one sees it. */}
-      <ReleaseNotice id="health-scoring" version="0.55.0">
-        <span className="font-medium text-[var(--color-text-primary)]">
-          Health scores changed in this release.
-        </span>{" "}
-        Most files score higher: cohesion, duplication, hotspot and complexity findings
-        that did not hold up are gone, and test code no longer counts against production files. Files in languages health cannot analyse used
-        to count as 10.0; they now read &quot;Not analysed&quot; and leave the average, so a
-        repository with many of them can read lower. Scores are not comparable to
-        snapshots taken before this release.
+      <ReleaseNotice
+        id="health-scoring"
+        version="0.55.0"
+        detail={t("coChangeNoticeBody")}
+        detailLabel={t("coChangeNoticeMore")}
+        hideLabel={t("coChangeNoticeLess")}
+        dismissLabel={tc("dismiss")}
+      >
+        {t("coChangeNoticeTitle")}
       </ReleaseNotice>
 
       {meta ? (
         <p className="-mt-3 font-mono text-[10px] uppercase tracking-[0.12em] text-[var(--color-text-tertiary)]">
           {meta.last_indexed_at
-            ? `Indexed ${formatDateTime(meta.last_indexed_at)}`
-            : "Not indexed yet"}
+            ? t("indexed", { date: formatDateTime(meta.last_indexed_at) })
+            : t("notIndexed")}
           {meta.head_commit ? ` · ${meta.head_commit.slice(0, 8)}` : ""}
-          {` · ${meta.snapshot_count} snapshot${meta.snapshot_count === 1 ? "" : "s"}`}
+          {` · ${t("snapshots", { count: meta.snapshot_count })}`}
         </p>
       ) : null}
 
@@ -562,7 +566,7 @@ export default function CodeHealthPage() {
           const Icon = TAB_ICONS[id];
           return {
             id,
-            label: TAB_LABELS[id],
+            label: t(TAB_LABEL_KEYS[id]),
             icon: <Icon className="h-3.5 w-3.5" />,
             ...(badges[id] !== undefined ? { badge: badges[id] } : {}),
           };
@@ -587,13 +591,14 @@ export default function CodeHealthPage() {
             hotspotsSlot={<HotspotsSection repoId={repoId} />}
             trendSlot={
               <OverviewSection
-                title="Health trend"
-                description="How the scores have moved across indexed snapshots."
+                title={t("trendTitle")}
+                description={t("trendDescription")}
               >
                 <TrendSection
                   data={trend}
                   isLoading={trendLoading}
                   error={trendError}
+                  onRetry={() => void mutateTrend()}
                   counts={counts}
                 />
               </OverviewSection>

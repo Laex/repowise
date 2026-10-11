@@ -40,6 +40,7 @@ from .call_receiver_typing import (
     ReceiverTypingMixin,
     _store_capped,
 )
+from .decorator_names import decorator_base
 from .language_data import (
     get_builtin_methods,
     get_builtin_types,
@@ -132,7 +133,7 @@ _PROPERTY_ACCESSOR_SUFFIXES = (".setter", ".getter", ".deleter")
 
 def _is_property_accessor(sym: Any) -> bool:
     for decorator in getattr(sym, "decorators", ()) or ():
-        tail = decorator.lstrip("@").strip()
+        tail = decorator_base(decorator)
         if tail in _PROPERTY_DECORATORS or tail.endswith(_PROPERTY_ACCESSOR_SUFFIXES):
             return True
     return False
@@ -848,6 +849,8 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
                 # tier that answered, so it is stamped once here.
                 if call.edge_type != "calls":
                     resolved = replace(resolved, edge_type=call.edge_type)
+                if call.spawned:
+                    resolved = replace(resolved, spawned=True)
                 results.append(resolved)
 
         return results
@@ -959,10 +962,27 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
 
         tabled = self._external_chain_return_type(file_path, inner, language)
         from_table = tabled is not None
+        inner_callee = (
+            None
+            if tabled is not None
+            else self._chain_inner_callee(file_path, call, inner, caller_id, language)
+        )
+        if language == "go" and inner_callee is not None:
+            # A go method may sit in any file of its type's package, so the
+            # type is read by identity and the method asked for across it.
+            type_id = self._returned_type_id(inner_callee)
+            hit = (
+                None
+                if type_id is None
+                else self._call_typed_receiver(file_path, call, caller_id, type_id)
+            )
+            if hit is not None:
+                tier = hit.origin.removeprefix("receiver_typed_")
+                return True, self._return_typed_call(caller_id, hit.callee_id, tier, call.line)
         type_name = (
             tabled
             if tabled is not None
-            else self._inferred_chain_return_type(file_path, call, inner, caller_id, language)
+            else self._callee_chain_return_type(inner_callee, inner, language)
         )
         if type_name is None:
             return False, None
@@ -1112,7 +1132,7 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
             return None
         return methods.get(inner.target_name)
 
-    def _inferred_chain_return_type(
+    def _chain_inner_callee(
         self,
         file_path: str,
         call: CallSite,
@@ -1120,7 +1140,7 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         caller_id: str,
         language: str,
     ) -> str | None:
-        """The head's type read off the repository symbol the inner call resolves to."""
+        """The repository symbol the inner call of a chain resolves to."""
         if language not in self._return_type_chain_languages:
             # Admitted by its table alone; inferring from repository return
             # types is not admitted for this language.
@@ -1148,6 +1168,13 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         rep = self._overload_rep.get(callee_id)
         if rep is not None:
             callee_id = self._pick_overload(rep, inner.argument_count) or callee_id
+        return callee_id
+
+    def _callee_chain_return_type(
+        self, callee_id: str | None, inner: CallReceiver, language: str
+    ) -> str | None:
+        if callee_id is None:
+            return None
         return self._callee_return_type(callee_id, inner.argument_count, language)
 
     def _nested_receiver_call(
@@ -1158,9 +1185,10 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         A receiver records one hop, but the parser keeps every link of a chain
         as its own site on the chain's first line, so the hop below is read
         off the site *inner* names. Only C# reads it; elsewhere an inner call
-        is still typed as if nothing were chained under it.
+        is still typed as if nothing were chained under it. Go reads it too, so a
+        builder chain types each link from the one before.
         """
-        if language != "csharp":
+        if language not in ("csharp", "go"):
             return None
         sites = self._chained_sites.get(file_path)
         if sites is None:

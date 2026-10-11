@@ -251,7 +251,7 @@ The returned report rides on `PipelineResult.health_report`. Then
 trend tracking (rolling 50-row window per repo), and a second
 `{path: total_deduction}` map covering only the files whose score is held at
 the floor. Both maps come from `trends.snapshot_file_maps`, which the other two
-snapshot writers (`repowise health` and `repowise update --full`) also call; a repo
+snapshot writers (`repowise health --recompute` and `repowise update --full`) also call; a repo
 whose writers disagreed would get a history whose depth changed depending on
 which command last wrote it.
 
@@ -265,7 +265,10 @@ A single pass over the parsed file list. For each file the analyzer:
    `FileComplexity` of functions and classes. Each `FunctionComplexity` carries
    name, line range, nloc, ccn, max nesting, cognitive complexity, bumps, and
    param count; each `ClassComplexity` carries method count, total nloc, the
-   method list, LCOM4, max method ccn, and field count.
+   method list, LCOM4, max method ccn, and field count. A function or method
+   defined inside another function has a `FunctionComplexity` of its own: its
+   branches are counted there and not in the function around it. A lambda has
+   none and counts toward the function that holds it.
 2. **Populates symbol complexity** (`_populate_symbol_complexity`): writes
    `max(ccn)` into `Symbol.complexity_estimate` as a side effect, so the
    `ContextAssembler` symbol ranker benefits even when a caller never touches
@@ -511,6 +514,15 @@ dispatch and its heaviest arm: `nested_complexity` skips the two levels the
 `switch` and its `case` open, and `complex_method`, `brain_method` and `bumpy_road`
 read the CCN outside the dispatch plus the CCN of its most complex arm.
 
+In TypeScript and JavaScript (TSX / JSX included) a ternary opens no nesting level
+when it is an arm of a chain (`a ? x : b ? y : z`), sits inside JSX markup, or has a
+JSX branch: a view choosing one of ten panels is one decision per arm (each still
+counts toward CCN and adds a flat +1 to cognitive complexity, like an `else if`), not
+ten levels deep. A ternary inside another's `consequence` still nests, as does one in
+a call argument or object literal inside JSX (`{fmt(a ? b : c)}`) and one whose
+branch is not itself JSX (`cond ? c2 && <A/> : x`); so does every `if` / `for` /
+`try` in a handler written in JSX.
+
 `biomarkers/registry.py` is an **explicit list**, not auto-discovery:
 keeps the registration order deterministic and lets tests inject extras
 via `registered_biomarkers(extra=...)`.
@@ -652,10 +664,13 @@ Full method and data:
 
 ### 6.3 Fix first ranking (`fix_first/`, `worth.py`)
 
+Index and update save the queue and the Do next list, so these surfaces open without rebuilding them.
+
 Fix first is built once in `analysis/health/fix_first/build.py` from stored rows
 and rendered unchanged by `get_health`, `repowise health`, the dashboard and the
 generated CLAUDE.md. Every excluded unit is counted in `totals.excluded` under one
-reason:
+reason. These reasons and the performance default queue's are decided in one place,
+`analysis/health/queue/`:
 
 | Reason | What it leaves out |
 |---|---|
@@ -664,14 +679,20 @@ reason:
 | `below_min_worth` | A refactoring recovering under `MIN_WORTH` (0.5) or with no steps; a loop-built string that is bounded or not in production |
 | `history_only` | Only git-history findings |
 | `deprecated` | Deprecated functions |
+| `gated_off` | Functions a same-file constant-false flag switches off (`complexity/gating.py`): the body opens with `if not FLAG: return` or is one `if FLAG:` block. For performance this is the opportunity state `expected` with reason `gated_off`, and the default queue counts it under `gated_off`. `totals.dormant` counts the distinct functions |
+| `unreachable` | Targets an open dead-code finding with confidence 0.8 or more, or marked safe to delete, covers: the whole file, the symbol's lines, or its name |
 | `inherent_dispatch` | One dispatch holds 60% or more of the decision points (labels: 8 of 9 such rows rejected), unless a duplicate also sits in it |
 | `small_function` | Under 30 code lines and CCN 15 (on 67 labelled rows this cut drops 13 rejected and 4 accepted) |
 | `no_concrete_step` | No first edit with a file and line or a named group |
-| `low_value_kind` | Extract Class (0 of 14 accepted), Move Method (0 of 34), low cohesion (0 of 46), long method (0 of 10), long parameter lists (0 of 2) |
+| `low_value_kind` | Low cohesion (0 of 46 accepted), long method (0 of 10), long parameter lists (0 of 2) |
+| `kind_unaudited` | Plans led by Extract Class (0 of 14 accepted) or Move Method (0 of 34), kept to the full list until each passes a per-language audit |
+| `terminal_flow` | A quarter or more of the function's calls print or prompt (`complexity/terminal.py`): a status report, checklist or setup wizard |
+| `moderate_quiet` | Under CCN 80 and 200 lines, in a file outside the top fifth by churn (or changed once), with no `prior_defect` in the file and no `function_hotspot` on the function |
 
 Order: value first (the larger of health recovered and size: CCN 20/40/80/150,
 lines 100/200/400/800, nesting 5/6/8, a critical or brain-method finding, one step
-more on a hot file); a performance fix's value is its cost, with production,
+more on a hot file, where a function under 5% of its file's lines is credited that
+share of the file's importers); a performance fix's value is its cost, with production,
 entry-reachable, data-growing DB or network calls in the top band. Then tier
 `now` / `next` / `later`, with at most `HEAD_PER_KIND` (3) of the first `HEAD` (5)
 places per kind. `worth.py` decides `later` for every default list: a function
@@ -688,6 +709,8 @@ priority there; a performance opportunity is unless production code runs it over
 growing data.
 
 ### 6.4 Performance opportunities (`perf/`)
+
+User guide: [PERFORMANCE.md](../layers/PERFORMANCE.md).
 
 **Sinks.** `io_in_loop` resolves a call inside a loop through the graph's
 resolver and classifies the target against the I/O-boundary lexicon
@@ -708,18 +731,32 @@ through, or `<file>::__module__` for top-level code. Sinks, call sites and
 same-family co-signals (`io_in_loop` with `nested_loop_with_io`) are members. Two
 loops in one function are one site, because findings carry the sink's line. Each
 carries one `actionability` state (`plan_ready`, `advisory`, `investigate`,
-`expected`). The default queue holds production `plan_ready` and `advisory`, ranked
-by `rank_score`; actionability only breaks ties. Excluded reasons are counted in
-`default_queue`.
+`expected`). A group every member's name or file stem marks as a migration,
+startup, shutdown or crash recovery (`perf/cold_paths.py`) is `expected` with reason
+`cold_path`, with or without a strategy; `gated_off` takes precedence. The identity
+kernel's `execution_context` stays path-only.
+The default queue holds production `plan_ready` and `advisory` with
+`cost_proof = proven`, ranked by `rank_score`; actionability only breaks ties.
+Excluded reasons are counted in `default_queue`. A cause whose loop size nothing
+measured is stored as `cost_proof = unproven`: it never leads, and the `proof`
+filter and facet expose it.
 
 **Plans.** Proven means the transformation, not the runtime: parallelizing awaits
 against a DB or network client is advisory with a `bounded_concurrency`
 prerequisite. A loop already walking chunks is `loop_already_chunked`. When
 `io_in_loop` and `serial_await_in_loop` fire on one call they name each other in
-`siblings`. Plans list their edits (`mechanical` only when proven) and validation
-tests (coverage, call graph, import graph, then `via: "name-match"`). An
-opportunity links to a `performance_fix` refactoring plan only by exact
-`opportunity_id`.
+`siblings`. Plans list their edits (`mechanical` only when proven): one step per
+call site and loop, however many markers saw it, each naming the call it repeats
+(`details.sink_call`, or the helper a cross-function path enters). A step that adds
+a bulk form to the sink comes first only when every site reaches that one sink.
+Building a buffer or a set is one edit however many lines of the loop grow the
+string or probe the list, so `buffer_string_accumulation` and
+`replace_membership_collection` list one step per loop and variable, on the loop's
+line, naming the variable (`details.subject`) where the walk could read it as a
+plain name, and effort counts those steps.
+Plans also list validation tests (coverage, call graph, import graph, then
+`via: "name-match"`). An opportunity links to a `performance_fix` refactoring
+plan only by exact `opportunity_id`.
 
 **Dataflow promotion.** `serial_await_in_loop` and `nested_loop_quadratic` are
 promoted to `dataflow_verified: true` when a def/use pass proves iterations

@@ -1223,17 +1223,19 @@ def test_claude_refresh_project_files_skips_when_options_disable_file(
 
 
 def test_update_command_uses_editor_refresh_abstraction() -> None:
-    from repowise.cli.commands.update_cmd.command import _refresh_editor_stamp
+    from repowise.cli.commands.update_cmd.command import _finish_outcome, _refresh_editor_stamp
 
     command_source = inspect.getsource(run_update)
+    finish_source = inspect.getsource(_finish_outcome)
     stamp_source = inspect.getsource(_refresh_editor_stamp)
 
-    # The command routes every editor-file write through the shared stamp
-    # helper, which in turn uses the refresh abstraction — never the raw
-    # generator/fetcher internals.
-    assert "_refresh_editor_stamp" in command_source
+    # The command routes every editor-file write through the shared exit
+    # helper and its stamp helper, which in turn uses the refresh abstraction —
+    # never the raw generator/fetcher internals.
+    assert "_finish_outcome" in command_source
+    assert "_refresh_editor_stamp" in finish_source
     assert "refresh_editor_project_files" in stamp_source
-    for source in (command_source, stamp_source):
+    for source in (command_source, finish_source, stamp_source):
         assert "ClaudeMdGenerator" not in source
         assert "EditorFileDataFetcher" not in source
         assert "claude_md" not in source
@@ -1297,6 +1299,31 @@ def test_workspace_generation_rebinds_codex_provider_to_repo(
 
     assert result is rebound
     assert calls == [("codex_cli", "codex_cli/gpt-5.5", tmp_path)]
+
+
+def test_workspace_generation_rebinds_opencode_provider_to_repo(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    """opencode also runs in the repo's cwd, so a workspace must rebind it per repo."""
+
+    class FakeProvider:
+        provider_name = "opencode"
+        model_name = "opencode/default"
+
+    rebound = object()
+    calls: list[tuple[str, str, Path]] = []
+
+    def fake_resolve_provider(provider_name: str, model: str, repo_path: Path) -> object:
+        calls.append((provider_name, model, repo_path))
+        return rebound
+
+    monkeypatch.setattr(init_cmd.workspace, "resolve_provider", fake_resolve_provider)
+
+    result = init_cmd.workspace._workspace_generation_provider_for_repo(FakeProvider(), tmp_path)
+
+    assert result is rebound
+    assert calls == [("opencode", "opencode/default", tmp_path)]
 
 
 def test_init_command_uses_editor_option_abstraction() -> None:

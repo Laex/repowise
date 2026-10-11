@@ -2,11 +2,12 @@
 
 import { useCallback, useState, type ElementType, type ReactNode } from "react";
 import { ArrowUpRight, BellOff, Check, X } from "lucide-react";
-import type {
-  ActionDetail,
-  ActionStateValue,
-  ActionSurface,
-  NextAction,
+import {
+  ACTION_TIER_LABELS,
+  type ActionDetail,
+  type ActionStateValue,
+  type ActionSurface,
+  type NextAction,
 } from "@repowise-dev/types/actions";
 
 import { AiPromptBlock } from "../health/ai-prompt-modal";
@@ -16,12 +17,6 @@ import { EFFORT_LABEL } from "../health/labels";
 import { SeverityMark } from "../health/severity-mark";
 import type { Severity } from "../health/tokens";
 import { AdaptivePanel } from "../shared/adaptive-panel";
-
-const TIER_LABEL: Record<NextAction["tier"], string> = {
-  act_now: "Do now",
-  plan: "Worth planning",
-  improve_signal: "Improve what Repowise can see",
-};
 
 /** What the evidence link opens, named for the place it lands. */
 const EVIDENCE_LABEL: Record<ActionSurface, string> = {
@@ -53,6 +48,8 @@ export interface ActionDrawerProps {
   onAnswer?: ((state: ActionStateValue, message: string) => void) | undefined;
   /** The agent prompt for an action, as core renders it. Omit to hide the prompt. */
   loadPrompt?: ((action: NextAction, flavor: AiPromptFlavor) => Promise<string>) | undefined;
+  /** Show each command's CLI line. Set false for a host with no CLI; agent calls stay. */
+  showCliCommands?: boolean | undefined;
   LinkComponent?: ElementType | undefined;
   renderTitle: (title: string) => ReactNode;
 }
@@ -81,6 +78,7 @@ export function ActionDrawer({
   fileHref,
   onAnswer,
   loadPrompt,
+  showCliCommands = true,
   LinkComponent,
   renderTitle,
 }: ActionDrawerProps) {
@@ -99,7 +97,7 @@ export function ActionDrawer({
       onOpenChange={(open) => {
         if (!open) onClose();
       }}
-      eyebrow={action ? TIER_LABEL[action.tier] : "Next action"}
+      eyebrow={action ? ACTION_TIER_LABELS[action.tier] : "Next action"}
       title={action ? renderTitle(action.title) : "Next action"}
       widthClassName="md:max-w-[680px]"
     >
@@ -215,7 +213,7 @@ export function ActionDrawer({
                   {action.commands.map((c) => (
                     <li key={c.purpose} className="space-y-1">
                       <p className="text-sm text-[var(--color-text-secondary)]">{c.purpose}</p>
-                      {c.cli ? (
+                      {showCliCommands && c.cli ? (
                         <pre className="overflow-x-auto rounded bg-[var(--color-bg-inset)] px-3 py-1.5 font-mono text-xs text-[var(--color-text-primary)]">
                           {c.cli}
                         </pre>

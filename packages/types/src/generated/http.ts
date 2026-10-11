@@ -23,6 +23,8 @@ export interface ActionContext {
   fix_commits_90d: number;
   busy_threshold: number;
   coverage: "measured" | "stale" | "unknown";
+  /** The index holds too few commits for history-driven rules to rank by. */
+  history_too_short?: boolean;
 }
 
 export interface ActionDetail {
@@ -83,6 +85,8 @@ export interface ActionsResponse {
   week_start: string | null;
   context: ActionContext;
   horizons: Record<string, ActionHorizon>;
+  /** Where things stand in each horizon, in one sentence. */
+  summary: Record<string, string>;
   rules: ActionRuleStatus[];
   unavailable: Record<string, string>;
 }
@@ -91,6 +95,9 @@ export interface ActionsResponse {
 export interface ActiveProviderSelection {
   provider?: string | null;
   model?: string | null;
+  input_cost_per_1k?: number | null;
+  output_cost_per_1k?: number | null;
+  embedder?: string | null;
 }
 
 export interface AgentPromptResponse {
@@ -906,6 +913,7 @@ export interface DeadCodeSummaryResponse {
   deletable_lines: number;
   total_lines: number;
   by_kind: Record<string, unknown>;
+  analyzed_at?: string | null;
 }
 
 /** A link from a decision to a governed file or module. */
@@ -1266,6 +1274,13 @@ export interface EgoGraphResponse {
   outbound_count: number;
 }
 
+/** One registered embedder, as the settings picker renders it. */
+export interface EmbedderEntry {
+  id: string;
+  env_vars?: string[];
+  semantic?: boolean;
+}
+
 /**
  * Counts by tier and by kind, from a grouped read of the same filters.
  *
@@ -1556,6 +1571,7 @@ export interface FixFirstQueueResponse {
   by_improves: Record<string, number>;
   model_version: number;
   basis: Record<string, string | null>;
+  counts: QueueCounts;
 }
 
 export interface FixGain {
@@ -1607,6 +1623,7 @@ export interface FixItem {
   source: FixSource;
   next_call: ActionCommand;
   why_ranked?: FixRankFact[];
+  value?: number | null;
 }
 
 export interface FixRankFact {
@@ -1633,6 +1650,9 @@ export interface FixStep {
   file_path: string;
   line?: number | null;
   mechanical?: boolean;
+  signature?: string | null;
+  call?: string | null;
+  command?: string | null;
 }
 
 export interface FixTarget {
@@ -1652,6 +1672,7 @@ export interface FixTotals {
   eligible?: number;
   shown?: number;
   excluded?: Record<string, number>;
+  dormant?: number;
 }
 
 export interface FixVerify {
@@ -1659,9 +1680,10 @@ export interface FixVerify {
   tests_total: number;
   command: string | null;
   basis: "measured" | "inferred" | "unknown";
+  prerequisite?: string | null;
 }
 
-/** Optional per-call overrides for the enrichment provider/model. */
+/** Optional per-call provider/model overrides, as chat accepts. */
 export interface GenerateCodeRequest {
   provider?: string | null;
   model?: string | null;
@@ -2251,6 +2273,10 @@ export interface NextAction {
   surface: string;
   effort: "S" | "M" | "L";
   confidence: "high" | "medium";
+  /** 0-4: the Fix first value band, or what the severity says. */
+  value?: number;
+  /** Value x confidence / effort: the order inside a tier. */
+  priority?: number;
   done_when: string;
   command?: string | null;
   marker?: string | null;
@@ -2600,6 +2626,36 @@ export interface PatchCoverageTestHint {
   total: number;
 }
 
+/** A function's stored size measures; an absent one was not measured. */
+export interface PlanMeasuresResponse {
+  ccn?: number | null;
+  nloc?: number | null;
+  params?: number | null;
+}
+
+/**
+ * What happened to a plan the index resolved as no longer detected.
+ *
+ * ``applied`` means the measures are consistent with the plan being applied:
+ * the target shed at least half the predicted decision points and a function
+ * fitting the extracted slice appeared beside it.
+ */
+export interface PlanPayoffResponse {
+  outcome: string;
+  resolved_commit?: string | null;
+  resolved_at?: string | null;
+  before?: PlanMeasuresResponse | null;
+  after?: PlanMeasuresResponse | null;
+  realised?: Record<string, number> | null;
+  new_symbol?: string | null;
+}
+
+export interface PlanRiskResponse {
+  kind: string;
+  text: string;
+  ref?: string | null;
+}
+
 /**
  * What the map is counting.
  *
@@ -2624,11 +2680,16 @@ export interface ProviderEntry {
   models?: string[];
   default_model?: string | null;
   configured?: boolean;
+  requires_key?: boolean;
+  env_vars?: string[];
+  setup_hint?: string;
 }
 
 export interface ProviderStatusResponse {
   active: ActiveProviderSelection;
   providers?: ProviderEntry[];
+  flag_only_providers?: string[];
+  embedders?: EmbedderEntry[];
 }
 
 /**
@@ -2658,6 +2719,15 @@ export interface PublishResponse {
   repo?: string | null;
 }
 
+export interface QueueCounts {
+  inventory?: number;
+  in_scope?: number;
+  eligible?: number;
+  due?: number;
+  shown?: number;
+  excluded?: Record<string, number>;
+}
+
 /** What the ``fix_first`` scope leaves out of a page's filtered set. */
 export interface RefactoringHiddenCounts {
   total?: number;
@@ -2676,6 +2746,7 @@ export interface RefactoringOpportunitiesResponse {
   ignored_arguments?: Record<string, string> | null;
   scope?: "fix_first" | "all";
   hidden?: RefactoringHiddenCounts | null;
+  counts?: QueueCounts | null;
 }
 
 /**
@@ -2714,14 +2785,38 @@ export interface RefactoringOpportunityStatusUpdate {
   status: string;
 }
 
-/** Bounded product page; the legacy targets response remains unpaged. */
-export interface RefactoringPlanPageResponse {
-  items: RefactoringPlanResponse[];
-  total: number;
-  has_more: boolean;
-  next_offset: number | null;
-  summary: RefactoringSummary;
-  structural_leads: RefactoringPlanResponse[];
+/**
+ * One plan read alone: what other layers say about its target. Lists stay
+ * on :class:`RefactoringPlanResponse` and never carry these; both are absent
+ * on a plan that was never checked.
+ */
+export interface RefactoringPlanDetailResponse {
+  id: string;
+  refactoring_type: string;
+  file_path: string;
+  target_symbol: string;
+  line_start?: number | null;
+  line_end?: number | null;
+  plan?: Record<string, unknown>;
+  evidence?: Record<string, unknown>;
+  impact_delta?: number;
+  effort_bucket?: string;
+  blast_radius?: Record<string, unknown>;
+  confidence?: string;
+  source_biomarker?: string;
+  benefit?: number;
+  leverage?: number;
+  cost?: number;
+  risk?: number;
+  rank_score?: number;
+  dependents?: number;
+  file_nloc?: number;
+  file_weighted_deficit?: number;
+  validation?: Record<string, unknown>;
+  governed_by?: string[] | null;
+  risks?: PlanRiskResponse[] | null;
+  recipe?: Record<string, unknown> | null;
+  payoff?: PlanPayoffResponse | null;
 }
 
 /**
@@ -2768,11 +2863,21 @@ export interface RefactoringRollupResponse {
   directive?: Record<string, unknown>;
 }
 
-/** The opt-in code-generation switches, mirrored from ``refactoring.llm``. */
+/**
+ * The code-generation switch plus the model it will use.
+ *
+ * ``provider`` / ``model`` are read-only: they come from the same resolver
+ * chat uses, so the user configures a model once. Never carries a key.
+ */
 export interface RefactoringSettings {
   enabled?: boolean;
   provider?: string | null;
   model?: string | null;
+}
+
+/** The one writable field, ``refactoring.llm.enabled``. */
+export interface RefactoringSettingsUpdate {
+  enabled: boolean;
 }
 
 /** Same shape and vocabulary as health finding triage — one triage system. */
@@ -2786,6 +2891,7 @@ export interface RefactoringSummary {
   by_type: RefactoringTypeCount[];
   files_total?: number | null;
   structural_total?: number | null;
+  design_total?: number | null;
   performance_total?: number | null;
   small_effort_total?: number | null;
   health_recovery_total?: number | null;
@@ -3146,6 +3252,10 @@ export interface SecurityFindingResponse {
   commit_sha: string | null;
   commit_at: string | null;
   found_in_history: boolean;
+}
+
+export interface SecuritySummaryResponse {
+  scanned_at?: string | null;
 }
 
 export interface SetActiveProviderRequest {

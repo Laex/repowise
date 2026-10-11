@@ -395,32 +395,44 @@ def _iter_name_status(raw: str) -> Iterator[tuple[str, str, str]]:
 
 def _cat_file_batch(repo_path: str, sha: str, paths: list[str]) -> dict[str, bytes]:
     """One batch read; an object missing at *sha* is omitted rather than raising."""
-    specs = "\n".join(f"{sha}:{path}" for path in paths) + "\n"
+    read = read_blobs(repo_path, [(sha, path) for path in paths])
+    return {path: blob for (_, path), blob in (read or {}).items()}
+
+
+def read_blobs(repo_path: str, specs: list[tuple[str, str]]) -> dict[tuple[str, str], bytes] | None:
+    """``{(rev, path): bytes}`` over one ``git cat-file --batch``; ``None`` if git failed.
+
+    An object missing at its revision, or one that is not a file (a submodule),
+    is omitted instead of raising.
+    """
+    request = "\n".join(f"{rev}:{path}" for rev, path in specs) + "\n"
     proc = subprocess.run(
         ["git", "-C", repo_path, "cat-file", "--batch"],
-        input=specs.encode("utf-8"),
+        input=request.encode("utf-8"),
         capture_output=True,
         timeout=GIT_TIMEOUT_SECONDS,
     )
     if proc.returncode != 0:
-        return {}
-    out: dict[str, bytes] = {}
+        return None
+    out: dict[tuple[str, str], bytes] = {}
     data, cursor = proc.stdout, 0
-    for path in paths:
+    for spec in specs:
         newline = data.find(b"\n", cursor)
         if newline == -1:
             break
         header = data[cursor:newline]
         # A missing object echoes the whole spec back: "<sha>:<path> missing".
         # Match the suffix, not the field count, because a path may hold spaces.
-        if header.endswith(b" missing"):
+        # A submodule whose commit this repository lacks: "<sha> submodule", no body.
+        fields = header.decode("utf-8", "replace").split()
+        if header.endswith(b" missing") or fields[1:] == ["submodule"]:
             cursor = newline + 1
             continue
-        fields = header.decode("utf-8", "replace").split()
         if len(fields) < 3 or not fields[2].isdigit():
             break  # unparseable header: stop rather than misread the stream
         size = int(fields[2])
         start = newline + 1
-        out[path] = data[start : start + size]
+        if fields[1] == "blob":  # a submodule whose commit is here reads as that commit
+            out[spec] = data[start : start + size]
         cursor = start + size + 1  # trailing newline
     return out

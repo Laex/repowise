@@ -238,3 +238,15 @@ class HealthReport:
     # against the merged stored set, and need this configuration to get there.
     # Typed ``Any`` for the same reason as ``refactoring_suggestions``.
     performance_plan_policy: Any | None = None
+    # ``execution_roles.ExecutionRoles`` over the whole graph, so the writer can
+    # restamp stored performance findings this run did not rescan. Typed ``Any``
+    # for the same reason as ``refactoring_suggestions``.
+    execution_roles: Any | None = None
+    # One dict per walked function symbol, for the ``function_facts`` store
+    # (``HealthAnalyzer._function_fact_rows``). None when there was no graph to
+    # key rows on: the writers then leave the stored rows alone.
+    function_facts: list[dict] | None = None
+    # Each function's nearest tests over the whole graph
+    # (``function_test_map.function_test_map``), restamped onto every stored
+    # row. None without a graph, like ``function_facts``.
+    function_tests: dict[str, tuple] | None = None

@@ -65,6 +65,16 @@ class LanguageNodeMap:
     # empty and we sniff operator text via this set of node types whose
     # text content equals ``&&`` or ``||``.
     boolean_operator_text_kinds: frozenset[str] = frozenset()
+    # Ternary node kind(s) that choose rather than nest: an arm of a chain
+    # (``a ? x : b ? y : z``, a dispatch) or a choice between markup (JSX).
+    # Still a CCN point; no nesting level. Empty keeps every ternary nesting.
+    flat_ternary_kinds: frozenset[str] = frozenset()
+    # Some grammars spell a ternary's branches positionally instead of naming
+    # them ``consequence`` / ``alternative`` (Python's ``X if C else Y`` has no
+    # field names: the arms are its first and last named children). For those
+    # the else-arm is the node's last named child, so a chain arm can still be
+    # located by position and recognised as flat.
+    ternary_arms_positional: bool = False
 
     # ------------------------------------------------------------------
     # Class-level analysis (LCOM4 / god-class). All three fields default
@@ -86,7 +96,7 @@ class LanguageNodeMap:
     # denote the instance (``self`` / ``this`` / ``$this`` / ``cls``), and
     # ``member_access_kinds`` to the node type(s) for ``receiver.member``
     # access. The receiver and member-name children are pulled out by the
-    # generic field-name probe in ``walker._self_member_name`` (it tries
+    # generic field-name probe in ``ast_utils.self_member_name`` (it tries
     # the ``object``/``value`` and ``property``/``attribute``/``field``/
     # ``name`` fields, then falls back to positional children), so most
     # tree-sitter grammars need only the node-type names below.
@@ -247,6 +257,17 @@ class LanguageNodeMap:
     #     segment. The slicer treats them as jumps for the same reason. A user
     #     macro of the same name that does not exit only hides a span.
     yield_kinds: frozenset[str] = frozenset()
+    #   * ``await_kinds`` -- tokens that suspend the function (Python ``await`` /
+    #     ``async with`` / ``async for``, TS/JS ``await`` / ``for await``, Rust
+    #     ``.await``, C++ ``co_await``). Matched on the anonymous keyword token,
+    #     which every form carries. A span holding one lifts into a helper that
+    #     must itself be async, with its call site awaited.
+    #   * ``await_scope_kinds`` -- nodes that own the awaits inside them (Rust
+    #     ``async { }``): awaiting there suspends the block's future, not the
+    #     function, so the await scan stops at them. Nested functions and
+    #     lambdas (async closures among them) are skipped already.
+    await_kinds: frozenset[str] = frozenset()
+    await_scope_kinds: frozenset[str] = frozenset()
     exit_macro_kinds: frozenset[str] = frozenset()
     exit_macro_names: frozenset[str] = frozenset()
     #   * ``statement_wrapper_kinds`` -- statement node(s) that merely wrap the
@@ -312,6 +333,15 @@ class LanguageNodeMap:
     #     function's body never meet one.
     misread_scope: Callable[[Node], object] | None = None
 
+    # -- Local bindings ------------------------------------------------------
+    #   * ``local_value`` -- truthy for a ``function_kinds`` node that binds a
+    #     value and not a function (F#: ``let v = ...`` shares its node type
+    #     with ``let f x = ...``). Inside a function such a node is no unit of
+    #     its own, so it gets no entry there. None means every function-kind
+    #     node is a function. Checked only for nodes inside a collected
+    #     function; at module level the node keeps the entry it always had.
+    local_value: Callable[[Node], object] | None = None
+
 
 
 # Scalar type names C and C++ share, Win32's typedefs included because C/C++ on
@@ -338,6 +368,11 @@ _PY = LanguageNodeMap(
     # branch kinds. The comprehension ``for`` (``for_in_clause``) is a generator,
     # not a decision, so it is intentionally left out.
     branch_kinds=frozenset({"if_statement", "elif_clause", "conditional_expression", "if_clause"}),
+    # A conditional-expression chain (``1 if a else 2 if b else 3``) reads like
+    # an ``elif`` dispatch: each else-arm chooses rather than nests. The grammar
+    # names no branch fields, so the arm is found positionally.
+    flat_ternary_kinds=frozenset({"conditional_expression"}),
+    ternary_arms_positional=True,
     loop_kinds=frozenset({"for_statement", "while_statement"}),
     try_kinds=frozenset({"try_statement"}),
     catch_kinds=frozenset({"except_clause"}),
@@ -363,6 +398,9 @@ _PY = LanguageNodeMap(
     continue_kinds=frozenset({"continue_statement"}),
     with_kinds=frozenset({"with_statement"}),
     yield_kinds=frozenset({"yield"}),
+    # ``async`` marks ``async with`` / ``async for`` (and the comprehension
+    # form); a nested ``async def`` is a scope the slicer never enters.
+    await_kinds=frozenset({"await", "async"}),
     decorator_kinds=frozenset({"decorator"}),
     decorated_definition_kinds=frozenset({"decorated_definition"}),
 )
@@ -382,6 +420,7 @@ _TS = LanguageNodeMap(
     ),
     lambda_kinds=frozenset({"arrow_function"}),
     branch_kinds=frozenset({"if_statement", "ternary_expression"}),
+    flat_ternary_kinds=frozenset({"ternary_expression"}),
     loop_kinds=frozenset(
         {
             "for_statement",
@@ -421,6 +460,7 @@ _TS = LanguageNodeMap(
     break_kinds=frozenset({"break_statement"}),
     continue_kinds=frozenset({"continue_statement"}),
     yield_kinds=frozenset({"yield_expression"}),
+    await_kinds=frozenset({"await"}),
 )
 
 _JS = _TS  # identical control-flow nodes; tree-sitter-javascript shares shape.
@@ -486,6 +526,8 @@ _JAVA = LanguageNodeMap(
     catch_kinds=frozenset({"catch_clause"}),
     switch_kinds=frozenset({"switch_expression", "switch_statement"}),
     case_kinds=frozenset({"switch_block_statement_group", "switch_rule"}),
+    # A switch-rule ``yield t;`` parses as ``yield_statement`` (tree-sitter-java).
+    yield_kinds=frozenset({"yield_statement"}),
     boolean_operator_kinds=frozenset(),
     boolean_operator_text_kinds=frozenset({"binary_expression"}),
     class_kinds=frozenset({"class_declaration"}),
@@ -595,6 +637,8 @@ _RUST = LanguageNodeMap(
     exit_macro_names=frozenset({"bail", "ensure", "try"}),
     break_kinds=frozenset({"break_expression"}),
     continue_kinds=frozenset({"continue_expression"}),
+    await_kinds=frozenset({"await"}),
+    await_scope_kinds=frozenset({"async_block"}),
     # Rust parses every statement-position control-flow expression inside an
     # ``expression_statement``; the CFG builder unwraps it to classify the real
     # node, and the slicer uses this as the expression-oriented marker for
@@ -755,10 +799,15 @@ _CPP = LanguageNodeMap(
     local_decl_kinds=frozenset({"declaration"}),
     if_kinds=frozenset({"if_statement"}),
     block_kinds=frozenset({"compound_statement"}),
-    return_kinds=frozenset({"return_statement"}),
+    # ``co_return`` / ``co_yield`` leave a coroutine like ``return`` / ``yield``.
+    return_kinds=frozenset({"return_statement", "co_return_statement"}),
     raise_kinds=frozenset({"throw_statement"}),
     break_kinds=frozenset({"break_statement"}),
     continue_kinds=frozenset({"continue_statement"}),
+    yield_kinds=frozenset({"co_yield_statement"}),
+    # A coroutine carries no ``async`` token, so a span holding one is never
+    # offered as a mechanical extraction.
+    await_kinds=frozenset({"co_await"}),
 )
 
 _C = LanguageNodeMap(
@@ -859,6 +908,19 @@ _CSHARP = LanguageNodeMap(
     # invocations whose callee chain begins with ``Assert``.
     assert_call_kinds=frozenset({"invocation_expression"}),
     call_kinds=frozenset({"invocation_expression"}),
+    # ``x = ...`` and ``x += ...`` are both an ``assignment_expression`` (the
+    # dialect tells them apart by the ``operator`` token, as in Java and Go), so
+    # the augmented set stays empty.
+    assignment_kinds=frozenset({"assignment_expression"}),
+    local_decl_kinds=frozenset(
+        {"local_declaration_statement", "using_statement", "variable_declaration"}
+    ),
+    if_kinds=frozenset({"if_statement"}),
+    block_kinds=frozenset({"block"}),
+    return_kinds=frozenset({"return_statement", "yield_statement"}),
+    raise_kinds=frozenset({"throw_statement"}),
+    break_kinds=frozenset({"break_statement"}),
+    continue_kinds=frozenset({"continue_statement"}),
 )
 
 
@@ -1119,12 +1181,25 @@ _PASCAL = LanguageNodeMap(
 # until function kinds can carry a text predicate, no entry and no rows.
 
 
+def _fsharp_binds_a_value(node: Node) -> bool:
+    """``let v = ...`` as opposed to ``let f x = ...``: no parameter list."""
+    return node.type == "function_or_value_defn" and not any(
+        child.type == "function_declaration_left" for child in node.children
+    )
+
+
 # Known undercount, in the walker rather than this map: ``walk_file`` walks the
 # body node's children, so a body that IS one expression loses it and
 # ``let f x = if x > 0 then 1 else 2`` scores 1.
+#
+# A second one: a value bound inside a function (``let v = if a then 1 else
+# 2``) is a ``function_or_value_defn`` like a function, so the enclosing
+# function's walk stops at it, and ``local_value`` keeps it from getting an
+# entry of its own. Its branches are counted nowhere.
 _FSHARP = LanguageNodeMap(
     function_kinds=frozenset({"function_or_value_defn", "member_defn"}),
     lambda_kinds=frozenset(),
+    local_value=_fsharp_binds_a_value,
     branch_kinds=frozenset({"if_expression"}),
     loop_kinds=frozenset({"for_expression", "while_expression"}),
     try_kinds=frozenset({"try_expression"}),
@@ -1182,6 +1257,38 @@ _OBJC = LanguageNodeMap(
 )
 
 
+_PHP = LanguageNodeMap(
+    function_kinds=frozenset({"function_definition", "method_declaration"}),
+    lambda_kinds=frozenset({"anonymous_function", "arrow_function"}),
+    branch_kinds=frozenset({"if_statement", "else_if_clause", "conditional_expression"}),
+    loop_kinds=frozenset({"for_statement", "foreach_statement", "while_statement", "do_statement"}),
+    try_kinds=frozenset({"try_statement"}),
+    catch_kinds=frozenset({"catch_clause"}),
+    switch_kinds=frozenset({"switch_statement", "match_expression"}),
+    case_kinds=frozenset({"case_statement", "match_conditional_expression"}),
+    boolean_operator_kinds=frozenset(),
+    boolean_operator_text_kinds=frozenset({"binary_expression"}),
+    class_kinds=frozenset(
+        {"class_declaration", "trait_declaration", "interface_declaration", "enum_declaration"}
+    ),
+    self_identifiers=frozenset({"$this"}),
+    member_access_kinds=frozenset(
+        {"member_access_expression", "member_call_expression", "nullsafe_member_access_expression"}
+    ),
+    assert_call_kinds=frozenset(
+        {"member_call_expression", "scoped_call_expression", "function_call_expression"}
+    ),
+    call_kinds=frozenset(
+        {
+            "member_call_expression",
+            "scoped_call_expression",
+            "function_call_expression",
+            "nullsafe_member_call_expression",
+        }
+    ),
+)
+
+
 LANGUAGE_MAPS: dict[str, LanguageNodeMap] = {
     "python": _PY,
     "typescript": _TS,
@@ -1211,6 +1318,7 @@ LANGUAGE_MAPS: dict[str, LanguageNodeMap] = {
     # No "elixir" entry on purpose. See the note above ``_FSHARP``.
     "fsharp": _FSHARP,
     "objectivec": _OBJC,
+    "php": _PHP,
 }
 
 

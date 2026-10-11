@@ -11,6 +11,9 @@ from __future__ import annotations
 
 import posixpath
 
+from ..perf.actionability import BOUNDARY_NOUN
+from ..refactoring.render import brief
+
 TITLE_MAX = 90
 
 #: What the finding says about the code, completing "<subject> ...". The
@@ -66,13 +69,6 @@ REFACTOR_TITLE: dict[str, str] = {
 
 #: Appended to a why when a duplicate sits in the function being split.
 CLONED = "and part of it is duplicated, so splitting it also removes a copy"
-
-BOUNDARY_NOUN = {
-    "db": "database",
-    "filesystem": "file system",
-    "network": "network",
-    "subprocess": "subprocess",
-}
 
 #: Performance causes whose cost is not a boundary call: (title, problem, gain).
 PERF_SHAPE: dict[str, tuple[str, str, str]] = {
@@ -131,6 +127,11 @@ def imports_it(dependents: int) -> str:
 
 def plural(n: int, noun: str) -> str:
     return f"{n:,} {noun}" if n == 1 else f"{n:,} {noun}s"
+
+
+def held_back(n: int) -> str:
+    """Steps of a refactoring kind not yet audited, kept out of the item."""
+    return f"{n} (move or extract-class, not yet audited; in the full plan)"
 
 
 def short_symbol(symbol: str | None) -> str | None:
@@ -335,11 +336,14 @@ def history_fact(marker: str, details: dict, function: str | None = None) -> str
     return None
 
 
-def signature(name: str | None, params: list[str], returns: list[str]) -> str:
-    """``compute_x(a, b) -> c``; a long parameter list is cut with its count."""
-    shown = ", ".join(params[:4]) + (f", +{len(params) - 4} more" if len(params) > 4 else "")
-    out = f"{name}({shown})" if name else "a helper" + (f" taking ({shown})" if params else "")
-    return out + (f" -> {', '.join(returns[:3])}" if returns else "")
+def signature(
+    name: str | None, params: list[str], returns: list[str], *, is_async: bool = False
+) -> str:
+    """``_load(path) -> config``, as the plan's renderer phrases it
+    (``refactoring.render.brief``); a helper with no name reads ``<name>(...)``
+    and asks the reader to name it."""
+    out = brief(name, params, returns, is_async=is_async)
+    return out if name else f"{out}; name it for what the lines do"
 
 
 def first_sentence(text: str) -> str:

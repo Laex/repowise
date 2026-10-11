@@ -44,6 +44,7 @@ from repowise.core.persistence.crud import (
     list_performance_opportunities,
     performance_facet_counts,
 )
+from repowise.core.persistence.crud.analysis.queue_counts import any_unjudged, unit_counts
 
 from ..mcp_server._references import refactoring_plan_id
 
@@ -57,6 +58,8 @@ class PerformancePage:
     facets: dict[str, list[dict[str, Any]]]
     summary: dict[str, Any]
     ignored_arguments: dict[str, str] = field(default_factory=dict)
+    #: The causes' count vocabulary (``queue.counts``) in the query's files.
+    counts: dict[str, Any] = field(default_factory=dict)
 
 
 class PerformanceHealthService:
@@ -89,14 +92,14 @@ class PerformanceHealthService:
         filter control needs. It stays a single indexed aggregate over a table
         that already holds one row per cause rather than one per observation.
         """
+        judged = not (
+            query.default_queue
+            and await any_unjudged(self._session, self._repository_id, "causes")
+        )
         rows, total = await list_performance_opportunities(
             self._session,
             self._repository_id,
-            contexts=query.contexts,
-            boundary=query.boundary,
-            confidence=query.confidence,
-            actionabilities=query.actionabilities,
-            file_paths=query.file_paths,
+            **query.store_filters(judged=judged),
             sort=query.sort,
             limit=query.limit,
             offset=query.offset,
@@ -124,6 +127,15 @@ class PerformanceHealthService:
             next_offset=emitted if emitted < total else None,
             facets=await self._facets(query) if with_facets else {},
             summary=await self.summary(query.contexts) if with_summary else {},
+            counts=(
+                await unit_counts(
+                    self._session,
+                    self._repository_id,
+                    "causes",
+                    shown=len(items),
+                    file_paths=query.file_paths,
+                )
+            ).as_dict(),
         )
 
     async def _evidence_for(

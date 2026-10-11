@@ -1,6 +1,9 @@
+import { PERFORMANCE_EXECUTION_ROLES } from "@repowise-dev/types/health";
 import type {
   PerformanceActionabilityState,
   PerformanceContextFilter,
+  PerformanceCostProof,
+  PerformanceExecutionRole,
   PerformanceOpportunityConfidence,
   PerformanceOpportunityQuery,
 } from "@repowise-dev/types/health";
@@ -21,6 +24,8 @@ export interface PerformanceFilterState {
   boundary: string | null;
   confidence: PerformanceOpportunityConfidence | null;
   actionability: PerformanceActionabilityState | null;
+  proof: PerformanceCostProof | null;
+  role: PerformanceExecutionRole | "all" | null;
   sort: PerformanceSort;
   offset: number;
 }
@@ -36,12 +41,14 @@ export const INITIAL_FILTERS: PerformanceFilterState = {
   boundary: null,
   confidence: null,
   actionability: null,
+  proof: null,
+  role: null,
   sort: "rank",
   offset: 0,
 };
 
 /** The narrowing filters, apart from context, which is a permanent tab row. */
-const NARROWING_KEYS = ["boundary", "confidence", "actionability"] as const;
+const NARROWING_KEYS = ["boundary", "confidence", "actionability", "proof", "role"] as const;
 export type NarrowingKey = (typeof NARROWING_KEYS)[number];
 
 const SORTS: readonly PerformanceSort[] = ["rank", "leverage", "observations"];
@@ -52,6 +59,8 @@ const ACTIONABILITIES: readonly PerformanceActionabilityState[] = [
   "investigate",
   "expected",
 ];
+const PROOFS: readonly PerformanceCostProof[] = ["proven", "unproven", "background_unproven"];
+const ROLES: readonly (PerformanceExecutionRole | "all")[] = ["all", ...PERFORMANCE_EXECUTION_ROLES];
 const CONTEXTS: readonly PerformanceContextFilter[] = [
   "all",
   "production",
@@ -83,6 +92,8 @@ export function toQuery(
   if (state.boundary) query.boundary = state.boundary;
   if (state.confidence) query.confidence = state.confidence;
   if (state.actionability) query.actionability = state.actionability;
+  if (state.proof) query.proof = state.proof;
+  if (state.role) query.role = state.role;
   return query;
 }
 
@@ -102,6 +113,8 @@ export function serializeFilters(state: PerformanceFilterState): string {
   if (state.boundary) params.set("boundary", state.boundary);
   if (state.confidence) params.set("confidence", state.confidence);
   if (state.actionability) params.set("actionability", state.actionability);
+  if (state.proof) params.set("proof", state.proof);
+  if (state.role) params.set("role", state.role);
   if (state.sort !== INITIAL_FILTERS.sort) params.set("sort", state.sort);
   if (state.offset > 0) params.set("offset", String(state.offset));
   return params.toString();
@@ -124,6 +137,8 @@ export function parseFilters(search: string | URLSearchParams): PerformanceFilte
     boundary: params.get("boundary") || null,
     confidence: oneOf(params.get("confidence"), CONFIDENCES),
     actionability: oneOf(params.get("actionability"), ACTIONABILITIES),
+    proof: oneOf(params.get("proof"), PROOFS),
+    role: oneOf(params.get("role"), ROLES),
     sort: oneOf(params.get("sort"), SORTS) ?? INITIAL_FILTERS.sort,
     offset: Number.isFinite(offset) && offset > 0 ? offset : 0,
   };
@@ -140,7 +155,7 @@ export function withFilter<K extends keyof PerformanceFilterState>(
 }
 
 export function clearNarrowing(state: PerformanceFilterState): PerformanceFilterState {
-  return { ...state, boundary: null, confidence: null, actionability: null, offset: 0 };
+  return { ...state, boundary: null, confidence: null, actionability: null, proof: null, role: null, offset: 0 };
 }
 
 export function narrowingCount(state: PerformanceFilterState): number {

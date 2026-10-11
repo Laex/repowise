@@ -20,6 +20,15 @@ from tests.unit.health.fix_first_rows import FINDINGS, METRICS, PERFORMANCE, PLA
 from tests.unit.persistence.helpers import insert_repo
 
 
+def no_tests(path, function, start, end) -> dict:
+    """What the loader's test lookup answers for a finding no seeded test reaches."""
+    return {
+        "prerequisite": (
+            f"No test reaches this; add a characterization test for `{function}` before the edit."
+        )
+    }
+
+
 def _with_json(row: dict, name: str) -> dict:
     out = {k: v for k, v in row.items() if k != name}
     out[f"{name}_json"] = json.dumps(row.get(name) or {})
@@ -77,6 +86,7 @@ async def test_loader_matches_the_builder_over_rows(async_session) -> None:
         refactoring=REFACTORING,
         performance=PERFORMANCE,
         plans=PLANS,
+        validate=no_tests,
     )
     assert loaded == built
     # The seed exercises every kind, so equality is not over an empty queue.
@@ -130,6 +140,7 @@ async def test_loader_reads_the_stored_code_origin(async_session) -> None:
         refactoring=REFACTORING,
         performance=PERFORMANCE,
         plans=PLANS,
+        validate=no_tests,
     )
     assert loaded.totals.excluded["docs_example"] == 1
     # The update moved the metric's ``updated_at``, so only the basis differs.
@@ -180,6 +191,7 @@ async def test_loader_reads_verified_duplicates_as_a_fact(async_session) -> None
         refactoring=REFACTORING,
         performance=PERFORMANCE,
         plans=[*PLANS, helper],
+        validate=no_tests,
     )
     loaded = await load_fix_first(async_session, rid)
     assert "src/core.py" in {i.target.file_path for i in loaded.items}
@@ -218,6 +230,7 @@ async def test_loader_reads_extractions_for_a_finding_without_a_plan(async_sessi
         refactoring=REFACTORING,
         performance=PERFORMANCE,
         plans=[*PLANS, extraction],
+        validate=no_tests,
     )
     assert (loaded.items, loaded.totals) == (built.items, built.totals)
 
@@ -237,7 +250,7 @@ async def test_every_limit_and_id_is_a_slice_of_one_build(async_session, monkeyp
     monkeypatch.setattr(loader, "_build", counting)
     loader.clear_fix_first_cache()
     rows = {"metrics": METRICS, "findings": FINDINGS, "refactoring": REFACTORING,
-            "performance": PERFORMANCE, "plans": PLANS}
+            "performance": PERFORMANCE, "plans": PLANS, "validate": no_tests}
 
     full = await load_fix_first(async_session, rid, limit=None)
     assert full == build_fix_first(**rows, limit=None)
@@ -248,3 +261,108 @@ async def test_every_limit_and_id_is_a_slice_of_one_build(async_session, monkeyp
         **rows, item_id=second
     )
     assert builds == 1
+
+
+async def test_a_finding_item_verifies_with_measured_tests_of_its_lines(async_session) -> None:
+    """A finding with no plan takes its tests from coverage of its own lines."""
+    from repowise.core.persistence.models import TestCoverageEntry
+
+    rid = await seed_fix_first(async_session)
+    for test_id, lines in (
+        ("tests/test_plain.py::test_walk", [6, 7, 8]),
+        ("tests/test_plain.py::test_elsewhere", [50, 51]),
+    ):
+        async_session.add(
+            TestCoverageEntry(
+                repository_id=rid,
+                test_id=test_id,
+                test_file="tests/test_plain.py",
+                source_file="src/plain.py",
+                covered_lines_json=json.dumps(lines),
+                source_format="coverage_json",
+            )
+        )
+    await async_session.flush()
+    loaded = await load_fix_first(async_session, rid)
+    walk = next(i for i in loaded.items if i.target.file_path == "src/plain.py")
+    assert walk.kind == "finding"
+    assert walk.verify.basis == "measured"
+    assert [t.path for t in walk.verify.tests] == ["tests/test_plain.py::test_walk"]
+    assert walk.verify.tests_total == 1
+    assert walk.verify.command == "pytest tests/test_plain.py::test_walk"
+
+
+async def test_a_finding_item_with_no_tests_stays_unknown(async_session) -> None:
+    rid = await seed_fix_first(async_session)
+    loaded = await load_fix_first(async_session, rid)
+    walk = next(i for i in loaded.items if i.target.file_path == "src/plain.py")
+    assert (walk.verify.tests, walk.verify.basis, walk.verify.command) == ((), "unknown", None)
+    # The step to take before the edit, since no test pins today's behaviour.
+    assert walk.verify.prerequisite == (
+        "No test reaches this; add a characterization test for `walk` before the edit."
+    )
+
+
+async def test_loader_counts_dormant_causes_and_dead_code(async_session) -> None:
+    from repowise.core.persistence.models import DeadCodeFinding
+    from tests.unit.health.fix_first_rows import _perf
+
+    rid = (await insert_repo(async_session)).id
+    async_session.add(HealthFileMetric(repository_id=rid, file_path="src/repo.py", score=8.0,
+                                       nloc=90, is_test=False))
+    gated = _perf("perf3_gated", "x", actionability_state="expected", plan_state="no_safe_plan",
+                  fix_strategy=None, intervention_symbol="src/repo.py::off")
+    gated = _with_json(gated, "details")
+    gated["details_json"] = json.dumps({"actionability_reason": "gated_off"})
+    live = _perf("perf3_live", "y")
+    async_session.add_all([
+        PerformanceOpportunity(repository_id=rid, **gated),
+        PerformanceOpportunity(repository_id=rid, **_with_json(live, "details")),
+        DeadCodeFinding(repository_id=rid, kind="unused_internal", file_path="src/repo.py",
+                        symbol_name="load_all", confidence=0.9, status="open"),
+    ])
+    await async_session.flush()
+    queue = await load_fix_first(async_session, rid)
+    assert queue.items == ()
+    assert queue.totals.excluded["gated_off"] == 1 and queue.totals.dormant == 1
+    assert queue.totals.excluded["unreachable"] == 1
+
+
+def test_json_text_renders_for_both_dialects() -> None:
+    from sqlalchemy import column, select
+    from sqlalchemy.dialects import postgresql, sqlite
+
+    from repowise.core.persistence.sql import json_text
+
+    query = select(json_text(column("details_json"), "actionability_reason"))
+    assert "json_extract(details_json" in str(query.compile(dialect=sqlite.dialect()))
+    assert "CAST(details_json AS JSON) ->>" in str(query.compile(dialect=postgresql.dialect()))
+
+
+async def test_an_unverified_read_skips_the_test_lookup(async_session, monkeypatch) -> None:
+    """The actions view never shows tests, so it must not pay for resolving them.
+
+    The verified queue, once built, answers an unverified read too.
+    """
+    from repowise.core.persistence.crud.analysis import fix_first as loader
+
+    rid = await seed_fix_first(async_session)
+    loader.clear_fix_first_cache()
+    calls = 0
+    original = loader._finding_validator
+
+    async def counting(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(loader, "_finding_validator", counting)
+    bare = await load_fix_first(async_session, rid, verify=False)
+    assert calls == 0
+    assert [i.id for i in bare.items] == [i.id for i in (await load_fix_first(async_session, rid)).items]
+    assert calls == 1
+    unverified = await load_fix_first(async_session, rid, limit=None, verify=False)
+    assert [i.id for i in unverified.items] == [
+        i.id for i in (await load_fix_first(async_session, rid, limit=None)).items
+    ]
+    assert calls == 1

@@ -12,14 +12,29 @@ what makes them agree.
 from __future__ import annotations
 
 import json
-from typing import Any
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import (
+    Select,
+    bindparam,
+    case,
+    func,
+    inspect,
+    or_,
+    select,
+    update,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
 
 from ....analysis.finding_registry import excluded_types
 from ...models import RefactoringSuggestion, _new_uuid, _now_utc
+from ...sql import rule_predicate
 from .._shared import _BATCH_SIZE, _finding_file_path
+
+if TYPE_CHECKING:
+    from .refactoring_payoff import PayoffContext
 
 # The finding-triage vocabulary, shared with health findings so Code Health has
 # one triage system rather than one per layer.
@@ -125,22 +140,30 @@ def _scope_predicates(
     return predicates
 
 
+def _field(item: Any, name: str) -> Any:
+    """*name* off a ``RefactoringSuggestion`` dataclass or a plain dict."""
+    return item.get(name) if isinstance(item, dict) else getattr(item, name, None)
+
+
+def _target_of(item: Any) -> tuple[str, str, str]:
+    return (
+        _field(item, "refactoring_type"),
+        _finding_file_path(item),
+        _field(item, "target_symbol"),
+    )
+
+
 def _scope_suggestions(
     suggestions: list[Any],
     *,
     allowed: set[str] | None,
     refactoring_type: str | None,
 ) -> list[Any]:
-    def _type_of(item: Any) -> Any:
-        if hasattr(item, "refactoring_type"):
-            return item.refactoring_type
-        return item.get("refactoring_type")
-
     return [
         item
         for item in suggestions
         if (allowed is None or _finding_file_path(item) in allowed)
-        and (refactoring_type is None or _type_of(item) == refactoring_type)
+        and (refactoring_type is None or _field(item, "refactoring_type") == refactoring_type)
     ]
 
 
@@ -151,6 +174,7 @@ async def finalize_refactoring_suggestions(
     *,
     file_paths: list[str] | None = None,
     refactoring_type: str | None = None,
+    payoff: PayoffContext | None = None,
 ) -> int:
     """Reconcile a detector run against the stored plans. Returns rows left open.
 
@@ -175,6 +199,9 @@ async def finalize_refactoring_suggestions(
       answering and stops reading as current;
     - a row from an older model, or one written before public ids existed, is
       resolved for the same reason. Ids are not translated across models.
+
+    With *payoff*, each current-model plan this call resolves gets a payoff row
+    (``refactoring_payoff``), and a reopened plan loses its own.
     """
     from ....analysis.health.refactoring.identity import (
         REFACTORING_MODEL_VERSION,
@@ -227,6 +254,8 @@ async def finalize_refactoring_suggestions(
     now = _now_utc()
     seen: set[str] = set()
     pending: list[RefactoringSuggestion] = []
+    reopened: list[str] = []
+    resolved: list[RefactoringSuggestion] = []
     for suggestion, public_id in zip(scoped, public_ids, strict=True):
         if public_id in seen:
             # Two plans reaching one id would violate the uniqueness readers rely
@@ -248,10 +277,14 @@ async def finalize_refactoring_suggestions(
         for name in _REFRESHED_COLUMNS:
             if name in values:
                 setattr(row, name, values[name])
+        # Unranked until the finalizer ranks the refreshed content; a finalize
+        # that fails then leaves no stale rank beside fresh fields.
+        row.rank_position = row.blast_size = row.rank_json = None
         if row.status == "resolved" and row.status_reason == "no_longer_detected":
             row.status = "open"
             row.status_reason = None
             row.status_changed_at = now
+            reopened.append(row.id)
         row.updated_at = now
 
     for row in stored_rows:
@@ -259,6 +292,9 @@ async def finalize_refactoring_suggestions(
             continue
         if row.status in ("resolved", "false_positive"):
             continue
+        # An older model's row resolves because its id changed, not its code.
+        if row.public_id and row.model_version == REFACTORING_MODEL_VERSION:
+            resolved.append(row)
         row.status = "resolved"
         row.status_reason = "no_longer_detected"
         row.status_changed_at = now
@@ -269,6 +305,17 @@ async def finalize_refactoring_suggestions(
             session.add(row)
         await session.flush()
     await session.flush()
+    if payoff is not None:
+        from .refactoring_payoff import settle_refactoring_payoffs
+
+        await settle_refactoring_payoffs(
+            session,
+            repository_id,
+            resolved=resolved,
+            reopened=reopened,
+            detected={_target_of(item) for item in scoped},
+            ctx=payoff,
+        )
 
     return sum(1 for row in stored_rows if row.status == "open") + len(pending)
 
@@ -277,13 +324,15 @@ async def save_refactoring_suggestions(
     session: AsyncSession,
     repository_id: str,
     suggestions: list[Any],
+    *,
+    payoff: PayoffContext | None = None,
 ) -> None:
     """Reconcile every refactoring suggestion for *repository_id*.
 
     The full-reindex entry point. Accepts ``RefactoringSuggestion`` dataclasses
     or plain dicts.
     """
-    await finalize_refactoring_suggestions(session, repository_id, suggestions)
+    await finalize_refactoring_suggestions(session, repository_id, suggestions, payoff=payoff)
 
 
 async def upsert_refactoring_suggestions(
@@ -293,6 +342,7 @@ async def upsert_refactoring_suggestions(
     *,
     file_paths: list[str],
     refactoring_type: str | None = None,
+    payoff: PayoffContext | None = None,
 ) -> None:
     """Reconcile suggestions **only for the given file paths**.
 
@@ -309,6 +359,7 @@ async def upsert_refactoring_suggestions(
         suggestions,
         file_paths=list(file_paths),
         refactoring_type=refactoring_type,
+        payoff=payoff,
     )
 
 
@@ -475,3 +526,189 @@ async def count_refactoring_suggestions(
         )
     )
     return int((await session.execute(q)).scalar_one())
+
+
+# ---------------------------------------------------------------------------
+# Persisted rank: written once per finalize, read by every plan list
+# ---------------------------------------------------------------------------
+
+
+async def store_plan_ranks(
+    session: AsyncSession, repository_id: str, recommendations: list[Any]
+) -> None:
+    """Persist rank position, rank facts and change surface for *recommendations*.
+
+    Every other row is cleared first, so a plan the finalizer did not rank
+    (resolved, or reopened by hand since) reads as unranked and its list falls
+    back to ranking live until the next index. Neither write moves
+    ``updated_at``: a rank is derived, not a change to the plan.
+    """
+    from ....analysis.health.refactoring.recommendations import blast_size, canonical_order
+
+    table = RefactoringSuggestion.__table__
+    await session.execute(
+        update(table)
+        .where(table.c.repository_id == repository_id, table.c.rank_position.is_not(None))
+        .values(
+            rank_position=None, blast_size=None, rank_json=None, updated_at=table.c.updated_at
+        )
+    )
+    values = [
+        {
+            "plan_id": item.id,
+            "position": position,
+            "surface": blast_size(item.suggestion),
+            "facts": json.dumps(item.rank_facts(), separators=(",", ":")),
+        }
+        for position, item in enumerate(canonical_order(recommendations))
+    ]
+    statement = (
+        update(table)
+        .where(table.c.id == bindparam("plan_id"))
+        .values(
+            rank_position=bindparam("position"),
+            blast_size=bindparam("surface"),
+            rank_json=bindparam("facts"),
+            updated_at=table.c.updated_at,
+        )
+    )
+    for index in range(0, len(values), _BATCH_SIZE):
+        await session.execute(statement, values[index : index + _BATCH_SIZE])
+    _sync_loaded_ranks(session, repository_id, values)
+
+
+def _sync_loaded_ranks(
+    session: AsyncSession, repository_id: str, values: list[dict[str, Any]]
+) -> None:
+    """Give every plan this session holds the rank just written: the Core writes
+    bypass the identity map, and a later select returns a held instance as loaded."""
+    # Not an ORM bulk update by id instead: that fires ``updated_at``'s onupdate.
+    written = {item["plan_id"]: item for item in values}
+    for instance in list(session.sync_session.identity_map.values()):
+        if not isinstance(instance, RefactoringSuggestion):
+            continue
+        loaded = inspect(instance).dict
+        if loaded.get("repository_id") != repository_id:
+            continue
+        # A plan this finalize did not rank was cleared above, so it reads None.
+        item = written.get(loaded.get("id"), {})
+        set_committed_value(instance, "rank_position", item.get("position"))
+        set_committed_value(instance, "blast_size", item.get("surface"))
+        set_committed_value(instance, "rank_json", item.get("facts"))
+
+
+def _base_order(view: str, predicates: list[Any]) -> tuple[Select[Any], tuple[Any, ...]]:
+    """The plan query and its view order, before any narrowing filter.
+
+    ``file_spread`` deals one plan per file per round over the whole base set,
+    files in order of their best plan, as :func:`apply_view` does in memory.
+    """
+    if view != "file_spread":
+        query = select(RefactoringSuggestion).where(*predicates)
+        return query, (RefactoringSuggestion.rank_position,)
+    position = RefactoringSuggestion.rank_position
+    spread = (
+        select(
+            RefactoringSuggestion.id.label("plan_id"),
+            func.row_number()
+            .over(partition_by=RefactoringSuggestion.file_path, order_by=position)
+            .label("spread_round"),
+            func.min(position).over(partition_by=RefactoringSuggestion.file_path).label("first"),
+        )
+        .where(*predicates)
+        .subquery()
+    )
+    query = select(RefactoringSuggestion).join(spread, spread.c.plan_id == RefactoringSuggestion.id)
+    return query, (spread.c.spread_round, spread.c.first)
+
+
+async def ranked_refactoring_suggestions(
+    session: AsyncSession,
+    repository_id: str,
+    *,
+    min_confidence: str | None = None,
+    filters: Mapping[str, Any] | None = None,
+    view: str = "canonical",
+) -> list[RefactoringSuggestion] | None:
+    """The open plans in persisted rank order.
+
+    *filters* are the params of the shared ``PLAN_FILTERS``. They narrow after
+    the view is dealt, as the in-memory path does, so a filtered
+    ``file_spread`` keeps the order the unfiltered one had. ``None`` when an
+    open plan was not ranked by the last finalize: the caller ranks live.
+    """
+    from ....analysis.health.queue_rules import active_filters
+    from ....analysis.health.refactoring.recommendations import PLAN_FILTERS
+
+    base = _suggestion_filters(
+        repository_id,
+        refactoring_type=None,
+        file_paths=None,
+        min_confidence=min_confidence,
+        status="open",
+    )
+    unranked = await session.execute(
+        select(RefactoringSuggestion.id)
+        .where(*base, RefactoringSuggestion.rank_position.is_(None))
+        .limit(1)
+    )
+    if unranked.first() is not None:
+        return None
+    query, order = _base_order(view, base)
+    narrowing = [
+        rule_predicate(RefactoringSuggestion, rule, value)
+        for rule, value in active_filters(PLAN_FILTERS, filters or {})
+    ]
+    query = query.where(*narrowing).order_by(*order)
+    return list((await session.execute(query)).scalars().all())
+
+
+async def summarize_open_plans(
+    session: AsyncSession, repository_id: str, *, min_confidence: str | None = None
+) -> dict[str, Any]:
+    """The plan board's chip counts over the open plans, from narrow columns.
+
+    The plan payload is read only for the grouping types whose design count
+    needs it.
+    """
+    from ....analysis.health.refactoring_summary import GROUPING_TYPES, summarize_plans
+
+    kind = RefactoringSuggestion.refactoring_type
+    rows = await session.execute(
+        select(
+            kind,
+            RefactoringSuggestion.file_path,
+            RefactoringSuggestion.effort_bucket,
+            RefactoringSuggestion.impact_delta,
+            case(
+                (kind.in_(sorted(GROUPING_TYPES)), RefactoringSuggestion.plan_json), else_=None
+            ).label("plan_json"),
+        ).where(
+            *_suggestion_filters(
+                repository_id,
+                refactoring_type=None,
+                file_paths=None,
+                min_confidence=min_confidence,
+                status="open",
+            )
+        )
+    )
+    return summarize_plans(rows.all())
+
+
+async def refactoring_suggestions_by_public_id(
+    session: AsyncSession, repository_id: str, public_ids: list[str]
+) -> list[RefactoringSuggestion]:
+    """The plans named by *public_ids*, in that order, in one indexed query."""
+    if not public_ids:
+        return []
+    rows = (
+        await session.execute(
+            select(RefactoringSuggestion).where(
+                RefactoringSuggestion.repository_id == repository_id,
+                RefactoringSuggestion.public_id.in_(public_ids),
+            )
+        )
+    ).scalars()
+    by_id = {row.public_id: row for row in rows}
+    return [by_id[pid] for pid in public_ids if pid in by_id]

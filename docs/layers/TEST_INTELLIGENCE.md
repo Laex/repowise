@@ -70,6 +70,13 @@ known direction: a call edge says control *can* reach a file, not that a run
 did. So it is safe as a floor ("something reaches this, do not call it
 untested") and unsafe as a quantity.
 
+Each index also keeps, for every function, the few test functions nearest it in
+the call graph. Refactoring plans quote them as runnable selectors in place of
+whole test files, and they are inferred like the rest of the graph map. A
+function with no resolved caller, or in a language whose tests cannot be told
+apart by name (such as Java's `@Test` or Rust's `#[test]`), is left unknown
+rather than called untested.
+
 Each ingest replaces the previous per-file and per-test rows. Ingest at the
 commit you intend to query so line numbers match. The repo-wide totals of the
 newest 50 ingests are kept as history and drawn as a trend on the Tests tab
@@ -165,6 +172,13 @@ Each result says how it was found, and a guess never passes for evidence:
 | None of the above | "unknown, run the full suite to be safe" |
 | No map ingested at all | A prompt to run `coverage add` on a report with contexts |
 
+The graph also carries test wiring no import states: runner setup files
+(`setupFiles`, `globalSetup` and the like) link to the tests their config runs,
+a helper a test starts by a path relative to itself links to that test, and a
+`conftest.py` links to the files pytest collects. Each fixture request links
+the test to the fixture, so a change a conftest reaches only through its
+imports selects the tests whose fixtures use it, plus one import check.
+
 With `--format list` the caveats go to stderr so the pipe stays clean. The
 command exits `0` in every case: it reports, it does not gate. `--format args`
 prints runner arguments, or `:all` whenever any part of the answer is unknown.
@@ -232,26 +246,34 @@ with a different subsystem's `test_engine.py` by basename alone.
 
 ## From an agent
 
-**`get_risk(changed_files=[...])`** leads with a `directive` whose
-`test_recommendations` names up to ten tests for the changed files. Each row
-keeps its `basis`:
+**`get_risk(changed_files=[...], include=["tests"])`** leads with a `directive`
+whose `test_recommendations` names up to ten tests for the changed files. Each
+row keeps its `basis`:
 
 | `basis` | Holds | Means |
 |---|---|---|
 | `measured` | A test node id | The per-test map shows the test covering a changed file |
 | `inferred` | A test file path | The graph shows the test reaching the change; a candidate, not proof |
 
-`tests_to_run` is the older flat id list, measured first. `coverage_analysis`
-says whether coverage is available, partial, degraded or stale.
+`tests_to_run`, sent without the include, is the run list from the same
+selection `repowise impacted-tests` makes, with `tests_to_run_basis`,
+`tests_to_run_why` and `tests_run_all` (plus `tests_run_all_reasons` when every
+test must run). Without a coverage map the directive carries
+`coverage: {status, reason}`; with one, `coverage_analysis` says whether
+coverage is available, partial, degraded or stale.
 
-**`get_change_risk(revspec=...)`** returns `impacted_tests`, computed from the
-changed *lines*, so it is narrower:
+**`get_change_risk(revspec=...)`** returns `impacted_tests`, the same selection
+over the change's diff, so a measured map at either end of it matches by line:
 
 ```json
 {
-  "status": "map_present",
+  "status": "selected",
+  "run_all": false,
+  "reasons": [],
+  "basis": "measured",
   "map_present": true,
-  "tests": ["tests/test_auth.py::test_login", "..."],
+  "tests_to_run": ["tests/test_auth.py::test_login", "..."],
+  "why": {"tests/test_auth.py": "src/auth.py changed (coverage)"},
   "total": 23,
   "truncated": true,
   "line_coverage": {
@@ -260,14 +282,14 @@ changed *lines*, so it is narrower:
     "covered": [...],
     "no_coverage_data": [...]
   },
-  "summary": "23 test(s) cover the changed lines; showing first 10."
+  "summary": "23 test(s) to run for this change; showing first 10; the rest can be skipped."
 }
 ```
 
 `untested_changes` is the strong signal: the file is in the map but nothing
 covers the lines you touched. `stale_test_candidates` flags covered lines whose
 guarding test is absent from the diff. `no_coverage_data` means the file is not
-in the map. `get_change_risk` leaves out the CLI's filename-pattern guess.
+in the map.
 
 **Self-checking before a push.** `get_change_risk` without a `revspec` measures
 `patch_coverage` over everything a push would bring: the working tree
@@ -299,11 +321,15 @@ carries a discriminator beside the list:
 
   | `status` | Meaning |
   |---|---|
-  | `map_present` | A per-test map exists. An empty `tests` list here is a real finding: nothing in the map covers this change |
-  | `inferred` | No map; the graph names candidate test files. Passing them does not clear the change |
-  | `no_map` | No map and no graph answer. The summary says to run the full suite |
+  | `selected` | The selection vouches for `tests_to_run`. Empty here means the change needs no test (documentation, a deleted test) |
+  | `run_all` | Every test must run; `reasons` says why, and `tests_to_run` is what to run first |
   | `no_index` | Nothing indexed yet |
-  | `unknown` | The git read failed |
+  | `unknown` | The git or index read failed |
+  | `config_invalid` | `tests.*` in `.repowise/config.yaml` does not parse |
+  | `timeout` | The selection took over 30 seconds; `repowise impacted-tests` gives the same answer |
+  | `busy` | A selection for this repository is still running |
+
+  Every status but `selected` carries `run_all: true`: nothing vouches for a subset.
   | `no_source_line_changes` | No changed source lines to map |
 
 - `get_risk` keeps coverage availability, freshness and map presence explicit

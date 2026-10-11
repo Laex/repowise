@@ -96,10 +96,10 @@ _CONTRACTS: dict[str, ResponseBudgetContract] = {
         "blocks",
         (
             "global_hotspots",
-            "pr_blast_radius.guarding_tests",
             "pr_blast_radius",
             "directive.test_recommendations[]",
             "directive.tests_to_run[]",
+            "directive.tests_to_update[]",
             "directive.may_break[]",
             "directive.next_calls[]",
             "targets[]",
@@ -113,14 +113,16 @@ _CONTRACTS: dict[str, ResponseBudgetContract] = {
         ),
         requested_projections=(
             (
+                # The cards are the changed files, so they outlive the blast
+                # block, which stays first to go even when asked for.
                 "changed_files",
                 (
                     "directive.test_recommendations[]",
                     "directive.tests_to_run[]",
+                    "directive.tests_to_update[]",
                     "directive.may_break[]",
                     "directive.next_calls[]",
-                    "pr_blast_radius",
-                    "pr_blast_radius.guarding_tests",
+                    "targets[]",
                 ),
             ),
             # targets is required, so it is always asked for. Without this the
@@ -147,7 +149,6 @@ _CONTRACTS: dict[str, ResponseBudgetContract] = {
             "patch_coverage.files[]",
             "patch_coverage",
             "impacted_tests",
-            "health_delta.limits",
             "health_delta.skipped",
             "health_delta.top_findings[]",
         ),
@@ -321,11 +322,14 @@ _CONTRACTS: dict[str, ResponseBudgetContract] = {
             "performance_summary",
             "high_leverage_files[]",
             "secondary_rankings",
+            # A named page holds up to 25 items; its tail goes last of all.
+            "fix_first.items[]",
         ),
         protected=(
             "mode",
-            # The one lead, bounded by construction (at most five compact
-            # items): shedding it would leave the dashboard with nothing to do.
+            # The one lead: shedding the block would leave the dashboard with
+            # nothing to do. Bounded by construction (five compact items, or
+            # one named page), and only its page's tail is ever trimmed.
             "fix_first",
             "fix_id",
             "opportunity_id",
@@ -373,6 +377,7 @@ _CONTRACTS: dict[str, ResponseBudgetContract] = {
             "verified",
             "continuation",
             "continuation_reference",
+            "members",
             "error",
         ),
     ),
@@ -777,6 +782,21 @@ def _emergency_fit(
             return
 
 
+def _call_arguments(
+    signature: inspect.Signature, args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> dict[str, Any] | None:
+    """The call's arguments with defaults applied; ``None`` when the signature
+    is not the tool's own (a bridged call budgets with an empty one)."""
+    if not signature.parameters:
+        return None
+    try:
+        bound = signature.bind_partial(*args, **kwargs)
+    except TypeError:
+        return None
+    bound.apply_defaults()
+    return dict(bound.arguments)
+
+
 def _lead_with_dropped_targets(
     tool: str,
     result: dict[str, Any],
@@ -883,7 +903,7 @@ def enforce_response_budget(
         emergency.attach(result)
         trimmed = True
 
-    run_post_enforce(tool, result)
+    run_post_enforce(tool, result, _call_arguments(signature, args, kwargs))
 
     if result.get("truncated"):
         result.setdefault("_meta", {}).setdefault("state", {})["truncated"] = True

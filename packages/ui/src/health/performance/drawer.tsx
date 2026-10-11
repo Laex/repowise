@@ -10,10 +10,17 @@ import type {
   PerformanceOpportunityValidation,
   PerformanceModelState,
 } from "@repowise-dev/types/health";
-import type { RecommendationValidation, RefactoringPlan } from "@repowise-dev/types/refactoring";
+import type {
+  RecommendationValidation,
+  RefactoringPlan,
+  StepVerify,
+} from "@repowise-dev/types/refactoring";
 
 import { AdaptivePanel } from "../../shared/adaptive-panel";
+import { CollapsibleSection } from "../../shared/collapsible-section";
 import { InfoTip } from "../../shared/info-tip";
+import { formatNumber } from "../../lib/format";
+import { CommandLine } from "../../shared/command-line";
 import { ProvenancePathList } from "../../shared/provenance-path-list";
 import { performancePlanDetail } from "../../refactoring/types";
 import { SourceExcerpt } from "../../refactoring/source-excerpt";
@@ -240,7 +247,11 @@ function PlanSteps({ steps }: { steps: PerformanceOpportunityPlanStep[] }) {
     <ol className="mt-3 space-y-1.5">
       {groups.map((group, index) => {
         const first = group[0]!;
-        const places = group.map(where).filter((p): p is string => Boolean(p));
+        const places = group
+          .map((step) => ({ place: where(step), verify: step.verify }))
+          .filter((p): p is { place: string; verify: StepVerify | undefined } =>
+            Boolean(p.place),
+          );
         return (
           <li key={first.order} className="text-sm text-[var(--color-text-secondary)]">
             <span className="tabular-nums text-[var(--color-text-tertiary)]">{index + 1}.</span>{" "}
@@ -254,14 +265,18 @@ function PlanSteps({ steps }: { steps: PerformanceOpportunityPlanStep[] }) {
               <span className="ml-1.5 text-xs text-[var(--color-text-tertiary)]">mechanical</span>
             ) : null}
             {places.length === 1 ? (
-              <span className="ml-1.5 break-all font-mono text-xs text-[var(--color-text-tertiary)]">
-                {places[0]}
-              </span>
+              <>
+                <span className="ml-1.5 break-all font-mono text-xs text-[var(--color-text-tertiary)]">
+                  {places[0]!.place}
+                </span>
+                <StepCheck verify={places[0]!.verify} />
+              </>
             ) : places.length > 1 ? (
               <ul className="mt-1 space-y-0.5 pl-5">
                 {places.map((p) => (
-                  <li key={p} className="break-all font-mono text-xs text-[var(--color-text-tertiary)]">
-                    {p}
+                  <li key={p.place} className="break-all font-mono text-xs text-[var(--color-text-tertiary)]">
+                    {p.place}
+                    <StepCheck verify={p.verify} />
                   </li>
                 ))}
               </ul>
@@ -270,6 +285,28 @@ function PlanSteps({ steps }: { steps: PerformanceOpportunityPlanStep[] }) {
         );
       })}
     </ol>
+  );
+}
+
+/**
+ * How to check one step, when it differs from the plan: the server omits
+ * `verify` on a step the plan's validation already checks.
+ */
+function StepCheck({ verify }: { verify: StepVerify | undefined }) {
+  if (!verify) return null;
+  if (verify.coverage === "none") {
+    return (
+      <p className="mt-1 font-sans text-xs text-[var(--color-text-tertiary)]">
+        No test reaches this step.
+      </p>
+    );
+  }
+  return (
+    <>
+      {verify.commands.map((command) => (
+        <CommandLine key={command} command={command} />
+      ))}
+    </>
   );
 }
 
@@ -314,14 +351,6 @@ function PlanSection({
         </p>
       ) : null}
       {steps && steps.length > 0 ? <PlanSteps steps={steps} /> : null}
-      {opportunity.validation ? (
-        <div className="mt-3">
-          <ValidationSummary
-            validation={toRecommendationValidation(opportunity.validation)}
-            fileHref={adapter.fileHref}
-          />
-        </div>
-      ) : null}
       {planId && !enabled ? (
         <p className="mt-2 text-xs text-[var(--color-text-tertiary)]">
           This host cannot open the stored plan. Its id is{" "}
@@ -423,7 +452,73 @@ export function OpportunityDrawer({
 
             <CodeSection opportunity={current} adapter={adapter} />
 
-            <Section title="What the evidence shows">
+            {current.siblings && current.siblings.length > 0 ? (
+              <SiblingsNote siblings={current.siblings} onSelect={onSelectById} />
+            ) : null}
+
+            <Section title="Whether it can be changed">
+              <dl className="grid grid-cols-1 gap-x-4 gap-y-4 sm:grid-cols-2">
+                <Field
+                  label="Actionability"
+                  value={ACTIONABILITY_LABEL[current.actionability_state]}
+                  detail={humanizeToken(current.actionability_reason)}
+                />
+                <Field
+                  label="Actionability confidence"
+                  value={CONFIDENCE_LABEL[current.facets.actionability_confidence]}
+                  detail="Whether reducing the work is likely valid."
+                />
+                <Field
+                  label="Fix safety"
+                  value={current.fix ? humanizeToken(current.fix.safety) : "No named fix"}
+                  detail={
+                    current.fix
+                      ? "Whether this one transformation is safe to apply."
+                      : "No transformation was proposed, so none was judged safe."
+                  }
+                />
+              </dl>
+              {current.prerequisites.length > 0 ? (
+                <div className="mt-3">
+                  <p className="text-xs text-[var(--color-text-tertiary)]">
+                    Missing before a fix can be named:
+                  </p>
+                  <ul className="mt-1 list-inside list-disc text-xs text-[var(--color-text-secondary)]">
+                    {current.prerequisites.map((item) => (
+                      <li key={item}>{humanizeToken(item)}</li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+            </Section>
+
+            <PlanSection
+              opportunity={current}
+              adapter={adapter}
+              enabled={planEnabled}
+              plan={plan}
+            />
+
+            <RelatedSection adapter={adapter} filePath={current.file_path} />
+
+            {current.validation ? (
+              <CollapsibleSection
+                title="Tests"
+                hint={
+                  current.validation.total > 0
+                    ? `${formatNumber(current.validation.total)} guarding`
+                    : "none guarding"
+                }
+                defaultOpen={current.validation.total === 0}
+              >
+                <ValidationSummary
+                  validation={toRecommendationValidation(current.validation)}
+                  fileHref={adapter.fileHref}
+                />
+              </CollapsibleSection>
+            ) : null}
+
+            <CollapsibleSection title="What the evidence shows">
               <dl className="grid grid-cols-1 gap-x-4 gap-y-4 sm:grid-cols-2">
                 <Field label="Context" value={contextLabel(current.execution_context)} />
                 <Field label="Boundary" value={boundaryLabel(current.boundary_kind)} />
@@ -465,50 +560,11 @@ export function OpportunityDrawer({
                   />
                 ) : null}
               </dl>
-              {current.siblings && current.siblings.length > 0 ? (
-                <SiblingsNote siblings={current.siblings} onSelect={onSelectById} />
-              ) : null}
-            </Section>
+            </CollapsibleSection>
 
-            <Section title="Whether it can be changed">
-              <dl className="grid grid-cols-1 gap-x-4 gap-y-4 sm:grid-cols-2">
-                <Field
-                  label="Actionability"
-                  value={ACTIONABILITY_LABEL[current.actionability_state]}
-                  detail={humanizeToken(current.actionability_reason)}
-                />
-                <Field
-                  label="Actionability confidence"
-                  value={CONFIDENCE_LABEL[current.facets.actionability_confidence]}
-                  detail="Whether reducing the work is likely valid."
-                />
-                <Field
-                  label="Fix safety"
-                  value={current.fix ? humanizeToken(current.fix.safety) : "No named fix"}
-                  detail={
-                    current.fix
-                      ? "Whether this one transformation is safe to apply."
-                      : "No transformation was proposed, so none was judged safe."
-                  }
-                />
-              </dl>
-              {current.prerequisites.length > 0 ? (
-                <div className="mt-3">
-                  <p className="text-xs text-[var(--color-text-tertiary)]">
-                    Missing before a fix can be named:
-                  </p>
-                  <ul className="mt-1 list-inside list-disc text-xs text-[var(--color-text-secondary)]">
-                    {current.prerequisites.map((item) => (
-                      <li key={item}>{humanizeToken(item)}</li>
-                    ))}
-                  </ul>
-                </div>
-              ) : null}
-            </Section>
-
-            <Section title="Why it ranks here">
+            <CollapsibleSection title="Why it ranks here">
               <p className="text-sm text-[var(--color-text-secondary)]">
-                Position <span className="tabular-nums">{current.rank_position.toLocaleString()}</span>{" "}
+                Position <span className="tabular-nums">{(current.rank_position + 1).toLocaleString()}</span>{" "}
                 in the queue.
               </p>
               {current.why_ranked.length > 0 ? (
@@ -520,19 +576,10 @@ export function OpportunityDrawer({
                   ))}
                 </ul>
               ) : null}
-            </Section>
-
-            <PlanSection
-              opportunity={current}
-              adapter={adapter}
-              enabled={planEnabled}
-              plan={plan}
-            />
-
-            <RelatedSection adapter={adapter} filePath={current.file_path} />
+            </CollapsibleSection>
 
             {current.evidence.some((item) => item.path.length > 0) ? (
-              <Section title="Caller to sink paths">
+              <CollapsibleSection title="Caller to sink paths">
                 <ProvenancePathList
                   paths={current.evidence
                     .filter((item) => item.path.length > 0)
@@ -541,7 +588,7 @@ export function OpportunityDrawer({
                   fileHref={adapter.fileHref}
                   {...(adapter.symbolHref ? { symbolHref: adapter.symbolHref } : {})}
                 />
-              </Section>
+              </CollapsibleSection>
             ) : null}
 
             <RawObservations
@@ -552,7 +599,7 @@ export function OpportunityDrawer({
               adapter={adapter}
             />
 
-            <Section title="Hand this to an agent">
+            <CollapsibleSection title="Hand this to an agent">
               <p className="text-sm text-[var(--color-text-secondary)]">
                 Ask for the same record by its stable id:
               </p>
@@ -565,7 +612,7 @@ export function OpportunityDrawer({
                   <span className="font-mono">{resolved.analyzed_commit.slice(0, 7)}</span>.
                 </p>
               ) : null}
-            </Section>
+            </CollapsibleSection>
           </div>
 
           <div className="flex items-center gap-3 border-t border-[var(--color-border-default)] bg-[var(--color-bg-elevated)] px-5 py-3.5">

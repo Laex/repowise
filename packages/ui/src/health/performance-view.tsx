@@ -17,6 +17,7 @@ import { AiPromptModal } from "./ai-prompt-modal";
 import {
   buildPerformanceOpportunityPrompt,
   buildRefactoringPlanPrompt,
+  type AiPromptFlavor,
 } from "./ai-prompt-builder";
 import type { PerformanceViewAdapter } from "./performance/adapter";
 import { capabilitiesOf } from "./performance/capabilities";
@@ -112,6 +113,16 @@ export function PerformanceView({
     opportunity: PerformanceOpportunity;
     plan: RefactoringPlan | null;
   } | null>(null);
+
+  // Core renders the plan prompt; held stable so the modal fetches once per flavor.
+  const planId = promptFor?.plan?.id;
+  const planPrompt = useMemo(
+    () =>
+      planId && adapter.getRefactoringPlanPrompt
+        ? (flavor: AiPromptFlavor) => adapter.getRefactoringPlanPrompt!(planId, flavor)
+        : undefined,
+    [planId, adapter],
+  );
 
   const apply = (next: PerformanceFilterState) => {
     setFilters(next);
@@ -212,7 +223,11 @@ export function PerformanceView({
         <PageLede
           label="Causal opportunities"
           value={summary.total.toLocaleString()}
-          unit="ranked causes, not repeated observations"
+          unit={
+            data.counts
+              ? `ranked causes, not repeated observations; ${data.counts.eligible.toLocaleString()} in the default queue, ${data.counts.inventory.toLocaleString()} in the repository`
+              : "ranked causes, not repeated observations"
+          }
           layout="beside"
           figureFooter={
             <p className="text-caption text-[var(--color-text-tertiary)]">
@@ -341,10 +356,13 @@ export function PerformanceView({
         onOpenChange={(open) => {
           if (!open) setPromptFor(null);
         }}
+        promptSource={planPrompt}
         getPrompt={
-          promptFor?.plan
+          // A host without the prompt route (an older server) builds the plan
+          // prompt here instead; remove with `buildRefactoringPlanPrompt`.
+          promptFor?.plan && !planPrompt
             ? (flavor) => buildRefactoringPlanPrompt({ plan: promptFor.plan!, flavor })
-            : promptFor
+            : promptFor && !promptFor.plan
               ? (flavor) =>
                   buildPerformanceOpportunityPrompt({
                     opportunity: promptFor.opportunity,

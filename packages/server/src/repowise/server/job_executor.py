@@ -202,7 +202,8 @@ class JobProgressCallback:
     def on_message(self, level: str, text: str) -> None:
         if self._events is not None:
             self._events.add(level, text)
-        getattr(logger, level, logger.info)(text, job_id=self._job_id, phase=self._phase)
+        log_level = "info" if level == "notice" else level
+        getattr(logger, log_level, logger.info)(text, job_id=self._job_id, phase=self._phase)
 
     def _sync_job_status(self, *, force: bool = False) -> None:
         """Fire-and-forget progress update in the current event loop.
@@ -652,6 +653,11 @@ async def _persist_index_result(run: _JobRun, result: Any, incremental_pages: li
             from repowise.core.pipeline.page_tree_sync import rebuild_page_tree
 
             await rebuild_page_tree(session, repo_id)
+
+        # Every store is final: the views the overview and dashboard read.
+        from repowise.core.persistence.crud.analysis.actions import write_read_snapshots
+
+        await write_read_snapshots(session, repo_id)
 
         # Vector deletes before the SQL commit: a separate store, so no lock
         # conflict, and the idempotent delete keeps the durable commit last.

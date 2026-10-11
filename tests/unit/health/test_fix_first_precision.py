@@ -304,13 +304,13 @@ def test_other_causes_keep_an_unknown_loop() -> None:
     assert len(_perf_queue(row).items) == 1
 
 
-# --- F8: unknown loops no entry point reaches -----------------------------------
+# --- F8: unknown loops no request, message or job runs ------------------------------
 
 
-def _value(**facets) -> str:
+def _value(role: str = "unknown", **facets) -> str:
     from tests.unit.health.fix_first_rows import _perf
 
-    row = _perf("perf3_v", "src/db.py::fetch")
+    row = _perf("perf3_v", "src/db.py::fetch", execution_role=role)
     row["details"] = {**row["details"], "facets": facets}
     item = _perf_queue(row).lead
     return next(f.value for f in item.why_ranked if f.factor in ("value", "value within later"))
@@ -333,14 +333,16 @@ def test_only_a_loop_known_to_grow_leads() -> None:
     assert lead(loop_magnitude="grows_with_data").tier != "later"
 
 
-def test_an_unknown_loop_no_entry_reaches_drops_a_step() -> None:
-    assert _value(loop_magnitude="unknown", exposure="not_entry_reachable") == "1"
-    assert _value(loop_magnitude="unknown") == "1"
+def test_an_unknown_loop_no_hot_role_runs_drops_a_step() -> None:
+    assert _value(loop_magnitude="unknown") == "0"
+    # A name-derived entry point no longer counts: only the role does.
+    assert _value(loop_magnitude="unknown", exposure="entry_reachable") == "0"
 
 
-def test_reach_or_a_known_loop_keeps_the_step() -> None:
-    assert _value(loop_magnitude="unknown", exposure="entry_reachable") == "2"
-    assert _value(loop_magnitude="grows_with_data", exposure="not_entry_reachable") == "2"
+def test_reach_keeps_an_unknown_loop_a_step_below_a_known_one() -> None:
+    # An unproven cost never earns the value a loop known to grow does.
+    assert _value("request", loop_magnitude="unknown") == "1"
+    assert _value(loop_magnitude="grows_with_data") == "2"
 
 
 # --- lift: a duplicate inside the function ---------------------------------------
@@ -481,9 +483,15 @@ def test_a_module_scope_cause_reads_module_scope_of_its_file() -> None:
 
 
 def test_a_production_reachable_growing_db_loop_is_in_the_top_band() -> None:
-    from repowise.core.analysis.health.fix_first.build import VALUE_MAX
+    from repowise.core.analysis.health.queue.value import VALUE_MAX
 
-    assert _value(loop_magnitude="grows_with_data", exposure="entry_reachable") == str(VALUE_MAX)
+    grows = {"loop_magnitude": "grows_with_data"}
+    # Request or message, then a scheduled job, then no role evidence; a cold
+    # role never leads.
+    assert _value("request", **grows) == _value("event_consumer", **grows) == str(VALUE_MAX)
+    assert _value("scheduled_job", **grows) == "3"
+    assert _value("unknown", **grows) == "2"
+    assert _value("cli", **grows) == "1"
 
 
 def test_it_outranks_a_large_function_that_needs_judgment_on_score() -> None:
@@ -525,11 +533,13 @@ def test_a_one_line_block_reads_as_one_line() -> None:
 # --- kinds the baseline raters found not worth doing -------------------------------
 
 
-def test_extract_class_and_move_method_plans_are_low_value() -> None:
+def test_extract_class_and_move_method_plans_wait_for_their_audit() -> None:
     plan = {"groups": [{"methods": ["load", "save"], "fields": ["db"]}]}
-    assert _refactor_queue("extract_class", plan).totals.excluded["low_value_kind"] == 1
+    split = _refactor_queue("extract_class", plan)
+    assert split.items == () and split.totals.excluded["kind_unaudited"] == 1
     moved = _refactor_queue("move_method", {"to_class": "Ledger"})
-    assert moved.items == () and moved.totals.excluded["low_value_kind"] == 1
+    assert moved.items == () and moved.totals.excluded["kind_unaudited"] == 1
+    assert moved.totals.excluded["low_value_kind"] == 0
 
 
 def test_large_method_and_low_cohesion_findings_are_low_value() -> None:
@@ -555,3 +565,24 @@ def test_a_rust_panic_path_is_no_fix_first_candidate() -> None:
     assert queue.items == () and queue.totals.excluded["low_value_kind"] == 2
     swallowed = {**rows[0], "file_path": "src/a.py", "details": {"kind": "swallowed_catch"}}
     assert [i.target.file_path for i in _queue([swallowed]).items] == ["src/a.py"]
+
+
+def test_a_perf_step_names_its_function_unless_the_action_already_does() -> None:
+    from repowise.core.analysis.health.fix_first.build import _perf_step_text
+
+    quoted = {"action": "Batch the per-row session.get calls", "symbol": "src/db.py::Store.get"}
+    assert _perf_step_text(quoted, "src/db.py") == f"{quoted['action']} (Store.get)"
+    named = {"action": "Pass every key to get at once", "symbol": "src/db.py::Store.get"}
+    assert _perf_step_text(named, "src/db.py") == named["action"]
+
+
+def test_a_span_that_awaits_is_extracted_into_an_awaited_async_helper() -> None:
+    from repowise.core.analysis.health.fix_first import text
+
+    assert text.signature("load_rows", ["db"], ["rows"]) == "load_rows(db) -> rows"
+    assert text.signature("load_rows", ["db"], ["rows"], is_async=True) == (
+        "async load_rows(db) -> rows, awaited at the call site"
+    )
+    assert text.signature(None, ["db"], [], is_async=True) == (
+        "async <name>(db), awaited at the call site; name it for what the lines do"
+    )

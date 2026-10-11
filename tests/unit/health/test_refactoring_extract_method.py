@@ -20,6 +20,7 @@ from repowise.core.analysis.health.refactoring.extract_method import (
     recovered_share,
 )
 from repowise.core.analysis.health.refactoring.models import RefactoringContext
+from repowise.core.ingestion.parser import _get_language
 
 # A long function whose tail (compute-average loop) is a clean extraction.
 _PROCESS = """
@@ -92,6 +93,92 @@ def test_finds_clean_extraction_with_inferred_signature():
     assert best.slice_nloc >= 5
 
 
+# The same tail as _PROCESS, with a comment opening the else arm. The CFG fix keeps
+# the arm's block on the statement's line, so the slice still sees it.
+_PROCESS_ELSE_COMMENT = """
+def process(records, threshold):
+    results = []
+    errors = 0
+    for r in records:
+        if r is None:
+            errors += 1
+            continue
+        results.append(r)
+    total = 0
+    count = 0
+    for v in results:
+        if v > threshold:
+            total += v
+            count += 1
+        else:
+            # count the misses too
+            total -= v
+    average = total / count if count else 0
+    return average, errors
+"""
+
+
+def test_a_comment_opening_the_else_arm_still_yields_the_same_extraction():
+    # The comment must not change which span is offered or the parameters it takes.
+    lmap = get_language_map("python")
+    extractions = find_extractions(_first(_PROCESS_ELSE_COMMENT), lmap)
+    assert extractions, "expected at least one extraction"
+    best = extractions[0]
+    assert "average" in best.returns
+    assert "results" in best.params and "threshold" in best.params
+    assert len(best.returns) <= 1
+    assert best.ccn_removed >= 1
+    assert best.slice_nloc >= 5
+
+
+_JAVA_SWITCH_RULE_YIELD = """
+class A {
+    int pick(int[] xs, int k) {
+        int total = 0;
+        for (int x : xs) {
+            total += x;
+        }
+        int r = switch (k) {
+            case 1 -> {
+                int t = 0;
+                for (int x : xs) {
+                    if (x > 0) {
+                        t += x;
+                    }
+                    if (x > 10) {
+                        t -= 1;
+                    }
+                }
+                yield t;
+            }
+            default -> 0;
+        };
+        return r + total;
+    }
+}
+"""
+
+
+def test_a_java_switch_rule_yield_refuses_spans_that_hold_it():
+    # Lifting a span that contains a switch-rule `yield` into a helper would
+    # move the yield out of the switch rule it belongs to, so the plan cannot
+    # compile. Spans that stop before the yield stay offered.
+    if _get_language("java") is None:
+        pytest.skip("tree-sitter language pack missing for java")
+    res = analyze_file("m.java", "java", _JAVA_SWITCH_RULE_YIELD.encode(), flagged_only=False)
+    if res.stats.functions_seen == 0:
+        pytest.skip("tree-sitter language pack missing for java")
+    fn = res.functions[0]
+    lmap = get_language_map("java")
+    extractions = find_extractions(fn, lmap)
+    assert extractions, "expected at least one extraction"
+    # The yield is on line 19; no offered span may end on it, and the span
+    # that stops just before it stays the best one.
+    assert all(extraction.end_line != 19 for extraction in extractions)
+    best = extractions[0]
+    assert (best.start_line, best.end_line) == (10, 18)
+
+
 def test_no_extraction_when_every_span_has_a_jump():
     # A guard-clause cascade: every span contains a return, so nothing is a
     # single-exit slice -> no candidate.
@@ -158,18 +245,20 @@ def _find_extractions_reference(analysis, lmap):
         _MIN_SLICE_NLOC,
         _MIN_STMTS,
         Extraction,
-        _all_blocks,
         _declared_before_read,
         _exit_macros,
         _function_lines,
         _infer_in_out,
-    _loop_carry_free,
-    _outs_definitely_assigned,
+        _loop_carry_free,
+        _outs_definitely_assigned,
+        _reads_observing,
+        _Scan,
         _sorted,
         _span_metrics,
         _stmts_nloc,
         _unwrap_container,
         _var_lines,
+        all_blocks,
     )
 
     fn_node = analysis.fn_node
@@ -183,6 +272,7 @@ def _find_extractions_reference(analysis, lmap):
     body_nloc = _stmts_nloc(body_container.named_children, lines)
     def_lines, use_lines = _var_lines(analysis.def_use)
     declared_first = _declared_before_read(analysis.def_use)
+    reads = _reads_observing(analysis, def_lines)
     decision_kinds = (
         lmap.branch_kinds
         | lmap.loop_kinds
@@ -206,7 +296,7 @@ def _find_extractions_reference(analysis, lmap):
 
     out = []
     evaluated = 0
-    for block, loop in _all_blocks(fn_node, lmap.block_kinds, scope_kinds, lmap.loop_kinds):
+    for block, loop in all_blocks(fn_node, lmap.block_kinds, scope_kinds, lmap.loop_kinds):
         stmts = block.named_children
         n = len(stmts)
         is_body = block.id == body_container.id
@@ -227,8 +317,15 @@ def _find_extractions_reference(analysis, lmap):
                 ):
                     continue
                 span = stmts[i : j + 1]
-                decisions, has_jump = _span_metrics(
-                    span, decision_kinds, jump_kinds, scope_kinds, _exit_macros(lmap)
+                decisions, has_jump, has_await, *_ = _span_metrics(
+                    span,
+                    _Scan(
+                        decision_kinds,
+                        jump_kinds,
+                        scope_kinds,
+                        _exit_macros(lmap),
+                        (lmap.await_kinds, lmap.await_scope_kinds),
+                    ),
                 )
                 if has_jump or decisions < _MIN_CCN_REMOVED:
                     continue
@@ -237,7 +334,9 @@ def _find_extractions_reference(analysis, lmap):
                     continue
                 s = span[0].start_point[0] + 1
                 e = span[-1].end_point[0] + 1
-                params, returns = _infer_in_out(def_lines, use_lines, s, e, declared_first)
+                params, returns = _infer_in_out(
+                    def_lines, use_lines, s, e, declared_first, reads=reads
+                )
                 if len(params) > _MAX_PARAMS or len(returns) > _MAX_RETURNS:
                     continue
                 if not _outs_definitely_assigned(span, returns, def_lines, lmap):
@@ -254,6 +353,7 @@ def _find_extractions_reference(analysis, lmap):
                         returns=returns,
                         slice_nloc=slice_nloc,
                         ccn_removed=decisions,
+                        needs_async=has_await,
                     )
                 )
     return _sorted(out)
@@ -365,6 +465,196 @@ def _ctx(src: str, findings):
     )
 
 
+def _process_sources() -> dict[str, tuple[str, str]]:
+    """``language -> (extension, source)`` for one shape in every language the
+    slicer has a dialect for. The source is the same algorithm spelled the way
+    each language writes it, so a name difference cannot come from the code."""
+    py = textwrap.dedent(_PROCESS)
+    java = textwrap.dedent(
+        """
+        class Demo {
+            int process(int[] records, int threshold) {
+                int errors = 0;
+                java.util.List<Integer> results = new java.util.ArrayList<>();
+                for (int r : records) {
+                    if (r < 0) {
+                        errors++;
+                        continue;
+                    }
+                    results.add(r);
+                }
+                int total = 0;
+                int count = 0;
+                for (int v : results) {
+                    if (v > threshold) {
+                        total += v;
+                        count++;
+                    } else {
+                        total -= v;
+                    }
+                }
+                int average = 0;
+                if (count > 0) {
+                    average = total / count;
+                }
+                return average + errors;
+            }
+        }
+        """
+    )
+    ts = textwrap.dedent(
+        """
+        function process(records: number[], threshold: number): number {
+            const results: number[] = [];
+            let errors = 0;
+            for (const r of records) {
+                if (r < 0) {
+                    errors += 1;
+                    continue;
+                }
+                results.push(r);
+            }
+            let total = 0;
+            let count = 0;
+            for (const v of results) {
+                if (v > threshold) {
+                    total += v;
+                    count += 1;
+                } else {
+                    total -= v;
+                }
+            }
+            let average = 0;
+            if (count > 0) {
+                average = total / count;
+            }
+            return average + errors;
+        }
+        """
+    )
+    go = textwrap.dedent(
+        """
+        package main
+
+        func process(records []int, threshold int) int {
+            errors := 0
+            results := []int{}
+            for _, r := range records {
+                if r < 0 {
+                    errors++
+                    continue
+                }
+                results = append(results, r)
+            }
+            total := 0
+            count := 0
+            for _, v := range results {
+                if v > threshold {
+                    total += v
+                    count++
+                } else {
+                    total -= v
+                }
+            }
+            average := 0
+            if count > 0 {
+                average = total / count
+            }
+            return average + errors
+        }
+        """
+    )
+    rust = textwrap.dedent(
+        """
+        fn process(records: &[i32], threshold: i32) -> i32 {
+            let mut errors = 0;
+            let mut results: Vec<i32> = Vec::new();
+            for r in records {
+                if *r < 0 {
+                    errors += 1;
+                    continue;
+                }
+                results.push(*r);
+            }
+            let mut total = 0;
+            let mut count = 0;
+            for v in &results {
+                if *v > threshold {
+                    total += v;
+                    count += 1;
+                } else {
+                    total -= v;
+                }
+            }
+            let mut average = 0;
+            if count > 0 {
+                average = total / count;
+            }
+            average + errors
+        }
+        """
+    )
+    cpp = textwrap.dedent(
+        """
+        int process(int* records, int n, int threshold) {
+            int errors = 0;
+            std::vector<int> results;
+            for (int i = 0; i < n; i++) {
+                if (records[i] < 0) {
+                    errors++;
+                    continue;
+                }
+                results.push_back(records[i]);
+            }
+            int total = 0;
+            int count = 0;
+            for (int v : results) {
+                if (v > threshold) {
+                    total += v;
+                    count++;
+                } else {
+                    total -= v;
+                }
+            }
+            int average = 0;
+            if (count > 0) {
+                average = total / count;
+            }
+            return average + errors;
+        }
+        """
+    )
+    return {
+        "python": ("py", py),
+        "java": ("java", java),
+        "typescript": ("ts", ts),
+        "go": ("go", go),
+        "rust": ("rs", rust),
+        "cpp": ("cpp", cpp),
+    }
+
+
+def _detect_in(language: str, ext: str, src: str):
+    from repowise.core.ingestion.parser import _get_language
+
+    if _get_language(language) is None:
+        pytest.skip(f"tree-sitter language pack missing for {language}")
+    res = analyze_file(f"m.{ext}", language, src.encode(), flagged_only=False)
+    if res.stats.functions_seen == 0:
+        pytest.skip(f"tree-sitter language pack missing for {language}")
+    fn = res.functions[0]
+    ctx = RefactoringContext(
+        file_path=f"m.{ext}",
+        language=language,
+        nloc=100,
+        findings=[_Finding("complex_method", fn.name, fn.start_line, 1.5)],
+        function_analyses=res.functions,
+    )
+    plans = [s for s in ExtractMethodDetector().detect(ctx) if s.refactoring_type == "extract_method"]
+    assert plans, f"no extract_method plan for {language}"
+    return plans[0]
+
+
 def test_detector_emits_suggestion_for_flagged_function():
     findings = [_Finding("complex_method", "process", line_start=2, health_impact=1.5)]
     suggestions = ExtractMethodDetector().detect(_ctx(_PROCESS, findings))
@@ -379,7 +669,30 @@ def test_detector_emits_suggestion_for_flagged_function():
     assert 0 < share < 1
     assert s.impact_delta == round(1.5 * share, 3)
     # Plan shape is the locked schema.
-    assert set(s.plan) == {"span", "params", "returns", "suggested_name"}
+    assert set(s.plan) == {
+        "span",
+        "params",
+        "returns",
+        "suggested_name",
+        "needs_async",
+        "new_symbol",
+        "call_site",
+        "anchors",
+    }
+    assert s.plan["needs_async"] is False
+    # A module-level function: the helper is a plain function too.
+    assert s.plan["new_symbol"] == {
+        "kind": "function",
+        "async": False,
+        "receiver": None,
+        "uses_receiver": False,
+        "assigns": [],
+        "params": s.plan["new_symbol"]["params"],
+        "returns": s.plan["new_symbol"]["returns"],
+        "signature_text": s.plan["new_symbol"]["signature_text"],
+        "return_text": "return average",
+    }
+    assert s.plan["call_site"]["replace_span"] == s.plan["span"]
     assert set(s.plan["span"]) == {"start", "end"}
     assert set(s.evidence) == {"slice_nloc", "ccn_removed"}
     # A categorical claim, not a count: extraction is local, so there is nothing
@@ -400,7 +713,8 @@ def test_plan_carries_a_computed_name_not_a_hardcoded_none():
     # The slice's single OUT value is ``average``, so the span is by
     # construction the code that computes it.
     assert s.plan["returns"] == ["average"]
-    assert s.plan["suggested_name"] == "compute_average"
+    # In Python's private form.
+    assert s.plan["suggested_name"] == "_compute_average"
 
 
 class _Extraction:
@@ -415,10 +729,20 @@ class _Analysis:
 
 def test_suggested_name_unit():
     name = ExtractMethodDetector._suggested_name
-    # Exactly one OUT -> name the helper for what it produces.
-    assert name(_Analysis("process"), _Extraction(["average"])) == "compute_average"
+    # Exactly one OUT -> name the helper for what it produces, in the language's
+    # own convention.
+    assert name(_Analysis("process"), _Extraction(["average"]), "python") == "compute_average"
     # Non-identifier characters normalised through the shared slug.
-    assert name(_Analysis("p"), _Extraction(["total-count"])) == "compute_total_count"
+    assert name(_Analysis("p"), _Extraction(["total-count"]), "python") == "compute_total_count"
+    # A call with no language keeps the snake_case default (the pre-existing
+    # behaviour), so an unset ``ctx.language`` degrades rather than changes shape.
+    assert name(_Analysis("process"), _Extraction(["average"])) == "compute_average"
+
+
+def test_suggested_name_none_cases_are_unchanged_by_the_language():
+    """Control: the no-anchor rules this change must not touch. Each of these
+    was ``None`` before it and must stay ``None`` after, in every language."""
+    name = ExtractMethodDetector._suggested_name
     # No single OUT -> no anchor, so no name. The enclosing function's name
     # described the span's context, never the span, and collided with every
     # sibling plan in the file.
@@ -431,6 +755,60 @@ def test_suggested_name_unit():
     assert name(_Analysis("process"), _Extraction(["result"])) is None
     # Nothing usable at all -> no name at all.
     assert name(_Analysis("___"), _Extraction([])) is None
+    # And none of the above becomes a name just because the language is camelCase.
+    for lang in ("java", "go", "typescript", "cpp", "python"):
+        assert name(_Analysis("process"), _Extraction([]), lang) is None
+        assert name(_Analysis("process"), _Extraction(["result"]), lang) is None
+        assert name(_Analysis("process"), _Extraction(["___"]), lang) is None
+
+
+def test_suggested_name_follows_the_language_convention():
+    name = ExtractMethodDetector._suggested_name
+    # camelCase languages.
+    for lang in ("java", "go", "typescript", "tsx", "javascript", "jsx", "svelte", "vue"):
+        assert name(_Analysis("process"), _Extraction(["average"]), lang) == "computeAverage", lang
+    # snake_case languages, and C++ which has no single convention.
+    for lang in ("python", "rust", "cpp"):
+        assert name(_Analysis("process"), _Extraction(["average"]), lang) == "compute_average", lang
+    # An unknown language falls back rather than raising.
+    assert name(_Analysis("process"), _Extraction(["average"]), "cobol") == "compute_average"
+    # A language whose file has several words keeps all of them.
+    assert (
+        name(_Analysis("process"), _Extraction(["total_count"]), "java") == "computeTotalCount"
+    )
+
+
+def test_suggested_name_keeps_the_out_values_own_casing():
+    name = ExtractMethodDetector._suggested_name
+    # ``meanValue`` must survive as word boundaries. Lowercasing the whole label
+    # first (the old slug) gave ``compute_meanvalue``, neither camelCase nor
+    # snake_case.
+    assert name(_Analysis("process"), _Extraction(["meanValue"]), "java") == "computeMeanValue"
+    assert name(_Analysis("process"), _Extraction(["mean_value"]), "java") == "computeMeanValue"
+    assert name(_Analysis("process"), _Extraction(["MeanValue"]), "java") == "computeMeanValue"
+    assert name(_Analysis("process"), _Extraction(["meanValue"]), "python") == "compute_mean_value"
+    # A run of capitals stays one word: splitting it needs a dictionary.
+    assert name(_Analysis("process"), _Extraction(["HTTPStatus"]), "java") == "computeHttpstatus"
+    # The role-word guard still sees a multi-word out value's joined slug.
+    assert name(_Analysis("process"), _Extraction(["item_value"]), "java") == "computeItemValue"
+
+
+@pytest.mark.parametrize(
+    ("language", "expected"),
+    [
+        ("python", "_compute_average"),
+        ("rust", "compute_average"),
+        ("cpp", "compute_average"),
+        ("java", "computeAverage"),
+        ("typescript", "computeAverage"),
+        ("go", "computeAverage"),
+    ],
+)
+def test_detector_names_the_helper_in_the_files_language(language: str, expected: str):
+    ext, src = _process_sources()[language]
+    plan = _detect_in(language, ext, src)
+    assert plan.plan["returns"] == ["average"], language
+    assert plan.plan["suggested_name"] == expected, language
 
 
 def test_detector_silent_without_matching_finding():
@@ -490,7 +868,15 @@ def test_share_follows_what_the_biomarker_measures():
     assert recovered_share("large_method", fn, span) == 0.25
     assert recovered_share("brain_method", fn, span) == 0.5
     # Capped: a span cannot recover more than the whole finding.
-    assert recovered_share("large_method", _Shape(3, 10), _Span(2, 20)) == 1.0
+    assert recovered_share("large_method", _Shape(2, 10), _Span(2, 20)) == 1.0
+
+
+def test_no_biomarker_credits_more_than_the_decision_point_share():
+    # A long flat span (137 code lines, 2 decision points out of 40) moves
+    # straight-line code: the size share must not stand in for the split.
+    fn, span = _Shape(40, 200), _Span(2, 137)
+    assert recovered_share("large_method", fn, span) == pytest.approx(2 / 40)
+    assert recovered_share("brain_method", fn, span) == pytest.approx(2 / 40)
 
 
 def test_two_decision_points_out_of_a_tiny_size_finding_claim_little():
@@ -500,12 +886,13 @@ def test_two_decision_points_out_of_a_tiny_size_finding_claim_little():
     assert share == pytest.approx(16 / 292)
 
 
-def test_floor_drops_a_one_point_span_unless_it_is_a_large_size_lift():
+def test_floor_drops_a_one_point_span_whatever_its_size():
     fn = _Shape(12, 80)
     assert not _worth_extracting(fn, _Span(1, 8), {"complex_method"})
     assert _worth_extracting(fn, _Span(2, 5), {"complex_method"})
-    assert not _worth_extracting(fn, _Span(1, 11), {"large_method"})
-    assert _worth_extracting(fn, _Span(1, 12), {"large_method"})
+    # A 137-line span lifting one decision point out of a large method
+    # (registerChannelsCli) is no longer a size lift worth a plan.
+    assert not _worth_extracting(_Shape(30, 180), _Span(1, 137), {"large_method"})
 
 
 def test_a_helper_inheriting_the_finding_undiminished_is_not_worth_it():
@@ -652,8 +1039,10 @@ def test_a_best_span_below_the_floor_yields_to_the_next_one(monkeypatch):
     from repowise.core.analysis.health.refactoring import extract_method
 
     trivial = Extraction(10, 17, ("a",), (), slice_nloc=8, ccn_removed=1)
-    worth = Extraction(20, 25, ("b",), (), slice_nloc=6, ccn_removed=3)
-    monkeypatch.setattr(extract_method, "find_extractions", lambda _a, _l: [trivial, worth])
+    worth = Extraction(20, 27, ("b",), (), slice_nloc=8, ccn_removed=3)
+    monkeypatch.setattr(extract_method, "find_extractions", lambda _a, _l, _r=None, _p=None, _rf=None: [trivial, worth])
+    # No parsed source to anchor against: this pins span choice, not anchoring.
+    monkeypatch.setattr(extract_method, "anchor_plan", lambda _plan, _fn: True)
     fn = _Shape(12, 40)
     analysis = type(
         "A", (), {"name": "f", "start_line": 1, "end_line": 50, "ccn": 12, "nloc": 40,
@@ -668,7 +1057,7 @@ def test_a_best_span_below_the_floor_yields_to_the_next_one(monkeypatch):
         function_analyses=[analysis],
     )
     (s,) = ExtractMethodDetector().detect(ctx)
-    assert s.plan["span"] == {"start": 20, "end": 25}
+    assert s.plan["span"] == {"start": 20, "end": 27}
     assert s.impact_delta == round(1.2 * 3 / 12, 3)
 
 
@@ -742,3 +1131,222 @@ def test_a_span_leaving_real_work_behind_is_still_offered():
     (best, *_) = find_extractions(fn, lmap)
     assert "average" in best.returns
     assert best.end_line < fn.end_line
+
+
+# -- offer gates (span share, size, docstring start) ---------------------------------
+
+
+def _fn_lines(start: int, end: int):
+    return type("A", (), {"start_line": start, "end_line": end, "fn_node": None})()
+
+
+def _offer(fn_span: tuple[int, int], span: tuple[int, int], nloc: int, ccn: int = 9) -> bool:
+    from repowise.core.analysis.health.dataflow import Extraction
+    from repowise.core.analysis.health.refactoring.extract_method import _offerable
+
+    return _offerable(_fn_lines(*fn_span), Extraction(*span, (), (), nloc, ccn))
+
+
+@pytest.mark.parametrize(
+    ("fn_span", "span", "nloc"),
+    [
+        ((31, 313), (108, 311), 183),  # parseLineDirectives, share 0.72
+        ((1601, 1827), (1665, 1826), 151),  # cmd_migrate, share 0.71
+        ((18, 63), (29, 57), 23),  # buildConformanceOverlay, share 0.63
+    ],
+)
+def test_a_span_over_three_fifths_of_the_function_is_not_offered(fn_span, span, nloc):
+    assert not _offer(fn_span, span, nloc)
+
+
+def test_a_six_line_span_is_not_offered():
+    # bulk_update: 6 code lines out of a 132-line function.
+    assert not _offer((1304, 1435), (1349, 1354), 6, ccn=3)
+    assert _offer((1304, 1435), (1349, 1356), 8, ccn=3)
+
+
+@pytest.mark.parametrize(
+    ("fn_span", "span", "nloc"),
+    [
+        ((171, 210), (186, 209), 24),  # extract_include_dirs, share exactly 0.600
+        ((1699, 2208), (1769, 1786), 12),  # compute_order_by_sql
+        ((273, 367), (326, 366), 37),  # _start_multiplex
+        ((170, 216), (183, 204), 21),  # parallel provider search
+        ((20, 78), (38, 59), 22),  # qwen-oauth prepare_messages
+    ],
+)
+def test_calibration_shapes_are_still_offered(fn_span, span, nloc):
+    assert _offer(fn_span, span, nloc)
+
+
+# uninstall_gui: the slicer's best span ties with the one a line lower and wins
+# on the earlier start, so it opens on the docstring.
+_DOCSTRING_FIRST = """
+def uninstall(home, packaged, keep):
+    \"\"\"Remove the built artifacts and the packaged app.
+
+    Never touches user data. Returns the paths removed.
+    \"\"\"
+    removed = []
+    for path in home:
+        if path.exists() and path.is_dir():
+            removed.append(path)
+    for path in packaged:
+        if path.exists() or path.is_symlink():
+            removed.append(path)
+    print(len(removed))
+    if not removed:
+        print("nothing to remove")
+        return []
+    if keep:
+        print("kept user data")
+        return removed
+    print("removed user data")
+    print("done")
+    print("bye")
+    return removed
+"""
+
+
+def test_a_span_opening_on_the_docstring_is_not_offered():
+    fn = _first(_DOCSTRING_FIRST)
+    (best, *_) = find_extractions(fn, get_language_map("python"))
+    assert best.start_line == fn.start_line + 1  # the docstring line
+    findings = [_Finding("complex_method", "uninstall", fn.start_line, 1.5)]
+    assert ExtractMethodDetector().detect(_ctx(_DOCSTRING_FIRST, findings)) == []
+
+
+def test_a_leading_comment_is_not_a_docstring():
+    from repowise.core.analysis.health.refactoring.extract_method import _starts_on_docstring
+
+    node = _parse(
+        "typescript",
+        """
+        function f(a: number[]) {
+          /** Totals the positive values. */
+          let total = 0;
+          return total;
+        }
+        """,
+    )
+    assert not _starts_on_docstring(node, node.start_point[0] + 2)
+    assert not _starts_on_docstring(node, node.start_point[0] + 3)
+    strict = _parse("typescript", 'function g() {\n  "use strict";\n  let x = 1;\n  return x;\n}\n')
+    assert _starts_on_docstring(strict, strict.start_point[0] + 2)
+
+
+def test_a_comment_before_the_docstring_does_not_hide_it():
+    src = _DOCSTRING_FIRST.replace(
+        "def uninstall(home, packaged, keep):\n",
+        "def uninstall(home, packaged, keep):\n    # kept in sync with the installer\n",
+    )
+    fn = _first(src)
+    (best, *_) = find_extractions(fn, get_language_map("python"))
+    assert best.start_line == fn.start_line + 2  # the docstring, under the comment
+    findings = [_Finding("complex_method", "uninstall", fn.start_line, 1.5)]
+    assert ExtractMethodDetector().detect(_ctx(src, findings)) == []
+
+
+def test_a_refused_span_yields_only_to_a_disjoint_one(monkeypatch):
+    from repowise.core.analysis.health.dataflow import Extraction
+    from repowise.core.analysis.health.refactoring import extract_method
+
+    whole = Extraction(2, 80, ("a",), (), slice_nloc=60, ccn_removed=9)  # share 0.79
+    shrunk = Extraction(2, 55, ("a",), (), slice_nloc=40, ccn_removed=8)  # overlaps it
+    disjoint = Extraction(85, 95, ("b",), (), slice_nloc=10, ccn_removed=3)
+    monkeypatch.setattr(
+        extract_method, "find_extractions", lambda _a, _l, _r=None, _p=None, _rf=None: [whole, shrunk, disjoint]
+    )
+    monkeypatch.setattr(extract_method, "anchor_plan", lambda _plan, _fn: True)
+    analysis = type(
+        "A", (), {"name": "f", "start_line": 1, "end_line": 100, "ccn": 30, "nloc": 90,
+                  "fn_node": None}
+    )()
+    ctx = RefactoringContext(
+        file_path="m.py",
+        language="python",
+        nloc=100,
+        findings=[_Finding("complex_method", "f", 1, 1.2)],
+        function_analyses=[analysis],
+    )
+    (s,) = ExtractMethodDetector().detect(ctx)
+    assert s.plan["span"] == {"start": 85, "end": 95}
+
+
+def _span_in_out(src: str, s: int, e: int):
+    from repowise.core.analysis.health.dataflow import slice as slicer
+
+    fn = _first(src)
+    def_lines, use_lines = slicer._var_lines(fn.def_use)
+    declared_first = slicer._declared_before_read(fn.def_use)
+    reads = slicer._reads_observing(fn, def_lines)
+    return slicer._infer_in_out(def_lines, use_lines, s, e, declared_first, reads=reads)
+
+
+def test_a_comprehension_binder_is_not_a_parameter():
+    # Seen on get_health_findings: an earlier comprehension's ``v`` made the
+    # span's own ``v`` an input, and the call passed a name the caller lacks.
+    src = """
+    def f(severity, order, t):
+        exact = [v.strip() for v in severity if v]
+        b = len(exact)
+        allowed = [k for k, v in order.items() if v >= t]
+        return allowed, b
+    """
+    assert _span_in_out(src, 4, 5) == (("exact", "order", "t"), ("allowed", "b"))
+
+
+def test_an_import_path_naming_a_parameter_is_not_a_read():
+    # Seen on _lifespan: ``from repowise.server...`` read its ``server`` parameter.
+    src = """
+    def f(server, root):
+        a = root / "x"
+        from repowise.server.enrich import Enricher
+        e = Enricher(a)
+        return e
+    """
+    assert _span_in_out(src, 4, 5) == (("a",), ("e",))
+
+
+def test_a_span_holding_an_import_read_after_it_is_refused():
+    # The import would leave with the helper; an imported name is never made
+    # an input or output (the helper re-imports it).
+    src = """
+    def f(a, c):
+        from pkg.mod import Thing
+        if c:
+            a += 1
+        t = Thing(a)
+        return t
+    """
+    with pytest.MonkeyPatch.context() as mp:
+        from repowise.core.analysis.health.dataflow import slice as slicer
+
+        mp.setattr(slicer, "_MAX_BODY_SHARE", float("inf"))
+        mp.setattr(slicer, "_MIN_SLICE_NLOC", 1)
+        spans = find_extractions(_first(src), get_language_map("python"))
+    found = {(x.start_line, x.end_line): (x.params, x.returns) for x in spans}
+    assert (3, 5) not in found
+    assert (4, 6) not in found
+    assert found[(3, 6)] == (("a", "c"), ("t",))
+
+
+@pytest.mark.parametrize(
+    ("prefix", "inside", "floor", "offered"),
+    [("import json\n", "", 0, True), ("", "    import json\n", 2, False)],
+)
+def test_import_scope_controls_extractability(prefix, inside, floor, offered):
+    src = f"""{prefix}def f(v):
+{inside}    n = 0
+    dump = lambda x: json.dumps(x)
+    if v: n += len(dump(v))
+    if n: n += len(dump(n))
+    return n
+"""
+    with pytest.MonkeyPatch.context() as mp:
+        from repowise.core.analysis.health.dataflow import slice as slicer
+
+        mp.setattr(slicer, "_MAX_BODY_SHARE", float("inf"))
+        mp.setattr(slicer, "_MIN_SLICE_NLOC", 1)
+        spans = find_extractions(_first(src), get_language_map("python"))
+    assert any(floor < x.start_line <= 4 <= x.end_line for x in spans) is offered

@@ -60,7 +60,10 @@ def test_parse_query_reports_what_it_discards() -> None:
 def test_query_resolves_contexts_and_default_queue() -> None:
     assert parse_query(context="all")[0].contexts is None
     assert parse_query(context="production_tooling")[0].contexts == {"production", "tooling"}
-    assert parse_query()[0].actionabilities == {"plan_ready", "advisory"}
+    # The default queue is the stored judgement; any other context keeps its states.
+    assert parse_query()[0].queue_eligible is True and parse_query()[0].actionabilities is None
+    assert parse_query(context="all")[0].actionabilities == {"plan_ready", "advisory"}
+    assert parse_query(context="all")[0].queue_eligible is None
     assert parse_query(actionability="expected")[0].actionabilities == {"expected"}
     assert parse_query(boundary="none")[0].boundary == "none"
 
@@ -99,9 +102,9 @@ def test_summary_payload_names_absence_and_staleness() -> None:
 
 def test_rescope_summary_recounts_one_context() -> None:
     groups = [
-        ("production", None, "high", "advisory", "available", 2),
-        ("production", "db", "low", "plan_ready", "no_safe_plan", 1),
-        ("test", "db", "low", "advisory", "available", 5),
+        ("production", None, "high", "advisory", "available", "proven", "request", 2),
+        ("production", "db", "low", "plan_ready", "no_safe_plan", "unproven", "cli", 1),
+        ("test", "db", "low", "advisory", "available", "proven", "test", 5),
     ]
     scoped = rescope_summary({"total": 8, "x": 1}, groups, frozenset({"production"}))
     assert scoped == {
@@ -110,6 +113,7 @@ def test_rescope_summary_recounts_one_context() -> None:
         "actionability": {"advisory": 2, "plan_ready": 1},
         "context": {"production": 3},
         "boundary": {"none": 2, "db": 1},
+        "proof": {"proven": 2, "unproven": 1},
         "with_plan_total": 2,
     }
 
@@ -121,26 +125,27 @@ def test_rescope_summary_recounts_one_context() -> None:
 _SEEDS: list[dict[str, Any]] = [
     {"execution_context": "production", "boundary_kind": "db", "evidence_confidence": "high",
      "actionability_state": "plan_ready", "plan_state": "available", "file_path": "a.py",
-     "affected_call_sites_total": 4, "observations_total": 9},
+     "affected_call_sites_total": 4, "observations_total": 9, "cost_proof": "proven", "execution_role": "request"},
     {"execution_context": "production", "boundary_kind": None, "evidence_confidence": "medium",
      "actionability_state": "advisory", "plan_state": "no_safe_plan", "file_path": "b.py",
-     "affected_call_sites_total": 4, "observations_total": 2},
+     "affected_call_sites_total": 4, "observations_total": 2, "cost_proof": "unproven", "execution_role": "cli"},
     {"execution_context": "test", "boundary_kind": "network", "evidence_confidence": "low",
      "actionability_state": "advisory", "plan_state": "not_persisted", "file_path": "a.py",
-     "affected_call_sites_total": 7, "observations_total": 2},
+     "affected_call_sites_total": 7, "observations_total": 2, "cost_proof": "proven", "execution_role": "test"},
     {"execution_context": "tooling", "boundary_kind": None, "evidence_confidence": "high",
      "actionability_state": "expected", "plan_state": "no_safe_plan", "file_path": "c.py",
-     "affected_call_sites_total": 1, "observations_total": 9},
+     "affected_call_sites_total": 1, "observations_total": 9, "cost_proof": "unproven", "execution_role": "tooling"},
     {"execution_context": "production", "boundary_kind": "db", "evidence_confidence": "high",
      "actionability_state": "investigate", "plan_state": "no_safe_plan", "file_path": "c.py",
-     "affected_call_sites_total": 0, "observations_total": 5},
+     "affected_call_sites_total": 0, "observations_total": 5, "cost_proof": "proven", "execution_role": "scheduled_job"},
     {"execution_context": "unknown", "boundary_kind": "filesystem", "evidence_confidence": "medium",
      "actionability_state": "plan_ready", "plan_state": "available", "file_path": "b.py",
-     "affected_call_sites_total": 7, "observations_total": 1},
+     "affected_call_sites_total": 7, "observations_total": 1, "cost_proof": "proven", "execution_role": "unknown"},
     # Resolved: in no queue and no facet.
     {"execution_context": "production", "boundary_kind": "db", "evidence_confidence": "high",
      "actionability_state": "plan_ready", "plan_state": "available", "file_path": "a.py",
-     "affected_call_sites_total": 99, "observations_total": 99, "status": "resolved"},
+     "affected_call_sites_total": 99, "observations_total": 99, "status": "resolved",
+     "cost_proof": "proven", "execution_role": "request"},
 ]
 
 _QUERIES: list[dict[str, Any]] = [
@@ -154,6 +159,11 @@ _QUERIES: list[dict[str, Any]] = [
     {"context": "all", "file_paths": ("a.py", "b.py")},
     {"context": "all", "file_paths": ()},
     {"boundary": "network"},
+    {"proof": "unproven"},
+    {"context": "all", "proof": "unproven", "actionability": "expected"},
+    {"context": "all", "role": "all"},
+    {"role": "cli"},
+    {"context": "all", "role": "scheduled_job", "actionability": "investigate"},
 ]
 
 
@@ -168,6 +178,12 @@ def _seed_rows(repository_id: str) -> list[Any]:
             status=seed.get("status", "open"),
             rank_position=i,
             details_json="{}",
+            # The default queue's rule, as the index judges and stores it.
+            queue_eligible=(
+                seed["execution_context"] == "production"
+                and seed["actionability_state"] in ("plan_ready", "advisory")
+                and seed["cost_proof"] == "proven"
+            ),
             **{k: v for k, v in seed.items() if k != "status"},
         )
         for i, seed in enumerate(_SEEDS)
@@ -178,7 +194,7 @@ def _as_mapping(row: Any) -> dict[str, Any]:
     return {
         column: getattr(row, column)
         for column in (
-            "opportunity_id", "status", "rank_position", *_SEEDS[0],
+            "opportunity_id", "status", "rank_position", "queue_eligible", *_SEEDS[0],
         )
     }
 
@@ -226,6 +242,9 @@ async def test_keep_and_sort_agree_with_the_store(store, args, sort) -> None:
         boundary=query.boundary,
         confidence=query.confidence,
         actionabilities=query.actionabilities,
+        proofs=query.proofs,
+        roles=query.roles,
+        queue_eligible=query.queue_eligible,
         file_paths=query.file_paths,
         sort=query.sort,
         limit=query.limit,
@@ -240,7 +259,7 @@ async def test_keep_and_sort_agree_with_the_store(store, args, sort) -> None:
 def _reference_facets(groups: list[tuple], query: PerformanceQuery) -> dict[str, Any]:
     """The cross-filtered fold as the service wrote it before the rules were data."""
     dimensions = {"context": 0, "boundary": 1, "confidence": 2, "actionability": 3,
-                  "plan_state": 4}
+                  "plan_state": 4, "proof": 5, "role": 6}
     selected = {
         "context": query.contexts,
         "boundary": None if query.boundary is None else frozenset({query.boundary}),
@@ -249,6 +268,8 @@ def _reference_facets(groups: list[tuple], query: PerformanceQuery) -> dict[str,
             None if query.actionability is None else frozenset({query.actionability})
         ),
         "plan_state": None,
+        "proof": None if query.proof is None else frozenset({query.proof}),
+        "role": None if query.role in (None, "all") else frozenset({query.role}),
     }
     facets = {}
     for name, index in dimensions.items():
@@ -260,7 +281,7 @@ def _reference_facets(groups: list[tuple], query: PerformanceQuery) -> dict[str,
                 for other, values in selected.items()
             ):
                 continue
-            counts[row[index] or "none"] = counts.get(row[index] or "none", 0) + row[5]
+            counts[row[index] or "none"] = counts.get(row[index] or "none", 0) + row[7]
         facets[name] = [
             {"value": v, "total": t}
             for v, t in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
@@ -281,3 +302,18 @@ async def test_facet_counts_agree_with_the_store(store, args) -> None:
     assert expected == _reference_facets(grouped, query)
     for rows in _both_shapes(repository_id):
         assert facet_counts(rows, query) == expected
+
+
+async def test_an_unjudged_store_reads_the_default_queue_rule_live(store) -> None:
+    from sqlalchemy import update
+
+    from repowise.core.persistence.models import PerformanceOpportunity
+    from repowise.server.services.performance_health import PerformanceHealthService
+
+    session, repository_id = store
+    service = PerformanceHealthService(session, repository_id, "repo")
+    judged = [i["opportunity_id"] for i in (await service.page(parse_query()[0])).items]
+    await session.execute(update(PerformanceOpportunity).values(queue_eligible=None))
+    await session.commit()
+    live = [i["opportunity_id"] for i in (await service.page(parse_query()[0])).items]
+    assert live == judged == ["perf_0"]

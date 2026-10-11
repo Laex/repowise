@@ -2,9 +2,9 @@
 
 /**
  * Dead Code host — binds the shared {@link DeadCodeView} to web's `/api`
- * client and `/repos/:id` routing. The composition (safe-to-delete pile,
- * cluster rollups, drill-down table, patch/undo, bulk resolve, Propose
- * cleanup, Re-analyze) lives in `@repowise-dev/ui/dead-code`; this file only
+ * client and `/repos/:id` routing. The composition (lede, safe-to-delete
+ * list, findings table, patch/undo, bulk resolve, Propose cleanup,
+ * Re-analyze) lives in `@repowise-dev/ui/dead-code`; this file only
  * injects the app-specific pieces so web and hosted render the same view.
  */
 
@@ -18,6 +18,7 @@ import {
   patchDeadCodeFinding,
 } from "@/lib/api/dead-code";
 import { getJob } from "@/lib/api/jobs";
+import { useTranslations } from "next-intl";
 
 const POLL_INTERVAL_MS = 3_000;
 /** Give up watching after this long; the job may still be running server-side. */
@@ -28,7 +29,7 @@ const POLL_TIMEOUT_MS = 15 * 60_000;
  * only needs the terminal state to know when to refetch, and a plain promise
  * keeps the shared view free of any streaming dependency.
  */
-async function waitForJob(jobId: string): Promise<void> {
+async function waitForJob(jobId: string, timeoutMessage: string): Promise<void> {
   const deadline = Date.now() + POLL_TIMEOUT_MS;
   for (;;) {
     await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
@@ -38,12 +39,13 @@ async function waitForJob(jobId: string): Promise<void> {
       throw new Error(job.error_message || `Analysis ${job.status}`);
     }
     if (Date.now() > deadline) {
-      throw new Error("Analysis is taking longer than expected. Reload to see the results.");
+      throw new Error(timeoutMessage);
     }
   }
 }
 
 export function DeadCodeTab({ repoId }: { repoId: string }) {
+  const t = useTranslations("risk");
   const router = useRouter();
   const prefix = `/repos/${repoId}`;
 
@@ -53,7 +55,7 @@ export function DeadCodeTab({ repoId }: { repoId: string }) {
     getSummary: () => getDeadCodeSummary(repoId),
     listFindings: (opts) => listDeadCode(repoId, opts),
     analyze: () => analyzeDeadCode(repoId),
-    waitForAnalysis: waitForJob,
+    waitForAnalysis: (jobId) => waitForJob(jobId, t("analysisTimeout")),
     patchFinding: (findingId, patch) => patchDeadCodeFinding(findingId, patch),
     fileHref: (path) => fileEntityPath(prefix, path),
     graphHref: (path) =>

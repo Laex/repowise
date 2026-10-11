@@ -57,7 +57,7 @@ resolution and health markers are all static.
 | Tier | Languages | What you get |
 |------|-----------|--------------|
 | **Full** (13) | Python · TypeScript · JavaScript · Svelte · Vue · Java · Kotlin · Go · Rust · C++ · C# · Scala · Ruby | The whole pipeline: AST symbols, import resolution, a resolved call graph, heritage, docstrings, framework edges and code-health markers |
-| **Good** (11) | C · Swift · PHP · Dart · Object Pascal · COBOL · GDScript · VB.NET · Elixir · F# · Objective-C | Everything above except the full health suite. Dart and Object Pascal get health markers; C, F# and Objective-C get the complexity-derived ones; the rest get none yet |
+| **Good** (11) | C · Swift · PHP · Dart · Object Pascal · COBOL · GDScript · VB.NET · Elixir · F# · Objective-C | Everything above except the full health suite. Dart, Object Pascal and PHP get health markers; C, F# and Objective-C get the complexity-derived ones; the rest get none yet |
 | **Partial** (2) | Luau / Roblox · Razor / Blazor | Luau: AST symbols and `require()` resolution (Rojo and `.luaurc` aware), no health markers. Razor: a component symbol per file, call edges from `@code` blocks and component tags, C# health markers, no import edges yet |
 | **Lightweight** (6) | Clojure · Haskell · Lean 4 · Erlang · HTML · QML | A real file-to-file import graph, no symbol-level claims |
 | **Structural** (8) | R · Zig · Julia · Elm · OCaml · Crystal · Nim · D | Git history only: blame, hotspots, co-change. No AST parsing |
@@ -297,13 +297,15 @@ This table is why a language is Full and not Good.
 | Svelte · Vue | ✅ | ✅ | ✅ | no | no | ✅ | ✅ |
 | Java | ✅ | ✅ | ✅ | no | no | ✅ | ✅ |
 | Go | ✅ | n/a | ✅ | no | no | ✅ | ✅ |
-| Rust · C++ | ✅ | ✅ | ✅ | no | no | ✅ | ✅ |
-| C# · Scala · Ruby | ✅ | ✅ | ✅ | no | no | no | ✅ |
+| Rust · C++ · C# | ✅ | ✅ | ✅ | no | no | ✅ | ✅ |
+| Scala · Ruby | ✅ | ✅ | ✅ | no | no | no | ✅ |
 | Kotlin | ✅ | ✅ | ✅ | no | no | no | ✅ |
 | Dart | ✅ | n/a | ✅ | no | no | no | ✅ |
 | Object Pascal | ✅ | n/a | ✅ | n/a | n/a | no | ✅ |
 | Razor | ✅ | n/a | n/a | n/a | n/a | no | ✅ |
-| C · F# · Objective-C | ✅ | no | no | no | no | no | no |
+| PHP | ✅ | ✅ | ✅ | no | no | no | no |
+| C | ✅ | no | no | no | no | ✅ | no |
+| F# · Objective-C | ✅ | no | no | no | no | no | no |
 | Shell | ✅ | n/a | n/a | n/a | n/a | n/a | n/a |
 
 ✅ supported, "no" not available yet, n/a the language cannot carry that metric.
@@ -331,8 +333,9 @@ Per-marker detail is in [CODE_HEALTH.md](CODE_HEALTH.md).
 - **GDScript string dispatch is unresolved**, and a script without `class_name`
   gets no class symbol.
 - **VB.NET leaves a few constructs unparsed**, XML and tuple literals among them.
-- **C has complexity markers only.** It has no performance or Extract Method
-  support.
+- **C has no performance risk support.** Extract Method reuses the C++
+  def/use dialect; C carries none of the C++-only nodes, so the same plan
+  fires for both.
 - **Scala import resolution is partial**, and ScalaTest's infix DSL
   (`x shouldBe y`) is not counted as an assertion.
 
@@ -347,7 +350,7 @@ Mechanics behind these:
 |----------|------|
 | Vue · Svelte | Template binding forms (`v-for`, `{#each}`) |
 | Kotlin | Extract Method, which needs a grammar that labels control flow |
-| Scala · Ruby · C# | Extract Method (dataflow dialect) |
+| Scala · Ruby | Extract Method (dataflow dialect) |
 | GDScript | Health markers (complexity, performance, dataflow) |
 | Object Pascal | A dedicated `uses` resolver |
 | COBOL | Copybook resolution, dialect coverage, health markers |

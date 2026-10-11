@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ActionsResponse, NextAction } from "@repowise-dev/types/actions";
 
-import { NextActions, actionsStatus } from "../../src/overview/next-actions.js";
+import { NextActions, groupByTier } from "../../src/overview/next-actions.js";
 import { actionHref } from "../../src/overview/action-href.js";
 
 function action(overrides: Partial<NextAction> = {}): NextAction {
@@ -22,6 +22,8 @@ function action(overrides: Partial<NextAction> = {}): NextAction {
     surface: "file",
     effort: "M",
     confidence: "high",
+    value: 3,
+    priority: 1.5,
     done_when: "Line coverage on this file reaches 80%.",
     command: null,
     marker: null,
@@ -56,6 +58,7 @@ function response(week: NextAction[], quarter: NextAction[]): ActionsResponse {
       fix_commits_90d: 40,
       busy_threshold: 8,
       coverage: "unknown",
+      history_too_short: false,
     },
     horizons: { week: horizon(week), quarter: horizon(quarter) },
     rules: [
@@ -111,6 +114,31 @@ describe("NextActions", () => {
     expect(onSetState.mock.calls[0]?.[0].fingerprint).toBe("fp1");
   });
 
+  it("still says everything is answered once the re-read view drops the row", async () => {
+    const onSetState = vi.fn().mockResolvedValue(undefined);
+    const before = response([], [action()]);
+    const { rerender } = render(
+      <NextActions data={before} hrefFor={() => null} onSetState={onSetState} />,
+    );
+    const chip = () => screen.getByRole("radio", { name: /This quarter/ });
+    expect(chip()).toHaveTextContent("1");
+    fireEvent.click(screen.getByRole("button", { name: /More for Raise test coverage/ }));
+    fireEvent.click(await screen.findByText("Dismiss"));
+    // Until the re-read lands, the count stays with the view, as the sentence does.
+    expect(chip()).toHaveTextContent("1");
+    await waitFor(() => expect(onSetState).toHaveBeenCalledTimes(1));
+
+    const after = response([], []);
+    after.horizons.quarter.hidden = 1;
+    rerender(<NextActions data={after} hrefFor={() => null} onSetState={onSetState} />);
+    expect(screen.getByText(/You have answered everything listed here/)).toBeInTheDocument();
+    expect(screen.queryByText(/none of them produced work/)).toBeNull();
+    expect(chip()).toHaveTextContent("0");
+    // The other time frame held nothing to answer, so it reads as empty.
+    fireEvent.click(screen.getByRole("radio", { name: /This week/ }));
+    expect(screen.getByText(/none of them produced work/)).toBeInTheDocument();
+  });
+
   it("brings a row back when the write fails", async () => {
     const onSetState = vi.fn().mockRejectedValue(new Error("nope"));
     render(
@@ -159,21 +187,21 @@ describe("the action drawer", () => {
   });
 });
 
-describe("actionsStatus", () => {
-  it("names the window by its last indexed commit and counts work only", () => {
-    const now = action({ tier: "act_now", horizons: ["week"] });
-    const signal = action({ id: "s", tier: "improve_signal", horizons: ["week"] });
-    const text = actionsStatus(response([now, signal], []), "week");
-    expect(text).toMatch(/^1 thing worth doing in the week to /);
-    expect(text).toMatch(/1 of them now\.$/);
+describe("the status sentence", () => {
+  it("renders the sentence core wrote for the open time frame", () => {
+    const data = {
+      ...response([], [action()]),
+      summary: { week: "Core wording, week.", quarter: "Core wording, quarter." },
+    };
+    render(<NextActions data={data} hrefFor={() => null} />);
+    expect(screen.getByText("Core wording, quarter.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("radio", { name: /This week/ }));
+    expect(screen.getByText("Core wording, week.")).toBeInTheDocument();
   });
 
-  it("points to the other time frame when this one is clear", () => {
-    expect(actionsStatus(response([], [action()]), "week")).toBe(
-      "Nothing needs you in the week to " +
-        new Date("2026-09-28T09:45:08").toLocaleDateString(undefined, { month: "short", day: "numeric" }) +
-        ", the last indexed commit. 1 thing is worth planning this quarter.",
-    );
+  it("shows no sentence from a server that predates it", () => {
+    render(<NextActions data={response([], [action()])} hrefFor={() => null} />);
+    expect(screen.queryByText(/worth doing|Nothing/)).toBeNull();
   });
 });
 
@@ -261,3 +289,73 @@ describe("the fix_first rule", () => {
   });
 });
 
+describe("host-configurable hints", () => {
+  const unavailable = (): ActionsResponse => ({
+    ...response([], [action()]),
+    unavailable: { coverage: "no report" },
+  });
+  const withCli = () =>
+    action({
+      commands: [
+        { purpose: "See the file", cli: "repowise get-risk src/a.py", mcp: "get_risk(src/a.py)" },
+      ],
+    } as Partial<NextAction>);
+
+  it("shows the repowise update hint by default", () => {
+    render(<NextActions data={unavailable()} hrefFor={() => null} />);
+    expect(screen.getByText("repowise update").tagName).toBe("CODE");
+    expect(screen.getByText(/to include them\./)).toBeInTheDocument();
+  });
+
+  it("hides the hint sentence when unavailableHint is null", () => {
+    render(<NextActions data={unavailable()} hrefFor={() => null} unavailableHint={null} />);
+    expect(screen.getByText(/Not checked: coverage\./)).toBeInTheDocument();
+    expect(screen.queryByText("repowise update")).toBeNull();
+  });
+
+  it("renders a custom hint in place of the default", () => {
+    render(
+      <NextActions data={unavailable()} hrefFor={() => null} unavailableHint="Ask your admin." />,
+    );
+    expect(screen.getByText(/Ask your admin\./)).toBeInTheDocument();
+    expect(screen.queryByText("repowise update")).toBeNull();
+  });
+
+  it("shows CLI command lines by default and hides them with showCliCommands=false", async () => {
+    const data = response([], [withCli()]);
+    const { unmount } = render(<NextActions data={data} hrefFor={() => null} />);
+    fireEvent.click(screen.getByRole("listitem", { name: /Open Raise test coverage/ }));
+    expect(await screen.findByText("repowise get-risk src/a.py")).toBeInTheDocument();
+    unmount();
+    render(<NextActions data={data} hrefFor={() => null} showCliCommands={false} />);
+    fireEvent.click(screen.getByRole("listitem", { name: /Open Raise test coverage/ }));
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).queryByText("repowise get-risk src/a.py")).toBeNull();
+    expect(within(dialog).getByText(/get_risk\(src\/a\.py\)/)).toBeInTheDocument();
+  });
+});
+
+describe("groupByTier", () => {
+  it("gives each tier one heading, in tier order, whatever the row order", () => {
+    const rows = [
+      action({ id: "p1", tier: "plan" }),
+      action({ id: "n1", tier: "act_now" }),
+      action({ id: "p2", tier: "plan" }),
+    ];
+    expect(groupByTier(rows).map(([tier, items]) => [tier, items.map((a) => a.id)])).toEqual([
+      ["act_now", ["n1"]],
+      ["plan", ["p1", "p2"]],
+    ]);
+  });
+
+  it("keeps rows of a tier it does not know, in a trailing group", () => {
+    const rows = [
+      action({ id: "x1", tier: "someday" as NextAction["tier"] }),
+      action({ id: "p1", tier: "plan" }),
+    ];
+    expect(groupByTier(rows).map(([tier, items]) => [tier, items.map((a) => a.id)])).toEqual([
+      ["plan", ["p1"]],
+      ["someday", ["x1"]],
+    ]);
+  });
+});

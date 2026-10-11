@@ -638,19 +638,21 @@ def _history_tier_files(repo_path: Path, paths: Iterable[str]) -> set[str]:
     binaries: the traverser's own blocklists, plus a sniff for NUL bytes.
     """
     from ..traverser import (
-        _BLOCKED_DIRS,
         _BLOCKED_EXTENSIONS,
         _BLOCKED_FILENAME_SPEC,
         _is_binary,
+        in_blocked_dir,
     )
 
+    output_dirs: dict[Path, bool] = {}  # one listing per output-named dir
+
     def _keep(file_path: str) -> bool:
-        parts = file_path.split("/")
-        if any(part in _BLOCKED_DIRS for part in parts[:-1]):
+        name = file_path.rsplit("/", 1)[-1]
+        if Path(name).suffix.lower() in _BLOCKED_EXTENSIONS:
             return False
-        if Path(file_path).suffix.lower() in _BLOCKED_EXTENSIONS:
+        if _BLOCKED_FILENAME_SPEC.match_file(name):
             return False
-        if _BLOCKED_FILENAME_SPEC.match_file(parts[-1]):
+        if in_blocked_dir(file_path, repo_path, output_dirs):
             return False
         return not _is_binary(repo_path / file_path)
 

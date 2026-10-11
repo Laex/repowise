@@ -26,6 +26,8 @@ import type {
 import { Skeleton } from "../ui/skeleton";
 import { Button } from "../ui/button";
 import { EmptyState } from "../shared/empty-state";
+import { ApiError } from "../shared/api-error";
+import { toFriendlyMessage } from "../lib/errors";
 
 import { AiPromptModal, fileChatContext } from "./ai-prompt-modal";
 import { HotFunctionsPanel } from "./hot-functions-panel";
@@ -84,7 +86,11 @@ export function FindingsView({ adapter }: { adapter: CodeHealthAdapter }) {
   // the landing view already fired — no extra round-trip. Used to gate the
   // queue fetch and to seed the marker filter with the repo's whole
   // vocabulary rather than only the markers the current page happens to hold.
-  const { data: overview } = useSWR<HealthOverviewResponse>(
+  const {
+    data: overview,
+    error: overviewError,
+    mutate: mutateOverview,
+  } = useSWR<HealthOverviewResponse>(
     `code-health-overview:${cacheKey}`,
     () => adapter.getOverview(25),
     { revalidateOnFocus: false },
@@ -267,6 +273,7 @@ export function FindingsView({ adapter }: { adapter: CodeHealthAdapter }) {
     data: queue,
     isLoading: queueLoading,
     isValidating: queueValidating,
+    error: queueError,
     mutate: mutateQueue,
   } = useSWR<HealthWorkQueueResponse>(
     overview ? `code-health-queue:${cacheKey}:${JSON.stringify(query)}` : null,
@@ -568,24 +575,49 @@ export function FindingsView({ adapter }: { adapter: CodeHealthAdapter }) {
           </div>
         </div>
 
-        {queueLoading && !queue ? (
+        {!overview ? (
+          overviewError ? (
+            <ApiError
+              size="compact"
+              title="Couldn't load findings"
+              message={toFriendlyMessage(overviewError)}
+              onRetry={() => void mutateOverview()}
+            />
+          ) : (
+            <div className="grid gap-3">
+              {Array.from({ length: 4 }).map((_, i) => (
+                <Skeleton key={i} className="h-28 w-full" />
+              ))}
+            </div>
+          )
+        ) : queueLoading && !queue ? (
           <div className="grid gap-3">
             {Array.from({ length: 4 }).map((_, i) => (
               <Skeleton key={i} className="h-28 w-full" />
             ))}
           </div>
-        ) : total === 0 ? (
-          <EmptyState
-            title={filtered ? "Nothing matches these filters" : "No open findings"}
-            description={
-              filtered
-                ? "This view lists files carrying findings, ranked by leverage. Widen a filter to see more."
-                : "Files carrying findings appear here, ranked by leverage. Sync the repo to pick up new work."
-            }
-            {...(filtered
-              ? { action: { label: "Clear filters", onClick: clearFilters } }
-              : {})}
+        ) : queueError && !queue ? (
+          <ApiError
+            size="compact"
+            title="Couldn't load findings"
+            message={toFriendlyMessage(queueError)}
+            onRetry={() => void mutateQueue()}
           />
+        ) : total === 0 ? (
+          filtered ? (
+            <EmptyState
+              tone="filtered"
+              title="Nothing matches these filters"
+              description="This view lists files carrying findings, ranked by leverage. Widen a filter to see more."
+              action={{ label: "Clear filters", onClick: clearFilters }}
+            />
+          ) : (
+            <EmptyState
+              tone="positive"
+              title="No open findings"
+              description={`Health was scored${overview.summary.file_count ? ` across ${overview.summary.file_count.toLocaleString()} files` : ""} and none carries an open finding. New work appears here after the next index update.`}
+            />
+          )
         ) : (
           <div
             className={
@@ -652,6 +684,7 @@ export function FindingsView({ adapter }: { adapter: CodeHealthAdapter }) {
                     highlightedPath={highlightedPath}
                     selectedPaths={selectedPaths}
                     onToggleSelect={toggleSelect}
+                    onClearFilters={filtered ? clearFilters : undefined}
                   />
                 </section>
               ))}

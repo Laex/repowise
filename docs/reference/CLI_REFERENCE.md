@@ -269,6 +269,7 @@ See [WORKTREES.md](../scale/WORKTREES.md).
 | `--no-workspace` | Force single-repo mode (handy when running from a workspace root) |
 | `--repo` | Update a specific workspace repo by alias |
 | `--index-only` | Refresh the index only, skip doc regeneration for this run. In workspace mode, forces every stale repo to index-only. |
+| `--working-tree` | Also index uncommitted work (staged, unstaged and untracked files) on top of the commits since the last sync, so a rename you have not committed yet shows up in the graph. Off by default, so hooks and plain `update` stay anchored to commits. In workspace mode a repo with uncommitted changes counts as stale and is updated the same way. `repowise watch` always does this. |
 | `--docs` / `--no-docs` | Regenerate wiki pages for changed files, or skip doc regeneration entirely. Works in workspace mode too: `--docs` fans out to every stale repo's docs update (each needs an LLM provider/key configured, or pass `--provider`), and `--no-docs` forces index-only across the workspace. Without either flag each repo follows its own `docs_enabled`. |
 | `--full` | Upgrade a fast (`--mode fast`) index to a full one, see below. Single-repo only; errors in workspace mode. |
 | `--no-cost-tracking` | Don't record LLM spend for this run |
@@ -290,6 +291,7 @@ Over MCP, an ordinary tool response carries a **compact projection** of this obj
 repowise update                        # diff since last sync
 repowise update --dry-run              # preview
 repowise update --since v1.0.0         # diff from a tag
+repowise update --working-tree         # include uncommitted edits
 repowise update --reasoning off        # one-off supported-provider thinking-off run
 repowise update --workspace            # all workspace repos (docs where enabled, incl. first-time indexing)
 repowise update --workspace --docs     # force docs regeneration across every stale repo
@@ -727,7 +729,7 @@ repowise next --all                # up to 20 rows instead of 5
 repowise next --format json        # the whole stored view (--json also works)
 ```
 
-Rows are grouped as **Now**, **Worth planning** and **Improve what Repowise can see**, each with its impact, the facts behind it, when it counts as done, and a command when one applies. An index built before a store existed names that store and suggests `repowise update` rather than reporting it as empty.
+Rows are grouped as **Now**, **Worth planning** and **Improve what Repowise can see**, each with its impact, the facts behind it, when it counts as done, and a command when one applies. An index built before a store existed names that store and suggests `repowise update` rather than reporting it as empty. With fewer than five commits, the rows ranked by history are left out and the JSON sets `context.history_too_short`.
 
 ---
 
@@ -1067,6 +1069,8 @@ line up.
 | `--staged` | Diff the staged changes (`git diff --cached`); the default with no range outside CI (in CI: the pull request's change) |
 | `--format` | `table` (default), `json` (full report plus the selection), `list` (test ids one per line), or `args` (one line of runner arguments, or `:all`; reasons on stderr) |
 | `--runner` | For `--format args`: `auto` (default; `files` when mixed), `pytest` (node ids or files), `go` (package dirs), `jest` (files; pass with `--runTestsByPath`), `files` |
+| `--explain` | A test file or node id: say why it was or was not selected (the changed file, the evidence and the import route, or the rule that runs it) and its place in the run order. Added to `--format json` as `explain` |
+| `--prioritize` | With `--format args`, `list` or `json`: the whole suite, the selected tests first in run order, then every other test. Skips nothing; a full run is ordered too |
 
 ```bash
 repowise impacted-tests                        # staged changes
@@ -1075,6 +1079,8 @@ repowise impacted-tests main..HEAD             # a plain range
 repowise impacted-tests abc123                 # a single commit
 repowise impacted-tests main..HEAD --format list | xargs pytest
 repowise impacted-tests main...HEAD --format args --runner pytest
+repowise impacted-tests main...HEAD --explain tests/unit/test_api.py
+repowise impacted-tests main...HEAD --format args --prioritize
 ```
 
 `--format args` exits `0` whether it selects a subset or everything, and `2`
@@ -1083,14 +1089,28 @@ in the config. `--format json` adds `indexed_commit`, `map_current` and a
 per-file `selected.basis`: `full-run`, `no-tests-needed`, `test-tree`,
 `test-package`, `conftest`, `helper-importers`, `deleted-test`, `coverage`,
 `changed-test`, `call-graph`, `import-graph`, `filename-pattern`, `unknown`,
-or `none` (no index). When it runs everything:
+or `none` (no index), and a per-test `selected.why`: the first changed file and
+evidence that selected it, or why it runs with every subset. When it runs everything:
 [CI](../start/CI.md#selecting-the-tests-a-change-needs).
+
+**Run order.** `--format args` and `json` list the selected tests likeliest to fail
+first (`--format list` without `--prioritize` keeps the report's order). Tiers, in
+order: a test the change edits; one the per-test map runs on a changed line, then on
+a changed file; one whose calls, fixtures or direct import reach the change; one
+reaching it through other files; tests that run with every subset. Within a tier:
+a failure in the last local pytest run (`.pytest_cache`, ids relative to the
+repository root), fewer graph hops (when measured), more changes shared with the
+changed files, more changed files reached, then path. `--format json` lists each test under
+`order` with its `tier`, `hops`, `co_change` and `failed_last_run`. With
+`--prioritize`, a file selected only by some node ids runs whole at its place.
 
 ---
 
 ### `repowise health [PATH]`
 
-Compute per-file code-health scores from 51 deterministic detectors (McCabe complexity, nesting, brain methods, LCOM4 cohesion, god classes, native clone detection, untested hotspots, coverage gradient, function/ownership/churn/change-entropy organizational risk, test-quality smells, and more). Zero LLM calls by default, pure Python over tree-sitter + git data. See [`docs/layers/CODE_HEALTH.md`](../layers/CODE_HEALTH.md) for the user guide and [`docs/architecture/code-health.md`](../architecture/code-health.md) for the internals.
+Report per-file code-health scores from 51 deterministic detectors (McCabe complexity, nesting, brain methods, LCOM4 cohesion, god classes, native clone detection, untested hotspots, coverage gradient, function/ownership/churn/change-entropy organizational risk, test-quality smells, and more). Zero LLM calls by default, pure Python over tree-sitter + git data. See [`docs/layers/CODE_HEALTH.md`](../layers/CODE_HEALTH.md) for the user guide and [`docs/architecture/code-health.md`](../architecture/code-health.md) for the internals.
+
+By default it reads the analysis the last `repowise init` or `repowise update` stored, the same rows MCP and the web UI serve, and writes nothing. `--recompute` analyzes the working tree in-process instead.
 
 **Options:**
 
@@ -1100,9 +1120,10 @@ Compute per-file code-health scores from 51 deterministic detectors (McCabe comp
 | `--module <prefix>` | Restrict the report to files whose path starts with this prefix |
 | `--scope` | `all` (default) or `production`. Which files every figure describes. Tests score higher than production code, so narrowing lowers the number without a defect being found. |
 | `--counts` | `everything` (default) or `code_shape`. `code_shape` drops the git-derived half of the deduction, which rises as a file is worked on — the reading that answers whether the code itself is improving. |
-| `--refactoring-targets` | Print the refactoring queue the index stored: one opportunity per file with its structured, graph-aware plans (Extract Class / Helper / Method, Move Method, Break Cycle, Split File) as ordered steps, in the same order MCP and the web UI serve. Reads the index, so it needs `repowise init` first. See [REFACTORING.md](../layers/REFACTORING.md) |
-| `--recompute` | With `--refactoring-targets`: analyze the working tree in-process instead of reading the index. Slow on a large repo; the only option outside an indexed one. `--scope` and `--counts` apply only here. |
+| `--refactoring-targets` | Print the refactoring queue the index stored: one opportunity per file with its structured, graph-aware plans (Extract Class / Helper / Method, Move Method, Split File) as ordered steps and Break Cycle as advisory evidence, in the same order MCP and the web UI serve. Reads the index, so it needs `repowise init` first. See [REFACTORING.md](../layers/REFACTORING.md) |
+| `--recompute` | Analyze the working tree in-process instead of reading the stored analysis. A whole-repo `table` run writes the result back to the index (scores, findings, a trend snapshot); `json`, `md` and `--file`/`--module` runs never write. Slow on a large repo; the only option outside an indexed one. With `--refactoring-targets`, `--scope` and `--counts` apply only here. |
 | `--generate-code <selector>` | Generate an actual refactoring patch for one target. The only `health` flag that calls an LLM; needs a configured provider. |
+| `--plan <id>` | Print one stored refactoring plan as the prompt an agent applies; with `--format json`, its recipe (preconditions, steps, postconditions). Reads the index. |
 | `--trend` | Print the last 10 health snapshots + any active alerts (declining / predicted decline) |
 | `--badge` | Print a shields.io-compatible badge URL/JSON for the repo's health score |
 | `--format` | Output: `table` (default), `json`, `md` |
@@ -1119,7 +1140,7 @@ repowise health --generate-code packages/server/app.py::handler   # LLM patch fo
 repowise health --trend                               # snapshot history + alerts
 repowise health --counts code_shape                   # ignore the git-derived half
 repowise coverage add coverage.lcov   # ingest coverage, then:
-repowise health
+repowise health --recompute           # fold it into the scores now (or wait for the next update)
 repowise health --format json | jq .kpis              # machine-readable
 ```
 
@@ -2012,11 +2033,11 @@ repowise generate-claude-md --verbose      # show pipeline debug logs
 ### `repowise agents`
 
 Manage the agent integrations repowise can wire up on this machine: Claude
-Code, Codex, Cursor, OpenCode, Hermes, and anything reachable through
-`print-config`. `init` already wires the primary ones as part of a first run;
-this group is for what comes after it: adding an agent installed later,
-removing one, refreshing config after an upgrade, or printing a snippet for a
-host repowise does not write files for at all.
+Code, Codex, VS Code, Cursor, OpenCode, Hermes, GitHub Copilot CLI, Kiro, and
+anything reachable through `print-config`. `init` already wires the primary
+ones as part of a first run; this group is for what comes after it: adding an
+agent installed later, removing one, refreshing config after an upgrade, or
+printing a snippet for a host repowise does not write files for at all.
 
 With no subcommand, lists every known agent for the current repo: support
 tier, whether it looks installed, and every place it is currently wired to

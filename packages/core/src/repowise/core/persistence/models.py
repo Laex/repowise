@@ -28,6 +28,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     false,
+    func,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -290,6 +291,14 @@ class GraphNode(Base):
     is_entry_point: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # Dead-code exempt: reached from outside the graph. Every entry point is one.
     is_reachability_root: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false())
+    # Why a test file runs with every selected subset (it walks the source tree
+    # or runs the project in a child process). "" on a test checked and found
+    # ordinary; NULL on a test never checked (an older index) and on non-tests.
+    always_run_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # On a symbol a package exports, the barrel or entry file exporting it
+    # (``analysis.public_api``); "" on one checked and not exported; NULL on
+    # file nodes and on symbols never checked (an older index).
+    public_api: Mapped[str | None] = mapped_column(Text, nullable=True)
     pagerank: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     betweenness: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     # The commit ``betweenness`` was last actually computed at. Betweenness is
@@ -403,6 +412,18 @@ class GraphEdge(Base):
     # reparsing the repository. JSON keeps the additive migration portable.
     call_lines_json: Mapped[str] = mapped_column(
         Text, nullable=False, default="[]", server_default="[]"
+    )
+    # True when an import edge is purely type-level (e.g. TypeScript `import type`).
+    # Cycle detection skips these edges so mutual type imports are not flagged.
+    # Persisted so graphs rehydrated on incremental updates or rescores preserve it.
+    type_only: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+    # True when every import along the edge sits in a function body (a lazy
+    # import), so it runs on first call, not at module load. Skipped by cycle
+    # detection and persisted for the same reason as ``type_only``.
+    deferred: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_now_utc
@@ -1731,7 +1752,24 @@ class DocDriftFinding(Base):
     first_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
-class HealthFinding(Base):
+class QueueVerdict:
+    """A unit's place in the default queue, judged once at index time by
+    ``analysis.health.queue`` so lists filter and count it in SQL.
+
+    ``queue_eligible`` is NULL until the first judgement (a store written
+    before the columns), ``False`` with the one ``queue_reason`` that kept the
+    unit out, or ``True``; ``queue_value`` (0-4) and ``queue_tier`` are set on
+    eligible units only. ``queue_value`` is the reach-aware band: a central
+    file (top fifth by importers) adds a step, churn does not.
+    """
+
+    queue_eligible: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    queue_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    queue_value: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    queue_tier: Mapped[str | None] = mapped_column(String(8), nullable=True)
+
+
+class HealthFinding(QueueVerdict, Base):
     """One biomarker hit produced by the code-health analyzer."""
 
     __tablename__ = "health_findings"
@@ -1788,6 +1826,8 @@ class HealthFinding(Base):
             "dimension",
             "opportunity_id",
         ),
+        # Counting and the unjudged check group by the stored verdict.
+        Index("ix_health_findings_repo_status_queue", "repository_id", "status", "queue_eligible"),
     )
 
 
@@ -1842,6 +1882,14 @@ class RefactoringSuggestion(Base):
     status_changed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # The plan's place in the canonical rank, its rank factors and validation
+    # profile (``rank_json``) and its change surface, written at finalize for
+    # every live plan so a plan list is an ``ORDER BY``, not a hydration. NULL
+    # on a row the last finalize did not rank: readers fall back to ranking live.
+    rank_position: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # A column only so the ``blast`` sort can be an ORDER BY.
+    blast_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rank_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_now_utc
     )
@@ -1850,6 +1898,12 @@ class RefactoringSuggestion(Base):
     )
 
     __table_args__ = (
+        Index(
+            "ix_refactoring_suggestions_repo_status_rank",
+            "repository_id",
+            "status",
+            "rank_position",
+        ),
         Index(
             "ix_refactoring_suggestions_repo_type_opportunity",
             "repository_id",
@@ -1882,7 +1936,7 @@ class RefactoringSuggestion(Base):
     )
 
 
-class PerformanceOpportunity(Base):
+class PerformanceOpportunity(QueueVerdict, Base):
     """One causal performance opportunity, materialized for serving.
 
     The queue used to be rebuilt from every open performance finding on every
@@ -1922,6 +1976,17 @@ class PerformanceOpportunity(Base):
     # ``available`` | ``no_safe_plan`` | ``not_persisted``, decided once by the
     # writer that also decides whether a plan row exists.
     plan_state: Mapped[str] = mapped_column(String(16), nullable=False, default="no_safe_plan")
+    # ``proven`` | ``unproven`` (``worth.cost_proof``): whether anything measured
+    # that the cost grows. A store written before the column reads ``proven``
+    # until its next analysis, as it was served then.
+    cost_proof: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="proven", server_default="proven"
+    )
+    # ``execution_roles.ExecutionRole`` of the hottest member's loop owner, so
+    # the queue can leave out startup, CLI, tooling and test loops in SQL.
+    execution_role: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="unknown", server_default="unknown"
+    )
     fix_strategy: Mapped[str | None] = mapped_column(String(64), nullable=True)
     fix_safety: Mapped[str | None] = mapped_column(String(16), nullable=True)
     # The file holding the symbol worth editing, so target scoping is a column.
@@ -1969,6 +2034,13 @@ class PerformanceOpportunity(Base):
             "rank_position",
         ),
         Index("ix_performance_opportunities_repo_status_path", "repository_id", "status", "file_path"),
+        Index(
+            "ix_performance_opportunities_repo_status_queue",
+            "repository_id",
+            "status",
+            "queue_eligible",
+            "rank_position",
+        ),
     )
 
 
@@ -2000,7 +2072,102 @@ class PerformanceSummary(Base):
     )
 
 
-class RefactoringOpportunity(Base):
+class FunctionFact(Base):
+    """One function symbol: what runs it and what its body does.
+
+    Written by the health writers: facts for the files a run walked, the
+    execution role for every row each run, since a role moves with seeds and
+    calls in other files. One row per function, so later per-function
+    measures are new columns here rather than a second table.
+
+    Lean on purpose: the file, name and lines are on ``graph_nodes`` under the
+    same ``symbol_id`` (``path::name``), so they are joined, not copied, and a
+    file's rows are a key range of ``symbol_id``. Booleans cost no body bytes
+    in SQLite (0 and 1 are header-only), and on SQLite the table is clustered
+    on its key, so the key is stored once.
+    """
+
+    __tablename__ = "function_facts"
+
+    repository_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("repositories.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    # Bytewise order on PostgreSQL, so a file's rows are one key range
+    # (``crud.analysis.function_facts.file_rows``); SQLite compares bytes already.
+    symbol_id: Mapped[str] = mapped_column(
+        Text().with_variant(Text(collation="C"), "postgresql"), primary_key=True
+    )
+    # ``execution_roles.ExecutionRole``.
+    execution_role: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="unknown", server_default="unknown"
+    )
+    # ``dataflow.slice.FunctionFacts``; NULL where the walk produced none.
+    awaits: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    is_generator: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    uses_receiver: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # Whether ``receiver_assigns_json`` is the whole set of fields assigned:
+    # NULL in that column then means none, otherwise unknown.
+    receiver_assigns_known: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    receiver_assigns_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    early_exits: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # The complexity walk's size measures (``FunctionComplexity.stored_metrics``).
+    # NULL where the walk did not measure them; ``params`` is NULL rather than 0
+    # when no parameter was found, since the walk cannot tell that from none.
+    ccn: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    nloc: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    params: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    max_nesting: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # The nearest test functions (``analysis.function_test_map``), as
+    # ``[[selector, hops], ...]``: ``[]`` when no test reaches the function,
+    # NULL when no run has mapped it. Restamped every run, like the role.
+    tests_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = ({"sqlite_with_rowid": False},)
+
+
+class RefactoringPayoff(Base):
+    """What happened to a plan the writer resolved as no longer detected.
+
+    One row per plan, written when the writer resolves it and removed when it
+    reopens. ``before_*`` come from the stored ``function_facts`` row of the
+    plan's target, ``after_*`` from the run that resolved it, so nothing is
+    measured again when the plan is read. The prediction stays on the plan row.
+    """
+
+    __tablename__ = "refactoring_payoffs"
+
+    suggestion_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("refactoring_suggestions.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    repository_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False
+    )
+    # ``refactoring.payoff.PAYOFF_OUTCOMES``.
+    outcome: Mapped[str] = mapped_column(String(16), nullable=False)
+    # The commit the resolving run analysed; NULL when it was not recorded.
+    resolved_commit: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    resolved_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now_utc
+    )
+    before_ccn: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    before_nloc: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    before_params: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    after_ccn: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    after_nloc: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    after_params: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # A function the resolving run found in the target's file and the run
+    # before did not, sized like the plan's slice or carrying its suggested
+    # name: the helper, when the plan was applied.
+    new_symbol: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (Index("ix_refactoring_payoffs_repo_outcome", "repository_id", "outcome"),)
+
+
+class RefactoringOpportunity(QueueVerdict, Base):
     """One file's composed refactoring work, materialized for serving.
 
     Composition folds a file's plans into one ordered, precondition-aware
@@ -2092,6 +2259,15 @@ class RefactoringOpportunity(Base):
             "repository_id",
             "status",
             "file_path",
+        ),
+        # The ``fix_first`` scope's page, in queue order; its reason counts
+        # read the same (repository, status) prefix.
+        Index(
+            "ix_refactoring_opportunities_repo_status_eligible",
+            "repository_id",
+            "status",
+            "queue_eligible",
+            "queue_position",
         ),
     )
 
@@ -2314,8 +2490,9 @@ class CoverageIngest(Base):
 class ActionState(Base):
     """A person's answer to one next action: dismissed, snoozed, or done.
 
-    Actions themselves are computed on read (``analysis.actions``), so this is
-    the only stored half. ``action_id`` is stable across re-index because it is
+    Actions themselves are derived from the other stores (``analysis.actions``,
+    cached in :class:`ReadSnapshot`), so this is the only half a person writes.
+    ``action_id`` is stable across re-index because it is
     derived from the rule and its target. ``fingerprint`` is the one the action
     carried when the person acted; a dismissal holds only while it still
     matches, so an action whose facts changed materially comes back.
@@ -2337,6 +2514,35 @@ class ActionState(Base):
 
     __table_args__ = (
         UniqueConstraint("repository_id", "action_id", name="uq_action_states"),
+    )
+
+
+class ReadSnapshot(Base):
+    """A read view built at index or update time, served while its key holds.
+
+    ``kind`` names the view (the Fix first queue, the next-actions view) and
+    ``key`` the code that built it (repowise and model versions). Any write
+    to a store a view reads deletes the rows in the same transaction
+    (``persistence.read_snapshots``), so a row that exists is current and a
+    missing one is built live. Derived data: losing a row costs one build.
+    """
+
+    __tablename__ = "read_snapshots"
+
+    repository_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("repositories.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    kind: Mapped[str] = mapped_column(String(32), primary_key=True)
+    key: Mapped[str] = mapped_column(Text, nullable=False)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=_now_utc,
+        onupdate=_now_utc,
+        server_default=func.now(),
     )
 
 

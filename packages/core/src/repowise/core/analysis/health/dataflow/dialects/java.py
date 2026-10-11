@@ -24,7 +24,15 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from .base import BaseDefUseDialect, Occurrence, StatementDefUse
+from .base import (
+    NO_RECEIVER,
+    BaseDefUseDialect,
+    HandlerHead,
+    Occurrence,
+    Receiver,
+    StatementDefUse,
+    node_text,
+)
 
 if TYPE_CHECKING:
     from tree_sitter import Node
@@ -54,10 +62,26 @@ _SCOPE_BOUNDARIES = frozenset({"lambda_expression", "class_body"})
 class JavaDefUseDialect(BaseDefUseDialect):
     language = "java"
     member_access_kinds = frozenset({"field_access"})
+    receiver_write_kinds = _ASSIGN_KINDS | _UPDATE_KINDS
+    type_holder_kinds = frozenset(
+        {"formal_parameter", "local_variable_declaration", "enhanced_for_statement"}
+    )
+    type_wrapper_kinds = frozenset({"variable_declarator"})
     keyword_kinds = frozenset()  # Java has no keyword arguments.
 
     def _is_scope_boundary(self, node: Node) -> bool:
         return node.type in _SCOPE_BOUNDARIES
+
+    def handler_head(self, handler: Node) -> HandlerHead:
+        """``catch (A | B e)`` names ``A`` and ``B`` and binds ``e``."""
+        kids = handler.named_children
+        param = next((c for c in kids if c.type == "catch_formal_parameter"), None)
+        if param is None:
+            return (), None
+        kinds = next((c for c in param.named_children if c.type == "catch_type"), None)
+        types = tuple(node_text(t) for t in kinds.named_children) if kinds else ()
+        name = param.child_by_field_name("name")
+        return types, node_text(name) if name is not None else None
 
     def collect_reads(self, node: Node | None, out: list[Occurrence]) -> None:
         """Like the base collector, but a ``method_invocation`` / ``method_reference``
@@ -101,6 +125,17 @@ class JavaDefUseDialect(BaseDefUseDialect):
                 out.append(self._occ(name_node))
         return tuple(out)
 
+    def _own_receiver(self, fn_node: Node, lmap: LanguageNodeMap) -> Receiver | None:
+        """``this`` for an instance method or constructor, where a bare name
+        can also be a field; a ``static`` method has none. A lambda has none
+        of its own: it reaches the enclosing method's (``receiver``)."""
+        if fn_node.type in lmap.lambda_kinds:
+            return NO_RECEIVER
+        modifiers = next((c for c in fn_node.named_children if c.type == "modifiers"), None)
+        if modifiers is not None and any(c.type == "static" for c in modifiers.children):
+            return NO_RECEIVER
+        return self._receiver(lmap.self_identifiers, implicit=True)
+
     def _binder_identifier(self, node: Node) -> Node | None:
         named = node.child_by_field_name("name")
         if named is not None and named.type in self.identifier_kinds:
@@ -118,7 +153,9 @@ class JavaDefUseDialect(BaseDefUseDialect):
     ) -> None:
         t = node.type
         if t == _ENHANCED_FOR:  # ``for (T v : xs)``
+            start = len(defs)
             self._targets(node.child_by_field_name("name"), defs, uses)
+            self._loop_scoped(defs, start)
             self._process(node.child_by_field_name("value"), defs, uses)
         elif t in lmap.loop_kinds:  # for: init/cond/update; while / do: cond
             self._process(node.child_by_field_name("init"), defs, uses)

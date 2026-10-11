@@ -13,9 +13,11 @@ from . import (  # noqa: F401
     coverage_map,
     dead_code,
     doc_drift,
+    function_facts,
     health,
     performance,
     refactoring,
+    refactoring_payoff,
 )
 from .coverage import (
     coverage_by_module,
@@ -64,6 +66,7 @@ from .doc_drift import (
     serialize_doc_drift_row,
     summarize_confidence_rows,
 )
+from .function_facts import get_function_facts, tests_for_functions, write_function_facts
 from .health import (
     FILE_TREND_SNAPSHOT_WINDOW,
     HEALTH_SNAPSHOT_RETENTION,
@@ -112,7 +115,10 @@ from .refactoring import (
     finalize_refactoring_suggestions,
     get_refactoring_suggestion,
     get_refactoring_suggestions,
+    ranked_refactoring_suggestions,
     save_refactoring_suggestions,
+    store_plan_ranks,
+    summarize_open_plans,
     update_refactoring_suggestion_status,
     upsert_refactoring_suggestions,
 )
@@ -124,12 +130,14 @@ from .refactoring_opportunities import (
     refactoring_facet_counts,
     update_refactoring_opportunity_status,
 )
+from .refactoring_payoff import PayoffContext, plan_payoff
 
 __all__ = [
     "FILE_TREND_SNAPSHOT_WINDOW",
     "HEALTH_SNAPSHOT_RETENTION",
     "HealthSnapshotHeadline",
     "HealthSnapshotScalars",
+    "PayoffContext",
     "backfill_is_test",
     "backfill_module_attribution",
     "clear_unanalysed_scores",
@@ -156,6 +164,7 @@ __all__ = [
     "get_doc_drift_findings",
     "get_doc_drift_references",
     "get_file_language_map",
+    "get_function_facts",
     "get_health_finding_by_public_id",
     "get_health_findings",
     "get_health_metrics",
@@ -190,7 +199,9 @@ __all__ = [
     "opportunity_details",
     "performance_facet_counts",
     "performance_file_rollups",
+    "plan_payoff",
     "prune_unscored_health_rows",
+    "ranked_refactoring_suggestions",
     "refactoring_facet_counts",
     "replace_dead_code_findings",
     "replace_doc_drift_findings",
@@ -207,9 +218,12 @@ __all__ = [
     "serialize_doc_drift_reference_row",
     "serialize_doc_drift_row",
     "sort_metrics_worst_first",
+    "store_plan_ranks",
     "summarize_confidence_rows",
+    "summarize_open_plans",
     "tests_covering",
     "tests_covering_files",
+    "tests_for_functions",
     "update_dead_code_status",
     "update_health_finding_status",
     "update_refactoring_opportunity_status",
@@ -217,4 +231,5 @@ __all__ = [
     "upsert_health_findings",
     "upsert_health_metrics",
     "upsert_refactoring_suggestions",
+    "write_function_facts",
 ]

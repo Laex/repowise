@@ -13,6 +13,7 @@ both ask the same question of a listed receiver.
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING
 
 from .languages import LanguageNodeMap
@@ -24,12 +25,61 @@ if TYPE_CHECKING:
 # ``field_identifier`` / ``property_identifier`` / ``type_identifier`` ...).
 # Used by both the assertion-callee scan and the class self-member probe.
 _IDENTIFIER_SUFFIX = "identifier"
+_PROP_FIELD_NAMES = ("property", "attribute", "field", "name")
+# ``expression`` is C#'s receiver field on ``member_access_expression`` (its
+# ``this`` token is unnamed, so the positional fallback would pick the member).
+_OBJECT_FIELD_NAMES = ("object", "value", "argument", "operand", "expression")
 
 # Leaf node types that carry a declared name at the bottom of a C/C++
 # ``declarator`` chain.
 _DECLARATOR_NAME_KINDS = frozenset(
     {"identifier", "field_identifier", "type_identifier", "qualified_identifier"}
 )
+
+# Longest callee path a callback's name carries. A longer chain keeps its
+# trailing segments, which name the call the callback is handed to.
+_MAX_CALLEE_PATH = 100
+# A callee whose source text is already a dotted name (``ipcMain.handle``,
+# ``this.on``) and is kept as written.
+_PLAIN_PATH = re.compile(r"[\w$#]+(?:\.[\w$#]+)*")
+
+
+def member_object(node: Node) -> Node | None:
+    """The receiver child of a member-access (or index) node."""
+    for field_name in _OBJECT_FIELD_NAMES:
+        obj = node.child_by_field_name(field_name)
+        if obj is not None:
+            return obj
+    return next((c for c in node.children if c.is_named), None)
+
+
+def member_name(node: Node) -> Node | None:
+    """The member-name child of a member-access node."""
+    for field_name in _PROP_FIELD_NAMES:
+        prop = node.child_by_field_name(field_name)
+        if prop is not None:
+            return prop
+    named = [c for c in node.children if c.is_named]
+    return next((c for c in reversed(named) if c.type.endswith(_IDENTIFIER_SUFFIX)), None)
+
+
+def self_member_name(node: Node, names: frozenset[str]) -> str | None:
+    """Extract ``member`` from a ``self.member`` / ``this.member`` access.
+
+    Returns the member name when the receiver token is one of *names*
+    (a language's ``self_identifiers``, or a Go receiver's own name);
+    otherwise ``None`` (so ``other.x`` and
+    ``a.b.c``'s outer hops are ignored — only direct instance access
+    counts toward cohesion).
+    """
+    obj, prop = member_object(node), member_name(node)
+    if obj is None or prop is None or obj is prop:
+        return None
+    if obj.text is None or prop.text is None:
+        return None
+    if obj.text.decode("utf-8", errors="replace") not in names:
+        return None
+    return prop.text.decode("utf-8", errors="replace")
 
 
 def _pascal_unwrap_name(name: Node) -> Node:
@@ -161,9 +211,19 @@ def _find_call_callback_callee(node: Node) -> str | None:
     if call is None or call.type != "call_expression":
         return None
     callee = call.child_by_field_name("function")
-    if callee is None or callee.text is None:
+    if callee is None:
         return None
-    return " ".join(_node_text(callee).split())
+    path = _node_text(callee)
+    if not _PLAIN_PATH.fullmatch(path):
+        # A chained callee (``z.object({...}).superRefine``) would carry every
+        # argument in its text; its identifier path names the same call.
+        path = ".".join(_identifier_chain(callee, lower=False))
+    if len(path) > _MAX_CALLEE_PATH:
+        # Start the kept tail at a segment boundary; one identifier longer than
+        # the cap has none, so its own tail stands.
+        tail = path[-_MAX_CALLEE_PATH:]
+        path = tail.partition(".")[2] or tail
+    return path or None
 
 
 _TEST_SUITE_CALLBACK_CALLEES = frozenset({"describe", "context", "suite"})
@@ -245,6 +305,32 @@ def _collect_function_nodes(root: Node, lmap: LanguageNodeMap) -> list[Node]:
         for child in node.children:
             stack.append(child)
     return out
+
+
+def _nested_function_nodes(
+    collected: list[Node], candidates: list[Node], lmap: LanguageNodeMap
+) -> list[Node]:
+    """The functions and methods defined inside a collected function.
+
+    *collected* is what :func:`_collect_function_nodes` returned and
+    *candidates* every ``function_kinds`` node in the file. That collector
+    stops at the first function or lambda it meets and descends everything
+    else, so a function it did not return sits below one it did: a nested
+    ``def``, a function expression, a local function, a method of a local or
+    anonymous class. Each is a unit of its own, which the enclosing function's
+    walk skips. Lambdas are not candidates; they stay with the function that
+    holds them. A local value that shares a function's node type
+    (``lmap.local_value``) is no unit either.
+    """
+    seen = {node.id for node in collected}
+    local_value = lmap.local_value
+    return [
+        node
+        for node in candidates
+        if node.id not in seen
+        and is_function_node(node, lmap)
+        and not (local_value is not None and local_value(node))
+    ]
 
 
 def _parameter_list(fn_node: Node) -> Node | None:
@@ -346,20 +432,23 @@ def _count_parameters(fn_node: Node) -> int:
     return count
 
 
-def _identifier_chain(node: Node) -> list[str]:
-    """Every identifier under *node*, lowercased, in document order.
+def _identifier_chain(node: Node, *, lower: bool = True) -> list[str]:
+    """Every identifier under *node*, lowercased unless *lower* is false, in
+    document order.
 
     Order is load-bearing: the last entry is the name being called, the rest
-    the receiver path. Argument lists are never descended into.
+    the receiver path. Argument lists and ``type_arguments`` (TypeScript,
+    Java) are never descended into; C#'s ``type_argument_list`` still is.
     """
     names: list[str] = []
     stack: list[Node] = [node]
     while stack:
         cur = stack.pop()
-        if cur.type in ("argument_list", "arguments"):
+        if cur.type in ("argument_list", "arguments", "type_arguments"):
             continue
         if cur.type.endswith(_IDENTIFIER_SUFFIX) and cur.text is not None:
-            names.append(cur.text.decode("utf-8", "replace").lower())
+            text = cur.text.decode("utf-8", "replace")
+            names.append(text.lower() if lower else text)
         stack.extend(reversed(cur.children))
     return names
 

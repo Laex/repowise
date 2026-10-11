@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from ..asserts.oracle_reach import OracleReach
+    from ..dataflow.slice import FunctionFacts
     from ..perf.loop_facts import LoopFacts
 
 
@@ -94,9 +95,10 @@ class FunctionComplexity:
     is_test_case: bool = False
     # Every name called in this function's body, lowercased, **including**
     # nested function bodies -- where it parts company with the counts above,
-    # which stop at one. A function nested inside an already-collected one is
-    # never collected as an entry of its own, so stopping would attribute its
-    # calls to nobody. Empty for a language with no assertion
+    # which stop at one. A nested function has an entry of its own, but a test
+    # that hands an inline helper to something else never calls it by name, so
+    # stopping would put the helper's calls out of the test's reach. Empty for
+    # a language with no assertion
     # vocabulary row, because it rides on that traversal. It answers one
     # question: did this function hand its work to something else in the file?
     called_names: frozenset[str] = frozenset()
@@ -118,19 +120,42 @@ class FunctionComplexity:
     # CCN points inside that dispatch's heaviest arm, its own case point not
     # counted: a switch of one-line cases has 0.
     dispatch_arm: int = 0
+    # Calls on the terminal (print, prompt, console, stdout) over all calls in
+    # the body, nested bodies included, to two decimals. ``complexity/terminal.py``.
+    terminal_share: float = 0.0
     # True when the declaration is marked deprecated or the body's top level
     # issues a deprecation warning. ``complexity/deprecation.py``.
     deprecated: bool = False
+    # True when the body returns at once behind, or sits wholly inside, a
+    # module constant that is ``False`` in this file. ``complexity/gating.py``.
+    gated_off: bool = False
     # 1-indexed (start, end) lines of the first block that reaches
     # ``max_nesting``, when the function nests at all: the concrete place to
     # start flattening it. ``cyclomatic._walk_function_body``.
     deepest_block: tuple[int, int] | None = None
+    # Whole-function facts (awaits, yields, receiver, early exits), stored per
+    # function symbol by the health writer. ``dataflow.slice.function_facts``;
+    # None means not computed (a language with no map, or a failed read).
+    facts: FunctionFacts | None = None
 
     def __post_init__(self) -> None:
         if self.complex_conditions is None:
             self.complex_conditions = []
         if self.assertion_blocks is None:
             self.assertion_blocks = []
+
+    def stored_metrics(self) -> dict[str, int | None]:
+        """The size measures the ``function_facts`` store keeps for this function.
+
+        ``params`` is ``None`` for 0: the walk counts 0 both for no parameters
+        and for a list it could not find, and the store keeps unknown as NULL.
+        """
+        return {
+            "ccn": self.ccn,
+            "nloc": self.nloc,
+            "params": self.param_count or None,
+            "max_nesting": self.max_nesting,
+        }
 
 
 @dataclass
@@ -316,12 +341,28 @@ class PerfHit:
     # Distinct direct callers of the enclosing function, set only on the
     # centrality-gated ``hot_path_sync_io`` hit; 0 everywhere else.
     callers: int = 0
+    # The per-iteration call as written at ``line`` (``session.get``), so a plan
+    # can name what to batch; empty where the detector kept no call text.
+    sink_call: str = ""
+    # The variable the hit is about, as written: the string a ``+=`` grows
+    # (``string_concat_in_loop``), the list a membership test probes
+    # (``membership_test_against_list_in_loop``). One loop's hits on one
+    # variable are one edit, and the plan names it. Empty for every other
+    # kind and for a target that is not a plain name (``buf[0] += ...``).
+    subject: str = ""
 
     def loop_facts(self) -> dict[str, Any]:
-        """Loop facts for ``details``; absent when unset so old findings are unchanged."""
+        """Loop facts, the call text and the subject for ``details``.
+
+        Each key is absent when unset, so old findings are unchanged.
+        """
         facts = self.loop.as_details() if self.loop is not None else {}
         if self.loop_line:
             facts["loop_line"] = self.loop_line
+        if self.sink_call:
+            facts["sink_call"] = self.sink_call
+        if self.subject:
+            facts["subject"] = self.subject
         return facts
 
 

@@ -47,6 +47,7 @@ from repowise.cli.helpers import (
 from repowise.core.analysis.health import HEALTH_ANALYZER_VERSION
 from repowise.core.docs_mode import docs_mode_state_fields
 from repowise.core.index_scope import file_page_scope, stamp_index_scope
+from repowise.core.ingestion.git_indexer import GIT_HISTORY_VERSION, GIT_HISTORY_VERSION_KEY
 from repowise.core.update_lock import release_update_lock, try_acquire_update_lock
 
 
@@ -824,6 +825,8 @@ def upgrade_to_full(
         # from the current analyzer. Without the stamp the next plain `update`
         # would read a stale version and pay a redundant full re-score.
         state["health_analyzer_version"] = HEALTH_ANALYZER_VERSION
+        # The git backfill walked every file under the current history rules.
+        state[GIT_HISTORY_VERSION_KEY] = GIT_HISTORY_VERSION
         state["full_upgrade"] = {
             "status": "complete",
             "retryable": False,
@@ -854,7 +857,12 @@ def upgrade_to_full(
         if embedder_name and embedder_name != cfg.get("embedder"):
             from repowise.cli.helpers import save_config_partial
 
-            save_config_partial(repo_path, embedder=embedder_name)
+            # Explicit `embedding_model=None`, not a bare `embedder=`: the
+            # embedder just changed, so any model pinned for the old one no
+            # longer describes what this table was built with, and
+            # `save_config_partial` only clears the pin when told the model
+            # changed, not merely because `embedder` was passed (#2627).
+            save_config_partial(repo_path, embedder=embedder_name, embedding_model=None)
 
         elapsed = time.monotonic() - start
         console.print(

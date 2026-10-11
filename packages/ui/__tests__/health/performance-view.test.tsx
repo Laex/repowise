@@ -19,6 +19,11 @@ const openFirstRow = async () => {
   return first!;
 };
 
+/** Open a collapsed drawer section by its toggle's name. */
+function expand(panel: HTMLElement, name: string | RegExp) {
+  fireEvent.click(within(panel).getByRole("button", { name }));
+}
+
 describe("PerformanceView queue", () => {
   it("leads with the canonical rollup rather than flat context counters", async () => {
     render(<PerformanceView adapter={adapter()} />);
@@ -98,11 +103,22 @@ describe("PerformanceView queue", () => {
     render(<PerformanceView adapter={adapter()} />);
     const items = await rows();
     expect(items).toHaveLength(3);
-    expect(screen.getByText(/1 in the repository/)).toBeTruthy();
+    expect(screen.getAllByText("1 matching").length).toBeGreaterThan(0);
     const headings = screen.getAllByRole("heading", { level: 3 }).map((h) => h.textContent ?? "");
     expect(headings[0]).toContain("Plan ready");
     expect(headings[1]).toContain("Advisory");
     expect(headings[2]).toContain("Needs investigation");
+  });
+
+  it("keeps the green mark for a plan proven safe", async () => {
+    render(<PerformanceView adapter={adapter()} />);
+    const items = await rows();
+    const dot = (li: HTMLElement) =>
+      (li.querySelector("[aria-hidden='true'].rounded-full") as HTMLElement | null)?.style
+        .backgroundColor;
+    expect(dot(items[0]!)).toBe("var(--color-success)");
+    // Advisory with a stored plan: not proven safe, so not green.
+    expect(dot(items[1]!)).toBe("var(--color-text-tertiary)");
   });
 
   it("shows the cause in words, where in mono, and the sink as separate evidence", async () => {
@@ -209,10 +225,20 @@ describe("PerformanceView states", () => {
 });
 
 describe("PerformanceView drawer", () => {
+  it("numbers the queue from 1 although rank_position is stored 0-based", async () => {
+    render(<PerformanceView adapter={adapter()} />);
+    const first = await openFirstRow();
+    expect(within(first).getByText("1")).toBeTruthy();
+    const panel = await screen.findByRole("dialog");
+    expand(panel, "Why it ranks here");
+    expect(within(panel).getByText(/Position/).textContent).toMatch(/^Position 1 in the queue/);
+  });
+
   it("separates evidence confidence, actionability, and fix safety", async () => {
     render(<PerformanceView adapter={adapter()} />);
     await openFirstRow();
     const panel = await screen.findByRole("dialog");
+    expand(panel, "What the evidence shows");
     expect(within(panel).getByText("Evidence confidence")).toBeTruthy();
     expect(within(panel).getByText("Actionability confidence")).toBeTruthy();
     expect(within(panel).getByText("Fix safety")).toBeTruthy();
@@ -224,6 +250,7 @@ describe("PerformanceView drawer", () => {
     render(<PerformanceView adapter={adapter()} />);
     await openFirstRow();
     const panel = await screen.findByRole("dialog");
+    expand(panel, "What the evidence shows");
     expect(within(panel).getByText("Loop magnitude")).toBeTruthy();
     expect(within(panel).getByText("Grows with data")).toBeTruthy();
     expect(within(panel).getByText("self._sem")).toBeTruthy();
@@ -239,12 +266,14 @@ describe("PerformanceView drawer", () => {
     await openFirstRow();
     await waitFor(() => expect(getDetail).toHaveBeenCalled());
     const panel = await screen.findByRole("dialog");
+    expand(panel, "What the evidence shows");
     expect(within(panel).queryByText("Loop magnitude")).toBeNull();
   });
 
   it("carries the exact drill-down an agent should call", async () => {
     render(<PerformanceView adapter={adapter()} />);
     await openFirstRow();
+    expand(await screen.findByRole("dialog"), "Hand this to an agent");
     expect(await screen.findByText('get_health(opportunity_id="perf2_planready")')).toBeTruthy();
   });
 
@@ -256,7 +285,8 @@ describe("PerformanceView drawer", () => {
       expect(getDetail).toHaveBeenCalledWith("perf2_planready", { evidenceLimit: 8 }),
     );
     const panel = await screen.findByRole("dialog");
-    expect(within(panel).getByText(/Analyzed at/)).toBeTruthy();
+    expand(panel, "Hand this to an agent");
+    expect(await within(panel).findByText(/Analyzed at/)).toBeTruthy();
   });
 
   it("says a cause is no longer observed instead of showing it as open", async () => {
@@ -392,6 +422,35 @@ describe("PerformanceView drawer", () => {
     await openFirstRow();
     fireEvent.click(await screen.findByRole("button", { name: "Copy the plan for an agent" }));
     expect(await screen.findByText("Structured plan handoff")).toBeTruthy();
+  });
+
+  it("shows the plan prompt the server renders when the host serves one", async () => {
+    const exact: RefactoringPlan = {
+      id: "plan-1",
+      refactoring_type: "performance_fix",
+      file_path: "src/shared.py",
+      target_symbol: "src/shared.py::load",
+      line_start: 8,
+      line_end: 12,
+      plan: { opportunity_id: "perf2_planready", strategy: "batch_or_prefetch_io" },
+      evidence: {},
+      impact_delta: 0,
+      effort_bucket: "M",
+      blast_radius: {},
+      confidence: "medium",
+      source_biomarker: "io_in_loop",
+      rank_score: 12.5,
+    };
+    const served = vi.fn(async (planId: string, flavor: string) => `served ${planId} ${flavor}`);
+    render(
+      <PerformanceView
+        adapter={adapter({ getRefactoringPlan: async () => exact, getRefactoringPlanPrompt: served })}
+      />,
+    );
+    await openFirstRow();
+    fireEvent.click(await screen.findByRole("button", { name: "Copy the plan for an agent" }));
+    expect(await screen.findByText(/served plan-1 generic/)).toBeTruthy();
+    expect(served).toHaveBeenCalledWith("plan-1", "generic");
   });
 
   it("falls back to the evidence handoff when no plan was verified", async () => {
@@ -594,6 +653,70 @@ describe("PerformanceView drawer plan steps and validation", () => {
     expect(liTexts[1]).toContain("Batch the second call");
   });
 
+  it("shows a step's own check only where the server says it differs from the plan's", async () => {
+    const withSteps = page({
+      items: [
+        opportunity({
+          opportunity_id: "perf2_planready",
+          validation: {
+            basis: "inferred",
+            via: "call-graph",
+            total: 2,
+            tests: ["tests/test_a.py", "tests/test_b.py"],
+            commands: ["pytest tests/test_a.py tests/test_b.py"],
+          },
+          plan_steps: [
+            {
+              order: 1,
+              action: "Batch the first call",
+              symbol: "src/a.py::run",
+              file_path: "src/a.py",
+              line: 10,
+              applicability: "judgment",
+              verify: {
+                commands: ["pytest tests/test_a.py"],
+                tests: ["tests/test_a.py"],
+                coverage: "inferred",
+              },
+            },
+            {
+              order: 2,
+              action: "Batch the second call",
+              symbol: "src/b.py::run",
+              file_path: "src/b.py",
+              line: 20,
+              applicability: "judgment",
+            },
+            {
+              order: 3,
+              action: "Batch the third call",
+              symbol: "src/c.py::run",
+              file_path: "src/c.py",
+              line: 30,
+              applicability: "judgment",
+              verify: { commands: [], tests: [], coverage: "none" },
+            },
+          ],
+        }),
+      ],
+    });
+    render(
+      <PerformanceView adapter={adapter({ getPerformanceOpportunities: async () => withSteps })} />,
+    );
+    await openFirstRow();
+    const panel = await screen.findByRole("dialog");
+    const step = (text: RegExp) => within(panel).getByText(text).closest("li")!;
+    const first = step(/Batch the first call/);
+    expect(within(first).getByText("pytest tests/test_a.py")).toBeTruthy();
+    expect(within(first).getByRole("button", { name: "Copy command" })).toBeTruthy();
+    const second = step(/Batch the second call/);
+    expect(within(second).queryByRole("button", { name: "Copy command" })).toBeNull();
+    expect(within(second).queryByText(/No test reaches/)).toBeNull();
+    const third = step(/Batch the third call/);
+    expect(within(third).getByText("No test reaches this step.")).toBeTruthy();
+    expect(within(third).queryByRole("button", { name: "Copy command" })).toBeNull();
+  });
+
   it("renders the stored validation through the shared validation summary", async () => {
     const withValidation = page({
       items: [
@@ -616,6 +739,7 @@ describe("PerformanceView drawer plan steps and validation", () => {
     );
     await openFirstRow();
     const panel = await screen.findByRole("dialog");
+    expand(panel, /^Tests/);
     expect(within(panel).getByText(/Measured coverage/)).toBeTruthy();
     expect(within(panel).getByText(/via call graph/)).toBeTruthy();
     expect(within(panel).getByText("tests/test_a.py")).toBeTruthy();
@@ -643,6 +767,7 @@ describe("PerformanceView drawer plan steps and validation", () => {
     );
     await openFirstRow();
     const panel = await screen.findByRole("dialog");
+    expand(panel, /^Tests/);
     expect(within(panel).getByText(/via name match/)).toBeTruthy();
   });
 
@@ -662,6 +787,10 @@ describe("PerformanceView drawer plan steps and validation", () => {
     );
     await openFirstRow();
     const panel = await screen.findByRole("dialog");
+    // No guarding test is the case a reader needs, so the section opens on it.
+    const tests = within(panel).getByRole("button", { name: /^Tests/ });
+    expect(tests.getAttribute("aria-expanded")).toBe("true");
+    expect(tests.textContent).toContain("none guarding");
     expect(within(panel).getByText("Validation gap")).toBeTruthy();
     expect(within(panel).getByText(/Treat this as explicit validation work/)).toBeTruthy();
   });
@@ -671,6 +800,7 @@ describe("PerformanceView drawer plan steps and validation", () => {
     await openFirstRow();
     const panel = await screen.findByRole("dialog");
     expect(within(panel).queryByText(/guarding test/)).toBeNull();
+    expect(within(panel).queryByRole("button", { name: /^Tests/ })).toBeNull();
     expect(within(panel).queryByText(/Validation gap/)).toBeNull();
   });
 });
@@ -886,6 +1016,7 @@ describe("PerformanceView drawer, the fix itself", () => {
     render(<PerformanceView adapter={adapter()} />);
     await openFirstRow();
     const panel = await screen.findByRole("dialog");
+    expand(panel, "What the evidence shows");
     for (const facet of ["amplification", "exposure", "leverage", "change risk", "loop magnitude"]) {
       expect(within(panel).getByRole("button", { name: `What ${facet} means` })).toBeTruthy();
     }
@@ -894,7 +1025,7 @@ describe("PerformanceView drawer, the fix itself", () => {
   it("widens the excerpt up to the loop header and names the sink once", async () => {
     const lines = Array.from({ length: 30 }, (_, i) => `line ${i + 1}`);
     lines[5] = "    for row in rows:";
-    const readSource = vi.fn(async () => lines.join(String.fromCharCode(10)));
+    const readSource = vi.fn(async () => lines.join("\n"));
     render(<PerformanceView adapter={adapter({ readSource })} />);
     await openFirstRow();
     const panel = await screen.findByRole("dialog");
@@ -908,7 +1039,7 @@ describe("PerformanceView drawer, the fix itself", () => {
 
   it("says so when no loop header sits within reach of the call", async () => {
     const lines = Array.from({ length: 30 }, (_, i) => `line ${i + 1}`);
-    const readSource = vi.fn(async () => lines.join(String.fromCharCode(10)));
+    const readSource = vi.fn(async () => lines.join("\n"));
     render(<PerformanceView adapter={adapter({ readSource })} />);
     await openFirstRow();
     const panel = await screen.findByRole("dialog");

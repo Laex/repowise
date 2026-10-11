@@ -26,6 +26,7 @@ import structlog
 
 from ...code_origin import is_build_file
 from ...entry_candidacy import is_reachability_root
+from ...ingestion.decorator_names import decorator_base as _decorator_base
 from ...ingestion.models import REACHABILITY_USE_EDGE_TYPES
 from ...ingestion.package_roots import package_manifest_names
 from ...ingestion.symbol_identity import base_symbol_id, overload_sets
@@ -76,6 +77,7 @@ from .name_occurrences import (
     clamp_named_types,
     clamp_path_mentions,
     clamp_unverified_absence,
+    demote_exports_used_in_own_code,
     demote_used_in_own_file,
     drop_bare_name_uses,
     drop_internals_used_in_own_file,
@@ -90,6 +92,7 @@ from .risk_factors import (
     path_risk_factors,
     risk_evidence,
 )
+from .vbnet_modules import vbnet_module_names
 
 #: The unindexed scan below and the repo-wide absence check ask the same
 #: question of different file sets, so they share one identifier shape rather
@@ -173,29 +176,6 @@ def _declared_deliberately_unused(decorators: Iterable[str]) -> bool:
             ):
                 return True
     return False
-
-
-def _decorator_base(raw: str) -> str:
-    """Return the normalised base name of a single decorator/annotation token.
-
-    Strips a leading ``@``, trims whitespace, and drops any call-argument
-    ``(â€¦)`` tail.  For multi-word tokens (e.g. a Java modifier blob fragment
-    ``"Deprecated\n    public"``) only the first whitespace-delimited word is
-    kept, so visibility keywords that trail the annotation name are discarded.
-
-    This function handles ONE token.  Callers that receive multi-annotation
-    blobs (Java/Kotlin ``modifiers`` node) must split on ``@`` first.
-    """
-    base = raw.lstrip("@").strip()
-    paren = base.find("(")
-    if paren >= 0:
-        base = base[:paren].strip()
-    else:
-        # Handle trailing visibility keywords in modifier blobs:
-        # "Deprecated\n    public" â†’ "Deprecated"
-        parts = base.split()
-        base = parts[0] if parts else base
-    return base
 
 
 def _is_framework_registered(decorators: list[str]) -> bool:
@@ -760,7 +740,8 @@ class _ExportFile:
     # ``using`` names a namespace, so neither says anything about a symbol.
     importers_name_symbols: bool
     # Classes holding C# extension methods, called as ``x.Method()`` without
-    # naming the class, so no importer would name them either.
+    # naming the class, and VB.NET Modules, whose members are in scope
+    # unqualified: no importer would name either.
     extension_containers: frozenset[str]
     imported_as_namespace: bool
     enclosing_ranges: list[tuple[int, int]]
@@ -1033,6 +1014,9 @@ class DeadCodeAnalyzer:
         # version of the same question â€” not "could an unread file explain
         # this" but "did we look anywhere except the import graph".
         findings = drop_bare_name_uses(findings, self._source_map)
+        # Before the clamp, which would otherwise read a same-file use as
+        # "named elsewhere" and leave the row in the default view.
+        findings = demote_exports_used_in_own_code(findings, self._source_map)
         findings = clamp_unverified_absence(findings, self._source_map)
         findings = drop_internals_used_in_own_file(findings, self._source_map)
         findings = clamp_path_mentions(findings, self._source_map)
@@ -1463,10 +1447,11 @@ class DeadCodeAnalyzer:
         # member of the file. Only these two: ``dynamic_imports`` means the
         # module is loaded, which a plain import edge does not rescue either.
         # A framework edge that names its exports (a Lambda handler) rescues
-        # only those, through the importer check below.
+        # only those, through the importer check below. ``dynamic_hint`` is a
+        # whole-module dynamic use folded into a static edge on the same pair.
         if any(
-            edge.get("edge_type") in ("dynamic_uses", "framework")
-            and not edge.get("imported_names")
+            (edge.get("edge_type") in ("dynamic_uses", "framework") and not edge.get("imported_names"))
+            or edge.get("dynamic_hint")
             for edge in (
                 self.graph.get_edge_data(pred, node, {}) for pred in self.graph.predecessors(node)
             )
@@ -1483,7 +1468,7 @@ class DeadCodeAnalyzer:
             node_data=node_data,
             symbol_pairs=symbol_pairs,
             importers_name_symbols=self._importers_name_symbols(node, symbols),
-            extension_containers=self._extension_containers(node_data, symbol_pairs),
+            extension_containers=self._extension_containers(node, node_data, symbol_pairs),
             imported_as_namespace=self._imported_as_namespace(node, node_data),
             # Function bodies, so nested defs (closures) can be skipped.
             enclosing_ranges=[
@@ -1503,12 +1488,15 @@ class DeadCodeAnalyzer:
         )
 
     def _extension_containers(
-        self, node_data: dict, symbol_pairs: list[tuple[str, dict]]
+        self, node: Any, node_data: dict, symbol_pairs: list[tuple[str, dict]]
     ) -> frozenset[str]:
-        """Names of the classes in this file that declare a C# extension method."""
+        """Containers here a use never names: C# extension holders, VB.NET Modules."""
         if node_data.get("language") not in _CONTAINER_USE_LANGUAGES:
             return frozenset()
-        return frozenset(
+        modules = vbnet_module_names(
+            (sym for _, sym in symbol_pairs), self._source_map.get(str(node))
+        )
+        return modules | frozenset(
             sym.get("name", "")
             for sym_id, sym in symbol_pairs
             if self._declares_extension_method(sym_id)
@@ -1716,7 +1704,7 @@ class DeadCodeAnalyzer:
 
         Not when no importer names this file's symbols; not where the
         preprocessor reaches a symbol through macros, typedef aliases and token
-        pasting; not for a class holding C# extension methods.
+        pasting; not for a C# extension holder or a VB.NET Module.
         """
         return (
             file_ctx.importers_name_symbols

@@ -37,6 +37,7 @@ def _row(repo_id: str, caller: str, line: int) -> HealthFinding:
                 "cross_function": True,
                 "path": [f"{caller}::run", "src/shared.py::load", "src/db.py::fetch"],
                 "resolution_basis": "call-site",
+                "loop_magnitude": "grows_with_data",
                 "dataflow_verified": True,
             }
         ),
@@ -51,8 +52,9 @@ def _row(repo_id: str, caller: str, line: int) -> HealthFinding:
 async def materialized(session, health_data: str) -> str:
     """Five callers behind one shared helper, plus the base fixture's own row.
 
-    The fixture contributes a second production cause, which is why the totals
-    below are two rather than one.
+    The fixture contributes a second production cause whose loop nobody
+    measured, so the default queue holds one and counts the other as
+    ``unmeasured_cost``.
     """
     for index, caller in enumerate(_CALLERS, start=10):
         session.add(_row(health_data, caller, index))
@@ -102,8 +104,10 @@ async def test_a_bare_dashboard_leads_with_something_to_do(setup_mcp, materializ
     # it points at the loop of its first caller, so its title names the helper.
     shared = [i for i in perf if i["title"].endswith(" load")]
     assert len(shared) == 1, perf
-    assert shared[0]["next_call"]["arguments"]["opportunity_id"].startswith("perf")
-    assert 0 < len(json.dumps(shared[0])) <= 1500
+    # A list item's next call is one fix_id away; only the lead carries it inline.
+    item = (await get_health(fix_id=shared[0]["id"]))["item"]
+    assert item["next_call"]["arguments"]["opportunity_id"].startswith("perf")
+    assert 0 < len(json.dumps(shared[0])) <= 1000
 
 
 @pytest.mark.asyncio
@@ -140,7 +144,7 @@ async def test_the_queue_filters_before_it_caps(setup_mcp, materialized):
         performance_context="production",
         performance_boundary="db",
     )
-    assert result["performance_opportunities_total"] == 2
+    assert result["performance_opportunities_total"] == 1
     assert {
         item["execution_context"] for item in result["performance_opportunities"]
     } == {"production"}
@@ -185,6 +189,7 @@ async def test_performance_actionability_threads_through_and_defaults_off_expect
                     "cross_function": True,
                     "path": ["src/fs.py::run", "src/fs.py::read"],
                     "resolution_basis": "reliable-edge",
+                    "loop_magnitude": "grows_with_data",
                 }
             ),
             health_impact=0.0,
@@ -225,7 +230,7 @@ async def test_an_unrecognized_filter_value_is_named_not_silently_empty(
         only=["performance_opportunities"],
         performance_context="staging",
     )
-    assert result["performance_opportunities_total"] == 2
+    assert result["performance_opportunities_total"] == 1
     assert result["ignored_arguments"] == {
         "performance_context": "staging (accepted: production, tooling, test, unknown, all)"
     }
@@ -272,7 +277,9 @@ async def test_one_id_returns_the_cause_its_plan_and_its_rank_rationale(
     assert result["confidence"] == "high"
     assert result["fix"]["safety"] == "advisory"
     assert [step["order"] for step in result["plan_steps"]] == [1, 2, 3, 4, 5]
-    assert result["validation"]["commands"]
+    # No test reaches the fixture's code: no command, and the plan says so.
+    assert result["validation"]["commands"] == []
+    assert "add a characterization test" in result["validation"]["prerequisite"]
     assert result["facets"]["leverage"] == "shared"
     assert result["why_ranked"]
     assert len(json.dumps(result)) <= 20_000

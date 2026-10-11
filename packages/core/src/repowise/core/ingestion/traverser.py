@@ -31,6 +31,13 @@ from pathspec.patterns.gitwildmatch import GitWildMatchPattern, GitWildMatchPatt
 
 from ..code_origin import is_generated_header
 from ..entry_candidacy import conventional_entry_stems, not_an_execution_start
+from ..pytest_roots import (
+    PYTEST_CONFIG_NAMES,
+    PytestRoots,
+    parse_pytest_options,
+    pytest_options,
+    pytest_roots,
+)
 from ..test_paths import is_test_related_path
 from .languages.registry import REGISTRY as _LANG_REGISTRY
 from .languages.specs.cpp import INCLUDE_FRAGMENT_EXTENSIONS
@@ -209,13 +216,9 @@ _BLOCKED_DIRS: frozenset[str] = frozenset(
         ".mypy_cache",
         ".ruff_cache",
         ".tox",
-        "dist",
-        "build",
         ".next",
-        "target",  # Rust / Maven
         ".gradle",
         "vendor",  # Go / PHP
-        "coverage",
         "htmlcov",
         ".eggs",
         "site-packages",
@@ -319,6 +322,24 @@ _MINIFIED_SAMPLE_BYTES: int = 256 * 1024
 
 # Languages with no AST parsing, so generated-marker sniffing buys nothing.
 _SKIP_GENERATED_CHECK: frozenset[str] = _LANG_REGISTRY.unparseable_data_languages()
+
+#: Names build and report tools write to that are also ordinary package names
+#: (``analysis/coverage/``, coverage.py's own ``coverage/``, a Go ``build``
+#: package, a ``build`` route). Pruned unless the directory itself holds a
+#: hand-written source file: output roots hold bundles, objects and reports
+#: directly and keep any copied source a level deeper (``build/lib/``,
+#: ``target/generated-sources/``). Ceiling: a package holding only JavaScript
+#: or C directly, or whose files all sit in subdirectories, stays pruned, and
+#: no ignore file can re-include a pruned directory yet. A ``package.json`` is
+#: no evidence: bundlers write one beside their output.
+_OUTPUT_DIR_NAMES: frozenset[str] = frozenset({"build", "coverage", "dist", "target"})
+
+#: Languages a build or report writes (bundles, generated C, HTML reports),
+#: so their files are no evidence that an output-named directory is source.
+_EMITTED_LANGUAGES: frozenset[str] = _SKIP_GENERATED_CHECK | {"c", "cpp", "javascript", "objectivec"}
+
+#: Filename endings a compiler emits in otherwise hand-written languages.
+_EMITTED_SUFFIXES: tuple[str, ...] = (".d.ts", ".d.mts", ".d.cts", ".qmltypes", *_GENERATED_SUFFIXES)
 
 
 class FileTraverser:
@@ -432,7 +453,17 @@ class FileTraverser:
         return self._console_scripts
 
     @property
+    def pytest_roots(self) -> PytestRoots:
+        """Where pytest collects, from the configs the console-script pass read."""
+        return self._console_script_tables().pytest_roots
+
+    @property
     def _console_script_names(self) -> frozenset[str]:
+        return self._console_script_tables().names
+
+    @property
+    def console_script_names(self) -> frozenset[str]:
+        """Launcher names the repo's ``pyproject.toml`` files declare, read once per walk."""
         return self._console_script_tables().names
 
     @property
@@ -591,7 +622,8 @@ class FileTraverser:
         if dir_ignore is not None and dir_ignore.extra.match_file(dirname + "/"):
             return True
         nested = dir_ignore is not None and dir_ignore.gitignore.match_file(dirname + "/")
-        return self._dir_gitignored(rel_str, nested)
+        # Last, so a gitignored output tree is pruned before anything lists it.
+        return self._dir_gitignored(rel_str, nested) or is_output_dir(self.repo_root / rel_path)
 
     def _dir_gitignored(self, rel_str: str, nested_match: bool) -> bool:
         """Whether ``.gitignore`` prunes the directory, which it may not if git tracks a file in it."""
@@ -779,7 +811,9 @@ class FileTraverser:
             _is_console_script_target(rel_str, self._console_script_modules)
             or rel_str in self._distribution_inits
         )
-        is_test = is_test_related_path(rel_str, language)
+        is_test = is_test_related_path(
+            rel_str, language, self._console_script_tables().pytest_roots
+        )
         entry = _is_entry_point(rel_str, abs_path, language) or manifest_entry
         return FileInfo(
             path=rel_str,
@@ -1114,7 +1148,7 @@ def _is_entry_point(rel_str: str, abs_path: Path, language: str) -> bool:
 
 
 class ConsoleScriptTables(NamedTuple):
-    """What one pass over the repo's ``pyproject.toml`` files yields."""
+    """What one pass over the repo's Python project configs yields."""
 
     names: frozenset[str]
     """Launcher names an installer drops in the environment's script dir."""
@@ -1124,6 +1158,8 @@ class ConsoleScriptTables(NamedTuple):
     """``[project].name`` values — the distributions this repo installs as."""
     package_inits: frozenset[str]
     """Repo-relative ``__init__.py`` of each distribution's own import package."""
+    pytest_roots: PytestRoots = PytestRoots()
+    """Where a bare pytest run collects tests, which decides a test-named module."""
 
 
 def _collect_console_scripts(
@@ -1135,7 +1171,9 @@ def _collect_console_scripts(
     ``[project.entry-points.*]`` group from each ``pyproject.toml`` in the
     repo. In ``name = "pkg.module:func"`` the key is the launcher and the part
     before the colon is the module it imports; ``[project].name`` is the
-    distribution. Best-effort: unparsable files are skipped.
+    distribution. Best-effort: unparsable files are skipped. The pytest
+    configs (``pytest.ini``, ``tox.ini``, ``setup.cfg`` and the same
+    ``pyproject.toml``) come off this one walk and one read each.
     """
     from repowise.core.fs_walk import iter_glob
 
@@ -1143,14 +1181,21 @@ def _collect_console_scripts(
     modules: set[str] = set()
     distributions: set[str] = set()
     inits: set[str] = set()
+    pytest_configs: list[tuple[str, dict]] = []
+    unreadable: list[str] = []
     try:
         config_files = list(
-            iter_glob(repo_root, ("pyproject.toml",), prune_nested_git=prune_nested_git)
+            iter_glob(repo_root, tuple(PYTEST_CONFIG_NAMES), prune_nested_git=prune_nested_git)
         )
     except OSError:
         return ConsoleScriptTables(frozenset(), frozenset(), frozenset(), frozenset())
     for config_file in config_files:
-        project = _pyproject_project_table(config_file)
+        project, options, parsed = _read_python_config(config_file)
+        rel = config_file.relative_to(repo_root).as_posix()
+        if options is not None:
+            pytest_configs.append((rel, options))
+        if not parsed:
+            unreadable.append(rel)
         if project is None:
             continue
         dist = project.get("name")
@@ -1160,7 +1205,11 @@ def _collect_console_scripts(
                 inits.add(init)
         _add_script_targets(project, names, modules)
     return ConsoleScriptTables(
-        frozenset(names), frozenset(modules), frozenset(distributions), frozenset(inits)
+        frozenset(names),
+        frozenset(modules),
+        frozenset(distributions),
+        frozenset(inits),
+        pytest_roots(pytest_configs, unreadable),
     )
 
 
@@ -1179,16 +1228,24 @@ def _distribution_init(repo_root: Path, base: Path, dist: str) -> str | None:
     return init.relative_to(repo_root).as_posix()
 
 
-def _pyproject_project_table(config_file: Path) -> dict | None:
-    """The ``[project]`` table of one pyproject.toml, or None if unreadable or absent."""
+def _read_python_config(config_file: Path) -> tuple[dict | None, dict | None, bool]:
+    """``([project] table, pytest options, parsed)`` of one config.
+
+    The first two are None if absent or unreadable; *parsed* is False when the
+    file could not be read or parsed, so what it collects is unknown.
+    """
     import tomllib
 
     try:
-        data = tomllib.loads(config_file.read_text(encoding="utf-8"))
+        text = config_file.read_text(encoding="utf-8")
+        if config_file.name != "pyproject.toml":
+            return None, parse_pytest_options(config_file.name, text), True
+        data = tomllib.loads(text)
     except Exception:
-        return None
+        return None, None, False
     project = data.get("project")
-    return project if isinstance(project, dict) else None
+    options = pytest_options(config_file.name, toml=data)
+    return (project if isinstance(project, dict) else None), options, True
 
 
 def _add_script_targets(project: dict, names: set[str], modules: set[str]) -> None:
@@ -1327,14 +1384,77 @@ def _parse_gitmodules(repo_root: Path) -> frozenset[str]:
         return frozenset()
 
 
-def is_candidate_source_path(rel_path: str) -> bool:
+def _is_handwritten_source_name(name: str) -> bool:
+    """Whether a file named *name* is source a person writes, never a build writes."""
+    if name.endswith(_EMITTED_SUFFIXES):
+        return False
+    language = EXTENSION_TO_LANGUAGE.get(os.path.splitext(name)[1].lower())
+    return language is not None and language not in _EMITTED_LANGUAGES
+
+
+def is_output_dir(abs_dir: Path) -> bool:
+    """Whether *abs_dir* is a build or report output root (see ``_OUTPUT_DIR_NAMES``).
+
+    One listing of the directory itself, and only for an output-shaped name.
+    An unlistable directory is not output: a deleted source package must still
+    reach the change sources as deletions.
+    """
+    if abs_dir.name not in _OUTPUT_DIR_NAMES:
+        return False
+    try:
+        with os.scandir(abs_dir) as entries:
+            return not any(
+                _is_handwritten_source_name(e.name) and e.is_file() for e in entries
+            )
+    except OSError:
+        return False
+
+
+def in_blocked_dir(
+    rel_path: str, repo_root: Path | None, cache: dict[Path, bool] | None = None
+) -> bool:
+    """Whether a directory on *rel_path* (POSIX, repo-relative) is blocklisted.
+
+    With no *repo_root* there is nothing to list, so every output-shaped name
+    counts as output, the conservative answer. A caller checking many paths
+    passes one *cache* for the batch, so each output-named directory is listed
+    once. A hand-written file directly in a directory cached as output lists
+    it again, since that file may be what makes it source; build output never
+    has such a name, so a burst of it stays cached.
+    """
+    *dirs, name = rel_path.split("/")
+    for depth, part in enumerate(dirs, 1):
+        if part in _BLOCKED_DIRS:
+            return True
+        if part not in _OUTPUT_DIR_NAMES:
+            continue
+        if repo_root is None:
+            return True
+        abs_dir = repo_root.joinpath(*dirs[:depth])
+        cached = None if cache is None else cache.get(abs_dir)
+        if cached is None or (
+            cached and depth == len(dirs) and _is_handwritten_source_name(name)
+        ):
+            cached = is_output_dir(abs_dir)
+            if cache is not None:
+                cache[abs_dir] = cached
+        if cached:
+            return True
+    return False
+
+
+def is_candidate_source_path(
+    rel_path: str, repo_root: Path | None = None, cache: dict[Path, bool] | None = None
+) -> bool:
     """Whether *rel_path* is shaped like a file this repo would index.
 
     Path-shape only: the directory blocklist, the blocked extensions/filename
-    patterns, and the known-language extension map. No disk access, no
-    gitignore, no binary/size/generated checks, so a ``True`` answer means
-    "worth handing to the pipeline", never "will be indexed". :class:`FileTraverser`
-    still applies the full test on the files it walks.
+    patterns, and the known-language extension map. No gitignore, no
+    binary/size/generated checks, so a ``True`` answer means "worth handing to
+    the pipeline", never "will be indexed". :class:`FileTraverser` still
+    applies the full test on the files it walks. The only disk access is the
+    output-directory listing of :func:`in_blocked_dir`, given *repo_root*
+    (and memoized in *cache* when given).
 
     It serves the change sources that only see a path: the working-tree diff
     and the file watcher.
@@ -1342,10 +1462,11 @@ def is_candidate_source_path(rel_path: str) -> bool:
     One known false negative: an extensionless script that :class:`FileTraverser`
     accepts by shebang is rejected here, since deciding that means reading it.
     """
-    parts = Path(rel_path.replace("\\", "/")).parts
+    posix = rel_path.replace("\\", "/")
+    parts = Path(posix).parts
     if not parts:
         return False
-    if any(part in _BLOCKED_DIRS for part in parts[:-1]):
+    if in_blocked_dir(posix, repo_root, cache):
         return False
 
     name = parts[-1]

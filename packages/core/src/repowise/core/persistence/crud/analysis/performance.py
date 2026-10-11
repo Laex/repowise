@@ -14,6 +14,7 @@ for the same reason - they can no longer describe the current tree.
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from sqlalchemy import delete, func, select, update
@@ -31,6 +32,7 @@ from ...sql import order_by, rule_predicate
 from .refactoring import _refactoring_row_kwargs
 
 if TYPE_CHECKING:
+    from ....analysis.execution_roles import ExecutionRoles
     from ....analysis.health.perf.opportunities import (
         PerformanceOpportunity as OpportunityModel,
     )
@@ -102,9 +104,11 @@ def _row_kwargs(
     plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     from ....analysis.health.perf.serving import intervention_file
+    from ....analysis.health.queue.counts import perf_judgement
+    from ....analysis.health.queue.eligibility import queue_proof
 
     fix = opportunity.fix
-    return {
+    row = {
         "opportunity_id": opportunity.opportunity_id,
         "performance_model_version": opportunity.performance_model_version,
         "status": "open",
@@ -116,6 +120,8 @@ def _row_kwargs(
         "actionability_state": opportunity.actionability_state,
         "evidence_confidence": opportunity.confidence,
         "plan_state": plan_state,
+        "cost_proof": queue_proof(opportunity),
+        "execution_role": opportunity.facets.get("execution_role", "unknown"),
         "fix_strategy": fix.strategy if fix else None,
         "fix_safety": fix.safety if fix else None,
         "file_path": intervention_file(opportunity),
@@ -127,6 +133,13 @@ def _row_kwargs(
         "details_json": json.dumps(opportunity_details(opportunity, plan), separators=(",", ":")),
         "analyzed_commit": analyzed_commit,
     }
+    # Judged on the row as stored, which Fix first reads the same way.
+    judged = {
+        **row,
+        "facets": opportunity.facets,
+        "actionability_reason": opportunity.actionability_reason,
+    }
+    return {**row, **perf_judgement(judged, opportunity.facets, plan or {}).columns()}
 
 
 def _summary_payload(
@@ -135,35 +148,40 @@ def _summary_payload(
     plans: dict[str, dict[str, Any]] | None = None,
 ) -> dict:
     """The compact current headline, written once and read by primary key."""
-    from ....analysis.health.perf.opportunity_rank import (
-        default_queue_counts,
-        default_queue_exclusion,
-    )
     from ....analysis.health.perf.serving import intervention_file
+    from ....analysis.health.queue.eligibility import (
+        perf_queue_counts,
+        perf_queue_verdict,
+        queue_proof,
+    )
 
     counts: dict[str, int] = {}
     contexts: dict[str, int] = {}
     boundaries: dict[str, int] = {}
+    proofs: dict[str, int] = {}
     for item in opportunities:
         counts[item.actionability_state] = counts.get(item.actionability_state, 0) + 1
         contexts[item.execution_context] = contexts.get(item.execution_context, 0) + 1
         key = item.boundary_kind or "none"
         boundaries[key] = boundaries.get(key, 0) + 1
+        proof = queue_proof(item)
+        proofs[proof] = proofs.get(proof, 0) + 1
     # The lead is the head of the default queue, so it is production work with a
     # strategy; never a marker whose measured precision is below the bar for leading.
     lead = next(
         (
             o
             for o in opportunities
-            if default_queue_exclusion(o) is None and o.may_lead
+            if perf_queue_verdict(o).eligible and o.may_lead
         ),
         None,
     )
     return {
-        "default_queue": default_queue_counts(opportunities),
+        "default_queue": perf_queue_counts(opportunities),
         "actionability": counts,
         "context": contexts,
         "boundary": boundaries,
+        "proof": proofs,
         "with_plan_total": sum(1 for state in plan_states.values() if state == "available"),
         "lead": None
         if lead is None
@@ -194,6 +212,7 @@ async def finalize_performance_opportunities(
     *,
     analyzed_commit: str | None = None,
     plan_policy: PerformancePlanPolicy | None = None,
+    execution_roles: ExecutionRoles | None = None,
 ) -> int:
     """Rebuild this repository's performance read model from stored findings.
 
@@ -201,6 +220,10 @@ async def finalize_performance_opportunities(
     own rows land and inside their transaction, so the queue can never describe
     a set of findings that was never committed. Returns the number of open
     opportunities.
+
+    *execution_roles* is this run's role map over the whole graph. A role can
+    change in a file the run did not rescan (a seed or call moved elsewhere),
+    so every stored finding is restamped from it before grouping.
     """
     # Deferred throughout this module: the analysis package imports
     # persistence, so a module-level import here would close the cycle.
@@ -219,6 +242,8 @@ async def finalize_performance_opportunities(
             )
         ).all()
     )
+    if execution_roles is not None:
+        rows = await _restamp_roles(session, rows, execution_roles)
     opportunities = build_performance_opportunities(rows, evidence_limit=_EVIDENCE_LIMIT)
 
     await _restamp_findings(session, rows)
@@ -228,6 +253,35 @@ async def finalize_performance_opportunities(
     )
     await _write_summary(session, repository_id, opportunities, plan_states, analyzed_commit, plans)
     return len(opportunities)
+
+
+async def _restamp_roles(
+    session: AsyncSession, rows: list[Any], roles: ExecutionRoles
+) -> list[Any]:
+    """Each stored finding with its loop owner's current role; changed rows are written.
+
+    A row stored before ``role_owner`` existed gets its owner found the way
+    the analysis finds it, and keeps it from then on.
+    """
+    out: list[Any] = []
+    changed = []
+    for row in rows:
+        details = json.loads(row.details_json or "{}")
+        if "role_owner" in details:
+            owner = details["role_owner"]
+        else:
+            owner = roles.owner_of(row.file_path, row.line_start, details)
+        role = roles.role_of(owner, row.file_path)
+        if details.get("execution_role") == role and "role_owner" in details:
+            out.append(row)
+            continue
+        stamped = {**details, "execution_role": role, "role_owner": owner}
+        details_json = json.dumps(stamped, separators=(",", ":"))
+        changed.append({"id": row.id, "details_json": details_json})
+        out.append(SimpleNamespace(**{**row._mapping, "details_json": details_json}))
+    if changed:
+        await session.execute(update(HealthFinding), changed)
+    return out
 
 
 async def _restamp_findings(session: AsyncSession, rows: list[Any]) -> None:
@@ -305,15 +359,21 @@ async def _plan_facts(
     Serving one plan cannot afford the test-reachability walk, and without this
     it fell back to an empty profile that read as "no tests" for every plan.
     """
-    from ....analysis.health.refactoring.recommendations import hydrate_recommendations
+    from ....analysis.health.refactoring.recommendations import steps_with_verify
+    from .refactoring_recommendations import hydrate_recommendations, repository_checkout
 
     if not rows:
         return {}
     facts: dict[str, dict[str, Any]] = {}
-    for recommendation in await hydrate_recommendations(session, repository_id, rows):
+    checkout = await repository_checkout(session, repository_id)
+    for recommendation in await hydrate_recommendations(
+        session, repository_id, rows, step_verify=True, checkout=checkout
+    ):
         suggestion = recommendation.suggestion
         facts[suggestion.plan["opportunity_id"]] = {
-            "steps": (suggestion.plan or {}).get("steps", []),
+            "steps": steps_with_verify(
+                (suggestion.plan or {}).get("steps") or [], recommendation.validation
+            ),
             "effort_bucket": suggestion.effort_bucket,
             "benefit": recommendation.benefit,
             "cost": recommendation.cost,
@@ -453,6 +513,9 @@ async def list_performance_opportunities(
     boundary: str | None = None,
     confidence: str | None = None,
     actionabilities: frozenset[str] | None = None,
+    proofs: frozenset[str] | None = None,
+    roles: frozenset[str] | None = None,
+    queue_eligible: bool | None = None,
     file_paths: tuple[str, ...] | None = None,
     sort: str = "rank",
     limit: int = 20,
@@ -471,6 +534,9 @@ async def list_performance_opportunities(
         boundary=boundary,
         confidence=confidence,
         actionabilities=actionabilities,
+        proofs=proofs,
+        roles=roles,
+        queue_eligible=queue_eligible,
         file_paths=file_paths,
     )
     total = int(
@@ -501,7 +567,7 @@ async def performance_facet_counts(
     repository_id: str,
     *,
     file_paths: tuple[str, ...] | None = None,
-) -> list[tuple[str, str | None, str, str, str, int]]:
+) -> list[tuple[str, str | None, str, str, str, str, str, int]]:
     """Grouped counts over every open opportunity, in one aggregate statement.
 
     Returned pre-aggregation, one ``(*FACET_FIELDS, count)`` tuple per group,

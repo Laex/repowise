@@ -8,20 +8,16 @@ import { ChatInterface as ChatInterfaceShell } from "@repowise-dev/ui/chat/chat-
 import { getArtifactSourceTarget, useChatDraft } from "@repowise-dev/ui/chat";
 import { pageHref } from "@/lib/utils/page-href";
 import { getProviders } from "@/lib/api/providers";
-import { getRepoStats } from "@/lib/api/repos";
 import { forkConversation, setConversationArtifactPinned } from "@/lib/api/chat";
 import type { ChatArtifact, ChatUIMessage } from "@repowise-dev/types/chat";
 import { ModelSelector } from "./model-selector";
 import { ConversationHistory } from "./conversation-history";
 import { useRepositoryChat } from "./repository-chat-provider";
+import { useTranslations } from "next-intl";
 
 interface ChatInterfaceProps {
   repoId: string;
   repoName?: string;
-  /** Branch shown in the empty-state status line. */
-  defaultBranch?: string;
-  /** HEAD SHA shown in the empty-state status line, abbreviated to 7. */
-  headCommit?: string;
   /** Question to send immediately on mount (quick-ask deep links, `?q=`). */
   initialQuestion?: string;
 }
@@ -29,10 +25,9 @@ interface ChatInterfaceProps {
 export function ChatInterface({
   repoId,
   repoName,
-  defaultBranch,
-  headCommit,
   initialQuestion,
 }: ChatInterfaceProps) {
+  const t = useTranslations("chat");
   const {
     messages,
     conversationId,
@@ -71,13 +66,6 @@ export function ChatInterface({
   );
   const anyConfigured =
     providers === undefined || providers.providers.some((p) => p.configured);
-
-  // Orientation status line for the empty state.
-  const { data: stats } = useSWR(
-    `repo-stats:${repoId}`,
-    () => getRepoStats(repoId),
-    { revalidateOnFocus: false },
-  );
 
   // A plain /chat URL is an explicit fresh workspace. Only an addressable
   // conversation URL restores history, which keeps returning users from being
@@ -127,11 +115,17 @@ export function ChatInterface({
     ...(selectedProvider ? { provider: selectedProvider } : {}),
     ...(selectedModel ? { model: selectedModel } : {}),
   }), [pageContext, selectedModel, selectedProvider, sendMessage]);
+  // Read through a ref so the callback keeps its identity while tokens stream;
+  // otherwise every memoised turn re-renders on each token.
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
   const retryMessage = useCallback((message: ChatUIMessage) => {
-    const index = messages.findIndex((candidate) => candidate.id === message.id);
-    const previousUser = messages.slice(0, index).reverse().find((candidate) => candidate.role === "user");
+    if (message.role === "user") return sendWithConversationModel(message.text);
+    const all = messagesRef.current;
+    const index = all.findIndex((candidate) => candidate.id === message.id);
+    const previousUser = all.slice(0, index).reverse().find((candidate) => candidate.role === "user");
     if (previousUser) return sendWithConversationModel(previousUser.text);
-  }, [messages, sendWithConversationModel]);
+  }, [sendWithConversationModel]);
   const editAndResend = useCallback(async (message: ChatUIMessage, text: string) => {
     if (!conversationId || !message.serverId) return;
     const fork = await forkConversation(repoId, conversationId, { beforeMessageId: message.serverId });
@@ -198,35 +192,19 @@ export function ChatInterface({
       onArtifactPin={pinArtifact}
       onOpenArtifactSource={openArtifactSource}
       artifactOverrides={artifactOverrides}
-      statusSlot={
-        // Orientation, in one line: what was indexed, and which commit it was
-        // indexed from. The branch and SHA used to sit in a second page header
-        // that duplicated the breadcrumb; they belong with the other figures.
-        <span>
-          {[
-            stats ? `${stats.file_count.toLocaleString()} files` : null,
-            stats ? `${Math.round(stats.doc_coverage_pct)}% documented` : null,
-            stats && stats.symbol_count > 0
-              ? `${stats.symbol_count.toLocaleString()} symbols indexed`
-              : null,
-            defaultBranch,
-            headCommit ? headCommit.slice(0, 7) : null,
-          ]
-            .filter(Boolean)
-            .join(" · ")}
-        </span>
-      }
       sendDisabled={!anyConfigured}
       sendDisabledReason={
         <span>
-          No chat provider is configured. Add an API key in{" "}
-          <Link
-            href="/settings"
-            className="text-[var(--color-accent-primary)] hover:underline"
-          >
-            settings
-          </Link>{" "}
-          to start asking questions.
+          {t.rich("noProvider", {
+            link: (chunks) => (
+              <Link
+                href="/settings"
+                className="text-[var(--color-accent-primary)] hover:underline"
+              >
+                {chunks}
+              </Link>
+            ),
+          })}
         </span>
       }
       historySlot={

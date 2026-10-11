@@ -282,6 +282,36 @@ test.describe("routes", () => {
     assert "beforeEach callback" in names
 
 
+def test_a_chained_callee_names_its_callback_by_identifier_path():
+    """A zod schema's ``superRefine`` callback was named after the whole
+    ``z.object({...})`` expression, a name thousands of characters long."""
+    _require_language("typescript")
+    fields = ", ".join(f"field{i}: z.string().optional()" for i in range(40))
+    source = f"""
+export const Schema = z
+  .object({{ {fields} }})
+  .strict()
+  .superRefine((value, ctx) => {{
+    if (value.field1 && !value.field2) {{
+      ctx.addIssue({{ code: "custom", message: "field2" }});
+    }}
+  }});
+
+it.each([{{ name: "a", x: 1 }}, {{ name: "b", x: 2 }}])("case $name", ({{ x }}) => {{
+  expect(x).toBeGreaterThan(0);
+}});
+
+makeHandler<Entry[]>(config)((entry) => {{
+  return entry.id;
+}});
+""".encode()
+    names = [fn.name for fn in walk_file("/tmp/schema.ts", "typescript", source).functions]
+    assert "z.object.strict.superRefine callback" in names
+    assert "it.each callback" in names
+    assert "makeHandler callback" in names
+    assert all(len(name) <= 120 and "(" not in name for name in names)
+
+
 def test_rust_flat_match_complexity():
     """A flat match (all arms are simple expressions) should count as 1 CCN
     point for the match itself; individual arms should NOT add CCN."""
@@ -859,4 +889,61 @@ def test_ruby_assertion_blocks():
     assert many.assertion_blocks, "expected a run of assert calls"
     assert many.assertion_blocks[0][2] == 5
     few = _find(results, "test_few_asserts")
+    assert few is not None and few.assertion_blocks == []
+
+
+def test_php_nesting_and_ccn():
+    results = _walk("php/nested.php", "php")
+    deep = _find(results, "deeply_nested")
+    assert deep is not None
+    assert deep.ccn == 5, f"expected CCN 5, got {deep.ccn}"
+    assert deep.max_nesting == 4, f"expected nesting 4, got {deep.max_nesting}"
+    many = _find(results, "many_branches")
+    assert many is not None
+    # if + if + && + elseif + || + else if + base path
+    assert many.ccn == 7, f"expected CCN 7, got {many.ccn}"
+    assert many.max_nesting == 1, f"expected nesting 1, got {many.max_nesting}"
+    wordy = _find(results, "wordy")
+    assert wordy is not None and wordy.ccn == 3  # and + or
+    shallow = _find(results, "shallow")
+    assert shallow is not None and shallow.max_nesting == 0
+    assert shallow.param_count == 1
+    loops = _find(results, "loops_galore")
+    assert loops is not None
+    assert loops.ccn == 4  # for + foreach + do-while + 1
+    assert loops.max_nesting == 1
+    tc = _find(results, "try_catch_finally")
+    assert tc is not None
+    assert tc.ccn == 4  # if + 2 catch clauses + 1
+
+
+def test_php_lambdas_and_closures():
+    results = _walk("php/nested.php", "php")
+    fn = _find(results, "lambda_and_arrow")
+    assert fn is not None
+    # anonymous_function branch rolls into lambda_and_arrow
+    assert fn.ccn >= 3
+
+
+def test_php_classes_lcom4():
+    classes = _walk_classes("php/classes.php", "php")
+    cohesive = classes.get("CohesiveClass")
+    split = classes.get("SplitClass")
+    assert cohesive is not None and split is not None
+    assert cohesive.method_count == 4
+    assert split.method_count == 4
+    assert cohesive.lcom4 == 1
+    assert split.lcom4 >= 2
+    trait = classes.get("LoggableTrait")
+    assert trait is not None
+    assert trait.method_count == 2
+
+
+def test_php_assertion_blocks():
+    results = _walk("php/assertions.php", "php")
+    many = _find(results, "testManyAsserts")
+    assert many is not None
+    assert many.assertion_blocks, "expected a run of assert calls"
+    assert many.assertion_blocks[0][2] == 5
+    few = _find(results, "testFewAsserts")
     assert few is not None and few.assertion_blocks == []

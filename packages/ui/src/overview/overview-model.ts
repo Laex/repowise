@@ -169,14 +169,16 @@ export function buildReads(summary: OverviewSummaryResponse, routes: OverviewRou
         ? {
             bar: [
               {
-                fraction: prosePages / docPages,
-                color: "var(--color-accent-fill)",
-                title: `${formatNumber(prosePages)} pages with model-written prose`,
+                key: "prose",
+                label: "Pages with model-written prose",
+                value: prosePages,
+                detail: formatNumber(prosePages),
               },
               {
-                fraction: withoutProse / docPages,
-                color: "color-mix(in srgb, var(--color-accent-fill) 30%, var(--color-bg-inset))",
-                title: `${formatNumber(withoutProse)} pages built from the index alone`,
+                key: "index",
+                label: "Pages built from the index alone",
+                value: withoutProse,
+                detail: formatNumber(withoutProse),
               },
             ],
           }
@@ -335,7 +337,7 @@ export function buildExplore(
       key: "code-health",
       label: "Code health",
       href: `${r.base}/code-health`,
-      description: `Per-file scores, ${formatNumber(health.open_findings)} open findings, coverage and refactoring targets`,
+      description: `Per-file scores, ${formatNumber(health.finding_counts?.inventory ?? health.open_findings)} open findings, coverage and refactoring targets`,
     },
     {
       key: "knowledge-graph",

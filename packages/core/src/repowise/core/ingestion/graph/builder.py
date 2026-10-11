@@ -14,6 +14,7 @@ from typing import Any
 import networkx as nx
 import structlog
 
+from ...analysis.public_api import stamp_public_api
 from ..cohesion import (
     MODULE_DECLARATION_HINT,
     SAME_PACKAGE_HINT,
@@ -21,7 +22,7 @@ from ..cohesion import (
     withdraw_declaration_hint,
 )
 from ..languages.python_modules import dotted_module_for
-from ..models import ParsedFile
+from ..models import Import, ParsedFile, combine_load_kinds
 from ..resolvers import ResolverContext, resolve_import
 from ..resolvers.go import read_go_module_path, read_go_modules
 from ..symbol_identity import has_overload_identity
@@ -34,6 +35,19 @@ from ._serialize import SerializeMixin
 from ._stem import build_stem_map
 
 log = structlog.get_logger(__name__)
+
+
+def _merge_load_kind(data: dict[str, Any], imp: Import) -> None:
+    """Fold one more import into an edge's ``type_only`` / ``deferred`` marks,
+    by :func:`~repowise.core.ingestion.models.combine_load_kinds` (one
+    load-time import makes the edge a runtime one). ``deferred`` is stored
+    only when true."""
+    edge = (bool(data.get("type_only")), bool(data.get("deferred")))
+    data["type_only"], deferred = combine_load_kinds(edge, (imp.type_only, imp.deferred))
+    if deferred:
+        data["deferred"] = True
+    else:
+        data.pop("deferred", None)
 
 
 class GraphBuilder(MetricsMixin, ResolveMixin, EdgesMixin, SerializeMixin, RehydrateMixin):
@@ -65,6 +79,10 @@ class GraphBuilder(MetricsMixin, ResolveMixin, EdgesMixin, SerializeMixin, Rehyd
         # warmups that scan file text read it instead of re-opening every
         # file. Empty means "not supplied": every reader falls back to disk.
         self._source_map: dict[str, bytes] = {}
+        # Launcher names the traverser read from pyproject.toml; set by the
+        # pipelines that walk the repo, empty for a builder fed files directly.
+        self.console_scripts: frozenset[str] = frozenset()
+        self._pytest_roots: Any | None = None
         self._built = False
         # Resolver-built DotNetProjectIndex, stashed by build() for the
         # dynamic-hints phase to reuse (see build()).
@@ -225,6 +243,10 @@ class GraphBuilder(MetricsMixin, ResolveMixin, EdgesMixin, SerializeMixin, Rehyd
         same repo-relative POSIX key ``add_file`` registers under).
         """
         self._source_map = source_map or {}
+
+    def set_pytest_roots(self, roots: Any) -> None:
+        """Hand the builder where pytest collects (the traverser's ``pytest_roots``)."""
+        self._pytest_roots = roots
 
     def add_file(self, parsed: ParsedFile) -> None:
         """Register one parsed file and its symbols in the graph."""
@@ -406,6 +428,17 @@ class GraphBuilder(MetricsMixin, ResolveMixin, EdgesMixin, SerializeMixin, Rehyd
 
         run_warmups(self._parsed_files, ctx, progress=progress)
 
+        # Tests the import graph cannot see into, from the bytes already held,
+        # so selection reads a stored fact and never re-reads test files.
+        from ..always_run import stamp_always_run
+
+        try:
+            stamp_always_run(
+                self._graph, self._parsed_files, self._source_map, self.console_scripts
+            )
+        except Exception as exc:  # a detector bug must not fail the index
+            log.warning("always_run_detection_failed", error=str(exc))
+
         # --- Phase 1: Resolve file-level imports ---
         import_targets: dict[str, set[str]] = {}  # file → set of imported files
 
@@ -477,11 +510,15 @@ class GraphBuilder(MetricsMixin, ResolveMixin, EdgesMixin, SerializeMixin, Rehyd
                         self._graph[path][target]["imported_names"] = merged
                         if not imp.is_module_declaration:
                             withdraw_declaration_hint(self._graph[path][target])
+                        _merge_load_kind(self._graph[path][target], imp)
                     else:
                         edge_attrs: dict[str, Any] = {
                             "edge_type": "imports",
                             "imported_names": list(imp.imported_names),
+                            "type_only": imp.type_only,
                         }
+                        if imp.deferred:
+                            edge_attrs["deferred"] = True
                         # ``external:`` targets are excluded before the
                         # directory test, not after: an external node id has no
                         # directory, and a single-segment one such as
@@ -612,6 +649,12 @@ class GraphBuilder(MetricsMixin, ResolveMixin, EdgesMixin, SerializeMixin, Rehyd
         # --- Phase 4: Base method → the implementations that answer for it ---
         # Post-pass: needs heritage resolved and reads only the graph.
         self._resolve_override_dispatch(progress=progress)
+
+        # Which symbols a package exports, read off the imports just resolved.
+        try:
+            stamp_public_api(self._graph, self._parsed_files)
+        except Exception as exc:  # a reader bug must not fail the index
+            log.warning("public_api_stamp_failed", error=str(exc))
 
         self._built = True
 
