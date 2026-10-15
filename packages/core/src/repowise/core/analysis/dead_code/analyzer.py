@@ -24,7 +24,7 @@ from typing import Any
 
 import structlog
 
-from ...code_origin import is_build_file
+from ...code_origin import code_origin, is_build_file
 from ...entry_candidacy import is_reachability_root
 from ...ingestion.decorator_names import decorator_base as _decorator_base
 from ...ingestion.models import REACHABILITY_USE_EDGE_TYPES
@@ -54,14 +54,25 @@ from .constants import (
     never_flag_path,
 )
 from .contract_methods import is_com_method_implementation, is_contract_method
-from .csharp_reachability import build_csharp_named_files, build_csharp_named_types
+from .csharp_reachability import (
+    build_csharp_named_files,
+    build_csharp_named_types,
+    scanned_implementations,
+)
+from .deletion_gate import apply_deletion_gate
 from .dynamic_markers import (
     find_dynamic_edge_files,
     find_dynamic_import_files,
     read_source_text,
 )
-from .entry_shape import clamp_entry_shaped, drop_program_entries, is_program
+from .entry_shape import (
+    clamp_entry_shaped,
+    defines_main_function,
+    drop_program_entries,
+    is_program,
+)
 from .file_reachability import (
+    _NON_DEPENDENCY_EDGES,
     CSHARP_SUFFIX,
     PackageFileMap,
     ReachabilityRescues,
@@ -69,7 +80,9 @@ from .file_reachability import (
     is_file_reachable,
 )
 from .go_name_uses import drop_go_package_uses
+from .jvm_reachability import defines_main
 from .kotlin_multiplatform import settle_platform_declarations
+from .meta_annotations import MetaAnnotations
 from .models import DeadCodeFindingData, DeadCodeKind, DeadCodeReport
 from .module_strings import drop_named_modules
 from .name_occurrences import (
@@ -92,6 +105,7 @@ from .risk_factors import (
     path_risk_factors,
     risk_evidence,
 )
+from .swift_reachability import build_swift_named_files
 from .vbnet_modules import vbnet_module_names
 
 #: The unindexed scan below and the repo-wide absence check ask the same
@@ -178,7 +192,9 @@ def _declared_deliberately_unused(decorators: Iterable[str]) -> bool:
     return False
 
 
-def _is_framework_registered(decorators: list[str]) -> bool:
+def _is_framework_registered(
+    decorators: list[str], meta_annotations: frozenset[str] = frozenset()
+) -> bool:
     """Whether any decorator wires the symbol into a framework dispatcher.
 
     Both dead-code passes ask this question, and both asked it with the same
@@ -200,9 +216,18 @@ def _is_framework_registered(decorators: list[str]) -> bool:
       ``@register``, ``@register_drainer``, ``@Field.register_lookup``. Held to
       ``register`` exactly or a ``register_`` stem so that a past participle
       guarding a handler (``@registered_only``) is not read as one.
+
+    A qualified annotation (``@androidx.compose.ui.tooling.preview.Preview``)
+    is also matched by its type name, and *meta_annotations* names the repo's
+    own annotation classes that carry one of these (a Compose multipreview):
+    an unqualified use by its in-scope local name, a qualified use by its
+    fully qualified name.
     """
     bases = _decorator_bases(decorators)
-    if any(b.startswith(_FRAMEWORK_DECORATORS) for b in bases):
+    type_names = [n for n in (b.rsplit(".", 1)[-1] for b in bases) if n[:1].isupper()]
+    if any(b.startswith(_FRAMEWORK_DECORATORS) for b in (*bases, *type_names)):
+        return True
+    if not meta_annotations.isdisjoint(bases):
         return True
     if any(b.endswith(_FRAMEWORK_DECORATOR_SUFFIXES) for b in bases):
         return True
@@ -357,7 +382,7 @@ _TS_JS_IMPORTABLE_KINDS: frozenset[str] = frozenset({"constant", "variable"})
 
 # Single-file-component languages: the whole file is one component, so their
 # exports behave unlike an ordinary module's â€” see _non_importable_kinds.
-_SFC_LANGUAGES: frozenset[str] = frozenset({"svelte", "vue"})
+_SFC_LANGUAGES: frozenset[str] = frozenset({"svelte", "vue", "astro"})
 
 # Every kind an SFC component prop can take, plus "class" for the synthetic
 # component symbol itself â€” see _non_importable_kinds.
@@ -860,6 +885,10 @@ class DeadCodeAnalyzer:
         # scopes the C# name rescue to the projects that can see a file.
         self._dotnet_index = dotnet_index
         self._csharp_named_files: frozenset[str] | None = None
+        self._swift_named_files: frozenset[str] | None = None
+        # C# classes a plugin host or container finds by type, built on first use.
+        self._csharp_discovered: frozenset[tuple[str, str]] | None = None
+        self._parsed_files = parsed_files or {}
         self.git_meta_map = git_meta_map or {}
         # Source files ingestion could not read (currently: dropped on size).
         # An unread importer is invisible to the graph, so "no importers" stops
@@ -932,6 +961,22 @@ class DeadCodeAnalyzer:
         self._guard_cache: dict[str, list[tuple[str, str, str]]] = {}
         # {base id: overload member ids}, built on first use.
         self._overload_units: dict[str, list[str]] | None = None
+        # Repo annotation classes that register what they annotate, built on first use.
+        self._meta_annotations: MetaAnnotations | None = None
+
+    def _framework_meta_annotations(self, path: str) -> frozenset[str]:
+        """Names of repo annotation classes that register what they annotate in *path*."""
+        if self._meta_annotations is None:
+            self._meta_annotations = MetaAnnotations(self._source_map, _is_framework_registered)
+        return self._meta_annotations.visible_in(path)
+
+    def _csharp_discovered_classes(self) -> frozenset[tuple[str, str]]:
+        """``(file, class)`` the runtime instantiates by type; see :func:`scanned_implementations`."""
+        if self._csharp_discovered is None:
+            self._csharp_discovered = scanned_implementations(
+                self.graph, self._source_map, self._parsed_files
+            )
+        return self._csharp_discovered
 
     def _reachability_rescues(self, whitelist: AbstractSet[str]) -> ReachabilityRescues:
         """Assemble the rescue state the shared predicate reads."""
@@ -943,12 +988,16 @@ class DeadCodeAnalyzer:
                 self._source_map,
                 dotnet_index=self._dotnet_index,
                 repo_root=self._repo_root,
+                discovered=self._csharp_discovered_classes(),
             )
+        if self._swift_named_files is None:
+            self._swift_named_files = build_swift_named_files(self.graph, self._source_map)
         return ReachabilityRescues(
             bundler_alias_targets=frozenset(self._bundler_alias_targets),
             whitelist=frozenset(whitelist),
             package_files=self._package_files,
             csharp_named_files=self._csharp_named_files,
+            swift_named_files=self._swift_named_files,
         )
 
     def analyze(
@@ -968,7 +1017,9 @@ class DeadCodeAnalyzer:
         findings: list[DeadCodeFindingData] = []
 
         dynamic_patterns = cfg.get("dynamic_patterns", _DEFAULT_DYNAMIC_PATTERNS)
-        whitelist = set(cfg.get("whitelist", []))
+        # Machine output known only by its content (a webpack chunk, a minified
+        # bundle) joins the whitelist, which every pass already honours.
+        whitelist = set(cfg.get("whitelist", [])) | self._content_machine_output()
 
         if cfg.get("detect_unreachable_files", True):
             findings.extend(self._detect_unreachable_files(whitelist))
@@ -1035,6 +1086,8 @@ class DeadCodeAnalyzer:
             BuildFacts(repo_root=self._repo_root, dotnet_index=self._dotnet_index),
         )
 
+        findings = apply_deletion_gate(findings, self.graph, self._repo_root)
+
         min_conf = cfg.get("min_confidence", RISK_CAP_CONFIDENCE)
         hidden_below_threshold = sum(1 for f in findings if f.confidence < min_conf)
         findings = [f for f in findings if f.confidence >= min_conf]
@@ -1064,6 +1117,7 @@ class DeadCodeAnalyzer:
             _names_by_file(exports),
             dotnet_index=self._dotnet_index,
             repo_root=self._repo_root,
+            discovered=self._csharp_discovered_classes(),
         )
         dropped = {id(f) for f in exports if (f.file_path, f.symbol_name) in named}
         demote_used_in_own_file([f for f in exports if id(f) not in dropped], self._source_map)
@@ -1430,7 +1484,8 @@ class DeadCodeAnalyzer:
         # Roots include framework-instantiated files the runtime constructs.
         # Not ``is_file_reachable``: its barrel rescue is scoped to files, and an
         # unused symbol defined in a barrel should still be flagged.
-        if is_reachability_root(node_data):
+        # A JVM ``main`` launches its file the same way.
+        if is_reachability_root(node_data) or defines_main(self.graph, str(node)):
             return None
         if node_data.get("is_test", False):
             return None
@@ -1580,7 +1635,8 @@ class DeadCodeAnalyzer:
         sym_name = sym.get("name", "")
         decorators = sym.get("decorators", [])
 
-        if _is_framework_registered(decorators):
+        meta = self._framework_meta_annotations(sym.get("file_path", ""))
+        if _is_framework_registered(decorators, meta):
             return True
         if _declared_deliberately_unused(decorators):
             return True
@@ -1737,7 +1793,12 @@ class DeadCodeAnalyzer:
         if sym.get("kind") == "interface" and not self._file_has_implementors(node):
             confidence = min(confidence, RISK_CAP_CONFIDENCE)
 
-        if is_contract_method(sym_name, sym.get("kind"), sym.get("language", "unknown")):
+        if is_contract_method(
+            sym_name,
+            sym.get("kind"),
+            sym.get("language", "unknown"),
+            modifiers=sym.get("modifiers"),
+        ):
             confidence = min(confidence, RISK_CAP_CONFIDENCE)
 
         if risk_factors:
@@ -2075,7 +2136,10 @@ class DeadCodeAnalyzer:
         if node_data.get("kind") in _UNCALLABLE_TYPE_KINDS:
             return False
         if is_contract_method(
-            sym_name, node_data.get("kind"), node_data.get("language", "unknown")
+            sym_name,
+            node_data.get("kind"),
+            node_data.get("language", "unknown"),
+            modifiers=node_data.get("modifiers"),
         ):
             return False
         if self._name_matches_dynamic(sym_name, dynamic_patterns):
@@ -2085,8 +2149,9 @@ class DeadCodeAnalyzer:
         # private ``@PostConstruct``/``@EventListener``/``@Scheduled``
         # method is invoked by the container, not by a source call.
         decorators = node_data.get("decorators") or []
+        meta = self._framework_meta_annotations(node_data.get("file_path", ""))
         return not (
-            _is_framework_registered(decorators) or _declared_deliberately_unused(decorators)
+            _is_framework_registered(decorators, meta) or _declared_deliberately_unused(decorators)
         )
 
     def _detect_zombie_packages(self, whitelist: set[str]) -> list[DeadCodeFindingData]:
@@ -2161,10 +2226,28 @@ class DeadCodeAnalyzer:
         if not self._has_package_manifest(pkg, files):
             return False
         # Tests are run, never imported, and so is a package that ships a
-        # program (a CLI started by its shebang). One program file is enough,
-        # even a stray script: this errs toward not calling a package dead.
-        files = [f for f in files if not self.graph.nodes.get(f, {}).get("is_test")]
-        if any(is_program(f, self._source_map.get(f, b"")) for f in files):
+        # program: a CLI started by its shebang, a JVM ``main``, or a root
+        # with a top-level ``main`` (Dart ``lib/main.dart``). A root alone is
+        # not enough: a Rust ``lib.rs`` is a root and the library's surface.
+        # One program file is enough, even a stray script: this errs toward
+        # not calling a package dead. A build-run source set (``is_never_flag``)
+        # counts as a test. Files only: a test file's symbols carry no test flag.
+        files = [
+            f
+            for f in files
+            if (nd := self.graph.nodes.get(f, {})).get("node_type") != "symbol"
+            and not nd.get("is_test")
+            and not nd.get("is_never_flag")
+        ]
+        if any(
+            is_program(f, self._source_map.get(f, b""))
+            or defines_main(self.graph, f)
+            or (
+                is_reachability_root(self.graph.nodes[f])
+                and defines_main_function(self.graph, f)
+            )
+            for f in files
+        ):
             return False
         # A real package contains at least one source file something could
         # import. Config and data (YAML, JSON, MD, TOML) is metadata, and a
@@ -2194,7 +2277,10 @@ class DeadCodeAnalyzer:
     def _has_cross_package_importer(self, pkg: str, files: list[str]) -> bool:
         """Whether anything outside *pkg* depends on a file inside it."""
         for f in files:
-            for pred in self.graph.predecessors(f):
+            for pred, _f, edge_data in self.graph.in_edges(f, data=True):
+                # Committed together is history, not a dependency.
+                if edge_data.get("edge_type") in _NON_DEPENDENCY_EDGES:
+                    continue
                 pred_str = str(pred)
                 if pred_str.startswith("external:"):
                     # Third-party imports don't count as cross-package
@@ -2241,6 +2327,19 @@ class DeadCodeAnalyzer:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _content_machine_output(self) -> set[str]:
+        """Files ``code_origin`` reads as generated or vendored from their bytes.
+
+        The path-only rules are asked per candidate by ``never_flag_path``.
+        ``is_test=False`` skips the test-path check, which cannot change
+        either answer and is half the cost.
+        """
+        return {
+            path
+            for path, data in self._source_map.items()
+            if code_origin(path, data, is_test=False) in ("generated", "vendored")
+        }
 
     def _should_never_flag(self, path: str, whitelist: set[str]) -> bool:
         """Return True if path should never be flagged as dead.

@@ -46,6 +46,8 @@ class OwnerListEntry(BaseModel):
     # Distinct commits by this person in the 90 days before HEAD; None when the
     # indexed commits do not cover the window.
     commit_count_90d: int | None
+    # A floor of that count when the indexed commits stop inside the window.
+    commit_count_90d_at_least: int | None = None
     last_commit_at: datetime | None
     bus_factor_risk_files: int  # files they own where bus_factor <= 1
 
@@ -74,22 +76,6 @@ class OwnerCoAuthor(BaseModel):
     co_change_strength: float  # 0-1 fraction
 
 
-class OwnerAgentCollab(BaseModel):
-    """How much coding-agent activity lands on the files this person owns.
-
-    Aggregated from the per-file agent-provenance rollup (GitMetadata) over
-    the owner's primary-owned files — agent identity per commit lives on the
-    commits surface, the per-file rollup only carries counts and tiers.
-    """
-
-    files_with_agent_commits: int
-    agent_commit_count: int
-    # Commit-weighted share of agent-attributed commits across owned files,
-    # 0-100. None when no owned file has a provenance-aware rollup yet.
-    agent_share_pct: float | None
-    tier_counts: dict = {}
-
-
 class OwnerProfileResponse(BaseModel):
     key: str
     name: str
@@ -102,6 +88,7 @@ class OwnerProfileResponse(BaseModel):
     dead_code_files_owned: int
     dead_code_lines_owned: int
     commit_count_90d: int | None
+    commit_count_90d_at_least: int | None = None
     last_commit_at: datetime | None
     first_commit_at: datetime | None
     bus_factor_risk_files: int
@@ -123,9 +110,6 @@ class OwnerProfileResponse(BaseModel):
 
     # Commit-category mix across files they touch (sum of categories).
     commit_categories: dict
-
-    # Agent collaboration on owned files (None when nothing is attributed).
-    agent_collab: OwnerAgentCollab | None = None
 
 
 class ModuleHealthOwner(BaseModel):

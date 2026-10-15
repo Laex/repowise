@@ -43,10 +43,12 @@ _PLUMBING: dict[str, str] = {
     "repowise/core/persistence/crud/analysis/health.py": "writes/reads the column",
     "repowise/core/persistence/crud/git.py": "supplies the hotspot path set, not the score",
     "repowise/core/persistence/stores/_sql_analysis.py": "passthrough to the crud writer",
+    "repowise/core/workspace/store.py": "copies the latest snapshot column into the workspace store",
     "repowise/core/persistence/_interfaces/_analysis.py": "the store ABC's parameter name",
     "repowise/server/schemas/repository.py": "the response field",
     "repowise/server/schemas/code_health.py": "the trend response fields",
     "alembic/versions/0019_code_health.py": "the migration that adds the column",
+    "alembic/versions/0108_health_snapshot_hotspot_nullable.py": "the migration that allows NULL",
     # --- trend surfaces: diff recorded snapshots, no current value -----------
     "repowise/core/analysis/health/trends.py": (
         "diffs snapshots and builds the snapshot writers' arguments; owns no current value"
@@ -58,6 +60,8 @@ _PLUMBING: dict[str, str] = {
     "repowise/cli/commands/health_cmd/command.py": "prints the KPI dict it was handed",
     "repowise/core/generation/editor_files/data.py": "the CodeHealthBlock field",
     "repowise/server/routers/_repo_summary.py": "serves the latest snapshot column on /repos/summary",
+    "repowise/server/chat_view_builders.py": "charts the trend snapshots get_health already returned",
+    "repowise/server/chat_datasets/history.py": "lists the snapshot scalars get_health trends read",
 }
 
 

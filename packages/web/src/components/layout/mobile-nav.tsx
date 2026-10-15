@@ -18,6 +18,8 @@ import { ScrollArea } from "@repowise-dev/ui/ui/scroll-area";
 import { Separator } from "@repowise-dev/ui/ui/separator";
 import { AddRepoDialog } from "@/components/repos/add-repo-dialog";
 import { VersionFooter } from "./version-footer";
+import { NewMark } from "./new-mark";
+import { useIsNewSurface } from "@/lib/hooks/use-new-surfaces";
 import { FeedbackButton } from "./feedback-button";
 import { LanguageSwitcher } from "./language-switcher";
 import { ThemeToggle } from "@repowise-dev/ui/shared/theme-toggle";
@@ -39,6 +41,7 @@ export function MobileNav({ repos = [], workspace }: MobileNavProps) {
   const t = useTranslations("nav");
   const ts = useTranslations("shell");
   const isWorkspace = workspace?.is_workspace ?? false;
+  const isNew = useIsNewSurface();
   const [open, setOpen] = React.useState(false);
   const pathname = usePathname();
   const activeRepoId = React.useMemo(() => {
@@ -74,7 +77,7 @@ export function MobileNav({ repos = [], workspace }: MobileNavProps) {
   }, [pathname]);
 
   return (
-    <div className="flex md:hidden min-h-14 items-center gap-3 px-4 border-b border-[var(--color-border-default)] bg-[var(--color-bg-surface)] shrink-0">
+    <div className="flex md:hidden print:hidden min-h-14 items-center gap-3 px-4 border-b border-[var(--color-border-default)] bg-[var(--color-bg-surface)] shrink-0">
       <Button
         variant="ghost"
         size="icon"
@@ -135,6 +138,7 @@ export function MobileNav({ repos = [], workspace }: MobileNavProps) {
                         />
                       </span>
                       <span className="truncate">{t(item.labelKey)}</span>
+                      {isNew(item.href) && <NewMark />}
                     </Link>
                   );
                 })}
@@ -244,6 +248,7 @@ export function MobileNav({ repos = [], workspace }: MobileNavProps) {
                                           />
                                         </span>
                                         <span className="truncate">{t(item.labelKey)}</span>
+                                        {isNew(item.href) && <NewMark />}
                                       </Link>
                                     );
                                   })}

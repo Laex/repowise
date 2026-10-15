@@ -124,6 +124,7 @@ if TYPE_CHECKING:
         EpisodeListResponse,
         EpisodeSummary,
     )
+    from .evidence import CardBasis, CardRef
     from .external_systems import (
         ExternalSystemEntry,
         ExternalSystemsResponse,
@@ -196,8 +197,11 @@ if TYPE_CHECKING:
     )
     from .meta import (
         ChangelogEntryModel,
+        ChangelogHighlightModel,
         ChangelogResponse,
         ChangelogSectionModel,
+        ReleaseStatsModel,
+        ReleaseTypeCountsModel,
         VersionResponse,
     )
     from .ownership import (
@@ -209,7 +213,6 @@ if TYPE_CHECKING:
         ModuleHealthDetail,
         ModuleHealthOwner,
         ModuleHealthSummary,
-        OwnerAgentCollab,
         OwnerCoAuthor,
         OwnerFileEntry,
         OwnerListEntry,
@@ -278,6 +281,8 @@ if TYPE_CHECKING:
         EmbedderEntry,
         OkResponse,
         ProviderEntry,
+        ProviderModelEntry,
+        ProviderModelsResponse,
         ProviderStatusResponse,
         ProviderValidationResponse,
         SavingsAgentRow,
@@ -288,6 +293,7 @@ if TYPE_CHECKING:
         SetApiKeyRequest,
         WebhookResponse,
     )
+    from .views import ChartView, SectionView, TableView, ViewPartList
     from .workspace import (
         WorkspaceArchitectureResponse,
         WorkspaceBlastRadiusResponse,
@@ -441,6 +447,7 @@ _EXPORTS: dict[str, tuple[str, ...]] = {
         "DocDriftSummaryResponse",
     ),
     "episodes": ("EpisodeCountsResponse", "EpisodeDetail", "EpisodeListResponse", "EpisodeSummary"),
+    "evidence": ("CardBasis", "CardRef"),
     "external_systems": ("ExternalSystemEntry", "ExternalSystemsResponse"),
     "git": (
         "AgentTrendBucket",
@@ -503,8 +510,11 @@ _EXPORTS: dict[str, tuple[str, ...]] = {
     "mcp": ("McpToolInfo", "McpToolSurfaceResponse", "UpdateMcpToolsRequest"),
     "meta": (
         "ChangelogEntryModel",
+        "ChangelogHighlightModel",
         "ChangelogResponse",
         "ChangelogSectionModel",
+        "ReleaseStatsModel",
+        "ReleaseTypeCountsModel",
         "VersionResponse",
     ),
     "ownership": (
@@ -516,7 +526,6 @@ _EXPORTS: dict[str, tuple[str, ...]] = {
         "ModuleHealthDetail",
         "ModuleHealthOwner",
         "ModuleHealthSummary",
-        "OwnerAgentCollab",
         "OwnerCoAuthor",
         "OwnerFileEntry",
         "OwnerListEntry",
@@ -574,6 +583,8 @@ _EXPORTS: dict[str, tuple[str, ...]] = {
         "EmbedderEntry",
         "OkResponse",
         "ProviderEntry",
+        "ProviderModelEntry",
+        "ProviderModelsResponse",
         "ProviderStatusResponse",
         "ProviderValidationResponse",
         "SavingsAgentRow",
@@ -623,6 +634,7 @@ _EXPORTS: dict[str, tuple[str, ...]] = {
         "WorkspaceUnmatchedConsumer",
         "WorkspaceUnresolvedLink",
     ),
+    "views": ("ChartView", "SectionView", "TableView", "ViewPartList"),
     "zoom": ("ZoomMapResponse", "ZoomMetricsResponse", "ZoomNodeResponse", "ZoomRelationResponse"),
 }
 
@@ -671,10 +683,14 @@ __all__ = [
     "C4SystemResponse",
     "CallerCalleeEntry",
     "CallersCalleesResponse",
+    "CardBasis",
+    "CardRef",
     "ChangeFeaturesResponse",
     "ChangelogEntryModel",
+    "ChangelogHighlightModel",
     "ChangelogResponse",
     "ChangelogSectionModel",
+    "ChartView",
     "ChatArtifactEnvelope",
     "ChatMessageResponse",
     "ChatRequest",
@@ -799,7 +815,6 @@ __all__ = [
     "NeighboringCommunity",
     "NodeSearchResult",
     "OkResponse",
-    "OwnerAgentCollab",
     "OwnerCoAuthor",
     "OwnerFileEntry",
     "OwnerListEntry",
@@ -820,6 +835,8 @@ __all__ = [
     "PlanRiskResponse",
     "PopulationBreakdown",
     "ProviderEntry",
+    "ProviderModelEntry",
+    "ProviderModelsResponse",
     "ProviderStatusResponse",
     "ProviderValidationResponse",
     "RefactoringHiddenCounts",
@@ -842,6 +859,8 @@ __all__ = [
     "RelatedWorkLens",
     "RelatedWorkRequest",
     "RelatedWorkResponse",
+    "ReleaseStatsModel",
+    "ReleaseTypeCountsModel",
     "RepoCreate",
     "RepoDeletedResponse",
     "RepoResponse",
@@ -861,6 +880,7 @@ __all__ = [
     "SavingsResponse",
     "SearchRequest",
     "SearchResultResponse",
+    "SectionView",
     "SecurityFindingResponse",
     "SecuritySummaryResponse",
     "SetActiveProviderRequest",
@@ -868,10 +888,12 @@ __all__ = [
     "SymbolImportanceComponents",
     "SymbolNodeSummary",
     "SymbolResponse",
+    "TableView",
     "TransitiveEntry",
     "UnclusteredFiles",
     "UpdateMcpToolsRequest",
     "VersionResponse",
+    "ViewPartList",
     "WebhookResponse",
     "WorkspaceArchitectureResponse",
     "WorkspaceBlastRadiusResponse",

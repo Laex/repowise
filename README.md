@@ -11,20 +11,14 @@ decisions once, on your machine. Then you and your coding agent ask it things:<b
 what calls this, what breaks if I change it, what is dead, what to fix first, and why it was built this way.</p>
 
 <p align="center">
-  <a href="#quickstart"><img src="https://img.shields.io/badge/SET_UP_WITH_YOUR_AGENT-one_line-F59520?style=for-the-badge&labelColor=0A0A0A" alt="Set up Repowise with your coding agent" /></a>
-  <a href="https://www.repowise.dev"><img src="https://img.shields.io/badge/LIVE_DEMO-repowise.dev-0A0A0A?style=for-the-badge&labelColor=F59520" alt="Open the live Repowise demo" /></a>
+  <a href="https://www.repowise.dev/?src=oss_readme_hero"><img src="https://img.shields.io/badge/LIVE_DEMO-repowise.dev-0A0A0A?style=for-the-badge&labelColor=F59520" alt="Open the live Repowise demo" /></a>
 </p>
 
 <table align="center">
 <tr>
-<td align="center" width="250"><h2>−31.6%</h2></td>
-<td align="center" width="250"><h2>2.3×</h2></td>
-<td align="center" width="250"><h2>58,924</h2></td>
-</tr>
-<tr>
-<td align="center" valign="top"><sub><strong>less agent output</strong><br />3.8 vs 7.2 tool calls<br /><em>43 questions · p&lt;0.0001</em></sub></td>
-<td align="center" valign="top"><sub><strong>more defects surfaced than CodeScene</strong><br />same 20% review budget<br /><em>2,770 files · p=0.003</em></sub></td>
-<td align="center" valign="top"><sub><strong>files indexed in one run</strong><br />dotnet/runtime, one laptop<br /><em>120 min · 11.7 GiB peak</em></sub></td>
+<td align="center" width="250"><b>−31.6%</b><br /><sub>less agent output · <em>p&lt;0.0001</em></sub></td>
+<td align="center" width="250"><b>2.3×</b><br /><sub>defects found vs CodeScene · <em>p=0.003</em></sub></td>
+<td align="center" width="250"><b>58,924</b><br /><sub>files indexed on one laptop · <em>120 min</em></sub></td>
 </tr>
 </table>
 
@@ -45,6 +39,8 @@ free and self-hosted · AGPL-3.0 or commercial
 </p>
 
 <p align="center">
+  <a href="#hosted"><strong>Hosted</strong></a> ·
+  <a href="https://www.repowise.dev/foresight?src=oss_readme_nav"><strong>Foresight</strong></a> ·
   <a href="#what-it-does"><strong>What it does</strong></a> ·
   <a href="#quickstart"><strong>Quickstart</strong></a> ·
   <a href="#your-agent-stops-guessing"><strong>Agents</strong></a> ·
@@ -67,6 +63,23 @@ why it was built this way. Cutting tokens was never the goal. It happens anyway,
 because an agent that can ask the index stops searching, opening and re-reading
 files to find out. Measured against the other context tools on the same agent
 tasks, it is also the largest saving.
+
+<a id="hosted"></a>
+<a id="foresight"></a>
+
+## Hosted, and Foresight
+
+Everything in this README runs free on your own machine. [repowise.dev](https://www.repowise.dev/?src=oss_readme_section)
+runs it for you, private repos included, and is where **Foresight** arrives first.
+
+<a href="https://www.repowise.dev/?src=oss_readme_section"><img src=".github/assets/hosted-foresight.webp" alt="Hosted at repowise.dev: everything in this README with nothing to run, private repos included, one MCP endpoint for Claude, ChatGPT and Cursor, the PR bot with free deterministic review and AI review for cents a pull request, Jira and Confluence, and team workspaces. Coming to repowise.dev: Foresight, models trained on how real codebases change that rank the files a fix will touch, flag what a change forgot, and explain every answer." width="100%" /></a>
+
+<p align="center">
+  <a href="https://www.repowise.dev/login?mode=signup&src=oss_readme_section"><img src="https://img.shields.io/badge/START_FREE-hosted-0A0A0A?style=for-the-badge&labelColor=F59520" alt="Start free on hosted repowise.dev" /></a>
+  <a href="https://www.repowise.dev/foresight?src=oss_readme_section"><img src="https://img.shields.io/badge/FORESIGHT-join_the_waitlist-0A0A0A?style=for-the-badge&labelColor=B9A3E3" alt="Join the Foresight waitlist" /></a>
+</p>
+
+---
 
 <a id="quickstart"></a>
 
@@ -113,7 +126,7 @@ the page that answers it.
 | You ask | Repowise gives you |
 |---|---|
 | *How does checkout work in this repo?* | A cited answer built from the call graph and the generated docs, in one call. [Search and answers](docs/layers/WIKI.md) |
-| *What calls this function, and what does it call?* | A call graph across 26 parsed languages, every edge stamped with how it was resolved and how far to trust it, plus traced execution flows from each entry point. [The graph](docs/layers/GRAPH.md) |
+| *What calls this function, and what does it call?* | A call graph across 27 parsed languages, every edge stamped with how it was resolved and how far to trust it, plus traced execution flows from each entry point. [The graph](docs/layers/GRAPH.md) |
 | *Can I get docs for this codebase?* | A wiki for every module and file, rendered from the code's structure with no key, or written by a model when you choose. It updates incrementally after each commit. [Docs](docs/layers/WIKI.md) |
 | *Which of our docs are wrong?* | Markdown checked against the tree: every reference to a file or symbol the code no longer has, with the line to edit. [Doc drift](docs/layers/DOC_DRIFT.md) |
 | *Why is it built this way?* | Decisions mined from ADRs, `# WHY:` comments, commit and PR history and your agent sessions, each tied to the code it governs and flagged when it goes stale. [Decisions](docs/layers/DECISIONS.md) |
@@ -232,7 +245,7 @@ Five layers, one index:
 
 | Layer | What it contributes |
 |---|---|
-| **1. Graph** | File and symbol dependencies across 26 AST-parsed languages, confidence-stamped call resolution, communities, centrality, cycles and execution flows |
+| **1. Graph** | File and symbol dependencies across 27 AST-parsed languages, confidence-stamped call resolution, communities, centrality, cycles and execution flows |
 | **2. Git history** | Hotspots, ownership, co-change, bus factor and bug-fix history: behavioural signals static analysis cannot see |
 | **3. Docs** | A wiki for every module and file, hybrid search, and your own markdown checked against the tree for claims the code no longer supports |
 | **4. Decisions** | Architectural rationale from ADRs, inline markers, commits, PRs and agent sessions, each claim traced to evidence |
@@ -458,7 +471,7 @@ repository and the cross-repo graph current.
 
 ## Supported languages
 
-**26 languages parsed to an AST, 40 on a five-rung ladder, framework-aware where an
+**27 languages parsed to an AST, 41 on a five-rung ladder, framework-aware where an
 ecosystem handler exists.** Every language ships in the open-source distribution.
 
 <p>
@@ -468,6 +481,7 @@ ecosystem handler exists.** Every language ships in the open-source distribution
   <img src="https://img.shields.io/badge/JavaScript-F7DF1E?style=flat-square&logo=javascript&logoColor=black" alt="JavaScript" />
   <img src="https://img.shields.io/badge/Svelte-FF3E00?style=flat-square&logo=svelte&logoColor=white" alt="Svelte" />
   <img src="https://img.shields.io/badge/Vue-42B883?style=flat-square&logo=vuedotjs&logoColor=white" alt="Vue" />
+  <img src="https://img.shields.io/badge/Astro-BC52EE?style=flat-square&logo=astro&logoColor=white" alt="Astro" />
   <img src="https://img.shields.io/badge/Java-ED8B00?style=flat-square&logo=openjdk&logoColor=white" alt="Java" />
   <img src="https://img.shields.io/badge/Kotlin-7F52FF?style=flat-square&logo=kotlin&logoColor=white" alt="Kotlin" />
   <img src="https://img.shields.io/badge/Go-00ADD8?style=flat-square&logo=go&logoColor=white" alt="Go" />
@@ -500,7 +514,7 @@ ecosystem handler exists.** Every language ships in the open-source distribution
 
 | Rung | Languages | What you get |
 |---|---|---|
-| **Full** (13) | Python · TypeScript · JavaScript · Svelte · Vue · Java · Kotlin · Go · Rust · C++ · C# · Scala · Ruby | The whole pipeline: AST symbols, import resolution, a resolved call graph, heritage, docstrings, framework edges and code-health markers |
+| **Full** (14) | Python · TypeScript · JavaScript · Svelte · Vue · Astro · Java · Kotlin · Go · Rust · C++ · C# · Scala · Ruby | The whole pipeline: AST symbols, import resolution, a resolved call graph, heritage, docstrings, framework edges and code-health markers |
 | **Good** (11) | C · Swift · PHP · Dart · Object Pascal · COBOL · GDScript · VB.NET · Elixir · F# · Objective-C | All of the above except the full health suite, within the language-specific ceilings in the full matrix |
 | **Partial** (2) | Luau / Roblox · Razor / Blazor | Luau: AST symbols and `require()` resolution, Rojo and `.luaurc` aware. Razor: component symbols, `@code` and component-tag call edges, C# health markers; no import resolution yet |
 | **Lightweight** (6) | Clojure · Haskell · Lean 4 · Erlang · HTML · QML | A real file-to-file import graph, and no symbol-level claims |
@@ -585,7 +599,7 @@ knows how much to trust what it just read.
 | Tool | What only this tool answers |
 |---|---|
 | `get_overview()` | Architecture summary, module map, entry points, git health. The first call on an unfamiliar codebase. |
-| `get_answer(question)` | Hybrid retrieval (full-text plus vector), graph expansion and one cited answer with a calibrated `retrieval_quality`. Search, read and reason in a single round-trip. |
+| `get_answer(question)` | Hybrid retrieval (full-text plus vector), graph expansion and one cited answer with a single calibrated `confidence`. Search, read and reason in a single round-trip. |
 | `get_context(targets, include?)` | Triage card for files, modules or symbols: summary, signatures, hotspot flag, governing decisions, symbol ids. `include` opens callers, callees, ownership and metrics. Batch many targets in one call. |
 | `get_symbol("file.py::Name")` | One indexed symbol's source with exact line bounds. |
 | `search_codebase(query)` | Hybrid search over code and docs, by symbol, path or concept. |
@@ -634,9 +648,10 @@ rows we lose beside the rows we win.
   precision, with recall up in all 7 cells since August. In all seven, no tool that
   recovers as much of the graph gets more of it right. The tool with the highest
   recall in most Go cells is still not us, and the page says so.
-- **Accuracy by language.** Graded against each language's own toolchain: C 0.95 to
-  0.98, Python 0.96 to 0.98 on three of four repositories, Rust 0.85 to 0.90, C# 0.73
-  to 0.92, C++ 0.75, Java 0.73 to 0.78, each with its recall and its weak spots.
+- **Accuracy by language.** Graded against each language's own toolchain: Go 0.996,
+  TypeScript 0.98 to 0.995, Dart 0.99, Python 0.96 to 0.99 on three of four
+  repositories, C 0.95 to 0.98, Java 0.87 to 0.95, Kotlin applications 0.94, each
+  with its recall.
 - **Scale.** dotnet/runtime, 58,924 files, indexed in 120 minutes at 11.7 GiB peak
   memory on one laptop. Building just the call graph uses 75 MB at the median, the
   lowest of five tools on 35 of 35 repositories.
@@ -773,9 +788,9 @@ checked it, is in [LINEAGE.md](docs/LINEAGE.md).
 
 Call-graph accuracy is graded against each language's own compiler toolchain, and we
 publish precision and recall per language, with the misses, in the
-[accuracy table](docs/BENCHMARKS.md#accuracy-by-language). On current main, precision
-runs 0.95 to 0.99 for Go, TypeScript, C and most Python, 0.85 to 0.90 for Rust, and
-0.73 to 0.92 for Java and C#, where overloaded methods are the main gap.
+[accuracy table](docs/BENCHMARKS.md#accuracy-by-language). Precision runs 0.95 to
+0.996 for Go, TypeScript, Dart, C and most Python, 0.87 to 0.95 for Java, 0.94 for
+Kotlin applications, 0.85 to 0.90 for Rust and 0.72 to 0.92 for C#.
 
 The largest repository indexed so far is dotnet/runtime: 58,924 files in 120 minutes
 at 11.7 GiB peak memory, on one 31 GB laptop with no API key. Time and memory by

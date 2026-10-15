@@ -23,6 +23,7 @@ from typing import Any
 
 import structlog
 
+from repowise.core.ingestion.git_indexer._constants import _DEFAULT_COMMIT_LIMIT
 from repowise.core.pipeline.modes import OrchestratorMode
 from repowise.core.pipeline.progress import (
     STAGE_ANALYSIS,
@@ -32,6 +33,7 @@ from repowise.core.pipeline.progress import (
     emit_warning,
 )
 from repowise.core.registry import HookProgressCallback
+from repowise.core.registry.plugins import load_plugins
 
 from .phase_timing import timed
 from .phases._common import TEST_RUN_FILE_LIMIT, _phase_done, limit_to_top_pagerank
@@ -189,7 +191,7 @@ class PipelineResult:
 async def run_pipeline(
     repo_path: Path | str,
     *,
-    commit_depth: int = 500,
+    commit_depth: int = _DEFAULT_COMMIT_LIMIT,
     follow_renames: bool = False,
     skip_tests: bool = False,
     skip_infra: bool = False,
@@ -222,7 +224,7 @@ async def run_pipeline(
     repo_path:
         Path to an already-cloned repository on disk.
     commit_depth:
-        Maximum commits to analyse per file (1-10000). Default 500.
+        Maximum commits to analyse per file (1-10000). Default 5000.
     follow_renames:
         Use ``git log --follow`` to track files across renames.
     skip_tests:
@@ -282,6 +284,8 @@ async def run_pipeline(
 
     # Wrap the incoming progress callback so registered pipeline hooks fire
     # around each phase transition. Zero-op when no hooks are registered.
+    # Plugins load first so the hooks they register are among them.
+    load_plugins()
     progress = HookProgressCallback(progress)
 
     # Optional crash-resume checkpointing. When a JobStore is supplied, a

@@ -77,6 +77,9 @@ class OwnerAccumulator:
     # Distinct commits in the 90 days before HEAD; None when the commit rows
     # are missing or do not reach back across the whole window.
     commit_count_90d: int | None = None
+    # When the commit rows stop inside the window: this person's commits in
+    # the part they cover, a floor of the 90-day count. None otherwise.
+    commit_count_90d_at_least: int | None = None
     lines_added_90d_est: float = 0.0
     lines_deleted_90d_est: float = 0.0
 
@@ -96,12 +99,6 @@ class OwnerAccumulator:
 
     dead_code_files: set[str] = field(default_factory=set)
     dead_code_lines: int = 0
-
-    # Agent-provenance rollup across primary-owned files.
-    owned_files_with_agents: int = 0
-    owned_agent_commits: int = 0
-    owned_attributed_commits: int = 0  # total commits on owned files with a rollup
-    owned_agent_tier_counts: Counter[str] = field(default_factory=Counter)
 
     # co-author tally: other_key -> shared file count
     coauthor_shared: Counter[str] = field(default_factory=Counter)
@@ -232,16 +229,6 @@ def aggregate_owners(
                 primary.module_hotspots[module] += 1
             if (row_field(m, "bus_factor") or 0) <= 1:
                 primary.bus_factor_risk_files += 1
-            # agent_authored_pct is None on rows indexed before provenance
-            # existed; skip those so the agent share stays honest.
-            if row_field(m, "agent_authored_pct") is not None:
-                primary.owned_attributed_commits += row_field(m, "commit_count_total") or 0
-                agent_commits = row_field(m, "agent_commit_count") or 0
-                if agent_commits > 0:
-                    primary.owned_files_with_agents += 1
-                    primary.owned_agent_commits += agent_commits
-                    for tier, n in json_field(m, "agent_tier_counts_json", {}).items():
-                        primary.owned_agent_tier_counts[str(tier)] += int(n)
 
         # Co-author tally: each pair of distinct touchers shares this file.
         for i, a in enumerate(touchers):
@@ -290,7 +277,8 @@ def _apply_commit_activity(
     Each owner's ``last_commit_at`` is the newest of their own commits; an
     owner with no row keeps the per-file value. The count stays ``None`` when
     there are no rows, or when the rows stop short of the window start and
-    are not the whole history (a capped sample would undercount).
+    are not the whole history (a capped sample would undercount); an owner
+    with commits in such a sample gets that count as a floor instead.
     """
     stamped: list[tuple[str, str, datetime]] = []
     for c in commits:
@@ -318,6 +306,8 @@ def _apply_commit_activity(
     for key, acc in accs.items():
         if covers_window:
             acc.commit_count_90d = len(recent.get(key, ()))
+        elif recent.get(key):
+            acc.commit_count_90d_at_least = len(recent[key])
         if key in last:
             acc.last_commit_at = last[key]
 

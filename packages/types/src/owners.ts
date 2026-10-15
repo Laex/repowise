@@ -15,6 +15,8 @@ export interface OwnerListEntry {
   dead_code_lines_owned: number;
   /** Distinct commits in the 90 days before HEAD; null when the indexed commits do not cover the window. */
   commit_count_90d: number | null;
+  /** A floor of that count when the indexed commits stop inside the window; null otherwise. */
+  commit_count_90d_at_least?: number | null;
   last_commit_at: string | null;
   bus_factor_risk_files: number;
 }
@@ -57,6 +59,8 @@ export interface OwnerProfile {
   dead_code_lines_owned: number;
   /** Distinct commits in the 90 days before HEAD; null when the indexed commits do not cover the window. */
   commit_count_90d: number | null;
+  /** A floor of that count when the indexed commits stop inside the window; null otherwise. */
+  commit_count_90d_at_least?: number | null;
   last_commit_at: string | null;
   first_commit_at: string | null;
   bus_factor_risk_files: number;
@@ -71,16 +75,4 @@ export interface OwnerProfile {
   /** Uncapped count behind the co_authors slice (for "+N more"). */
   co_authors_total?: number;
   commit_categories: Record<string, number>;
-  /** Agent activity on this person's owned files; null when none attributed. */
-  agent_collab?: OwnerAgentCollab | null;
-}
-
-/** How much coding-agent activity lands on the files this person owns. */
-export interface OwnerAgentCollab {
-  files_with_agent_commits: number;
-  agent_commit_count: number;
-  /** Commit-weighted agent share across owned files, 0–100; null when no
-   * owned file has a provenance-aware rollup yet. */
-  agent_share_pct: number | null;
-  tier_counts: Record<string, number>;
 }

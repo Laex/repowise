@@ -25,6 +25,7 @@ LanguageTag = Literal[
     # Single-file components — parsed as TypeScript via sfc_source.
     "svelte",
     "vue",
+    "astro",
     "go",
     "rust",
     "java",
@@ -226,6 +227,12 @@ class Symbol:
     # C# type declarations only: how many type parameters it declares, which is
     # what tells ``IFoo<T>`` from a same-named ``IFoo``. None elsewhere.
     type_parameter_count: int | None = None
+    # Kotlin functions only: the bare type an extension dispatches on (``Byte``
+    # for ``fun Byte.toHexString()``), None for a receiver that is its own type
+    # parameter; and the receiver as the id spells it, nullable mark and type
+    # parameter kept (``Byte?``, ``T``), which tells same-named extensions apart.
+    extension_receiver: str | None = None
+    written_receiver: str | None = None
     # Keyword modifiers the declaration writes, lowercased (``override``,
     # ``static``, ``abstract``...), for languages whose ``LanguageConfig``
     # names its modifier nodes. Access keywords land here too; ``visibility``
@@ -326,7 +333,8 @@ class CallSite:
     receiver_call: CallReceiver | None = None  # set only for a captured chained call
     # C++ `Ns::f()` / `Class::m()`: the qualifier as written. Kept apart from
     # ``receiver_name`` because that field routes to the member strategies,
-    # and cpp has none -- a scoped call must stay on the free-call path.
+    # and cpp has none -- a scoped call must stay on the free-call path. Java
+    # writes the ``S`` of ``S.super.m()`` here.
     scope_name: str | None = None
     edge_type: CallSiteEdgeType = "calls"  # see ``CallSiteEdgeType``
     supplied_props: set[str] | None = None  # prop names supplied in JSX element (None if unknown/spread)
@@ -337,6 +345,12 @@ class CallSite:
     # Handed straight to a task scheduler (``asyncio.create_task(f())``): it runs
     # later, beside its caller, so the caller neither waits for it nor repeats it.
     spawned: bool = False
+    # Java: each argument's type where it is a literal (``"String"``, ``"int"``,
+    # ``"null"``), else None; None overall when no argument is one.
+    argument_types: tuple[str | None, ...] | None = None
+    # Java: each argument that is a bare name (``start``), else None; None overall
+    # when no argument is one. The resolver reads its declared type.
+    argument_names: tuple[str | None, ...] | None = None
 
 
 # Raw extractor kinds, not the TS ``HeritageKind`` (a different payload);

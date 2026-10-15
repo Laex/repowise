@@ -701,12 +701,25 @@ more) and not both CCN 25 and nesting 5; a dominant dispatch; nesting that is on
 else-if or ternary chain; long but CCN under 20 and nesting under 5; a single
 complex condition or error site. From CCN 80, 400 lines or nesting 8 a function is
 worth doing regardless. The hot-file bonus orders items but never lifts one out of
-`later`. Each item carries up to `MAX_TESTS` (5) tests from its validation profile.
+`later`. Inside a band, items order by complexity removed times reach times the lead
+function's history, `1 + ln(1 + n)` for the `n` commits that changed it (`git_function_blame`);
+a repository with no function history, a file too large to blame, a unit led by no
+function and a performance cause weigh a file in the top fifth by churn 1.25 instead. Each item carries up to `MAX_TESTS` (5) tests from its validation profile.
 
 The findings list uses the same rule: worth-doing findings lead and the rest carry
 `lower_priority`. Class-design findings and history-only findings are lower
 priority there; a performance opportunity is unless production code runs it over
 growing data.
+
+#### Fix first steps
+
+A finding's first step can borrow a stored refactoring plan. A refactoring item is
+`later` when the plan of any of its steps still leaves a function above the
+break-up bar; a finding whose first step borrows such a plan keeps its tier, and
+the step says the plan alone leaves the function above the bar. An Extract Method
+step finds its lines by the text they start and end with, as the plan does, since
+line numbers move with the first edit; when that text also appears elsewhere in
+the file, the step says to keep the edit inside its function.
 
 ### 6.4 Performance opportunities (`perf/`)
 
@@ -770,8 +783,8 @@ held-out sample and carries 0.7; SQLAlchemy, with under 30 held-out labels, stay
 0.4. `unbounded_read_reduced_in_memory` (Python) flags an unlimited query whose rows
 are deduplicated per key in code.
 
-**Dialects.** `perf/dialects/` registers 12 dialects over 18 language tags (TS/JS
-also serve Vue and Svelte script blocks; C# serves Razor). C shares the C++ grammar
+**Dialects.** `perf/dialects/` registers 12 dialects over 19 language tags (TS/JS
+also serve Vue, Svelte and Astro script blocks; C# serves Razor). C shares the C++ grammar
 but has no perf dialect. A language without one emits nothing.
 
 **Soundness.** Dynamic dispatch, monkeypatching and callbacks-as-values produce no

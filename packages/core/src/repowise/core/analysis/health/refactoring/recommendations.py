@@ -41,7 +41,7 @@ from repowise.core.code_origin import ship_rank
 from repowise.core.test_paths import is_test_support_path, names_test_for, paired_test_names
 
 from .annotations import PlanAnnotations, partner_rows
-from .commands import JsPackages, commands_for_tests, plan_packages
+from .commands import TestRuns, commands_for_tests, keeps_runs, plan_runs
 from .models import RefactoringSuggestion
 from .render import list_plan
 
@@ -309,9 +309,9 @@ class ValidationPlan:
     # differs from the plan's, else ``None``; empty when none differs. Kept out
     # of :meth:`as_dict`, which every list serves; plan detail reads it.
     step_verify: list[dict[str, Any] | None] = field(default_factory=list)
-    # The package each shown JS/TS test runs from (``commands.JsPackages``),
+    # How each shown JS/TS, Go, Rust, JVM, Ruby or C# test runs (``commands.TestRuns``),
     # so a later read builds the same commands without a checkout.
-    js_packages: dict[str, str | None] = field(default_factory=dict)
+    test_runs: dict[str, list[str | None]] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -326,7 +326,7 @@ class ValidationPlan:
             "targets": [target.as_dict() for target in self.targets],
             "reasons": self.reasons,
             "prerequisite": self.prerequisite,
-            **({"js_packages": self.js_packages} if self.js_packages else {}),
+            **({"test_runs": self.test_runs} if keeps_runs(self.tests, self.test_runs) else {}),
         }
 
 
@@ -344,7 +344,8 @@ class ValidationEvidence:
     (``function_facts.tests_json``); an absent id was never mapped.
     ``hubs`` are the files no reach walk passes through (:func:`hub_files`), and
     ``siblings`` each directory's files, which decide whose test a name is.
-    ``js_packages`` is the package each JS/TS test runs from; absent, from the root.
+    ``test_runs`` is how each JS/TS, Go, Rust, JVM, Ruby or C# test runs; absent,
+    it gets no command.
     """
 
     symbols: Mapping[str, Sequence[SymbolSpan]] = field(default_factory=dict)
@@ -353,7 +354,7 @@ class ValidationEvidence:
     function_tests: Mapping[str, tuple[MappedTest, ...]] = field(default_factory=dict)
     hubs: frozenset[str] = frozenset()
     siblings: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
-    js_packages: JsPackages | None = None
+    test_runs: TestRuns | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -757,6 +758,26 @@ def _drop_hub_only(file_path: str, labels: set[str], keep: set[str]) -> set[str]
     }
 
 
+def _inferred_target(
+    file_path: str, reached: ReachedBy | None, keep: set[str] | None
+) -> tuple[set[str], ValidationBasis, ValidationVia | None, int, bool]:
+    """Labels, basis, via, total and identity completeness from the inferred map."""
+    if reached is None:
+        return set(), "unknown", None, 0, True
+    labels = set(reached.all_tests or reached.tests)
+    basis: ValidationBasis = "inferred" if reached.total else "unknown"
+    via = reached.via if reached.total else None
+    total = reached.total
+    identities_complete = reached.all_tests is not None or total == len(labels)
+    if keep is not None:
+        labels = _drop_hub_only(file_path, labels, keep)
+        if identities_complete:
+            # The whole list was filtered, so what is left is the answer.
+            basis, via = ("inferred", via) if labels else ("unknown", None)
+            total = len(labels)
+    return labels, basis, via, total, identities_complete
+
+
 def _validation_target(
     file_path: str,
     lines: set[int] | None,
@@ -776,19 +797,9 @@ def _validation_target(
         identities_complete = True
     else:
         reached = inferred.get(file_path)
-        labels = set(reached.all_tests or reached.tests) if reached is not None else set()
-        basis = "inferred" if reached is not None and reached.total else "unknown"
-        via = reached.via if reached is not None and reached.total else None
-        total = reached.total if reached is not None else 0
-        identities_complete = (
-            reached is None or reached.all_tests is not None or total == len(labels)
+        labels, basis, via, total, identities_complete = _inferred_target(
+            file_path, reached, keep
         )
-        if keep is not None and reached is not None:
-            labels = _drop_hub_only(file_path, labels, keep)
-            if identities_complete:
-                # The whole list was filtered, so what is left is the answer.
-                basis, via = ("inferred", via) if labels else ("unknown", None)
-                total = len(labels)
     ranked = rank(labels, covered, reached)
     ordered = sorted(labels, key=lambda label: (ranked[label][0], label))
     return (
@@ -903,12 +914,15 @@ def build_validation_plan(
         # Each quoted test's file, whole: shorter than naming every function,
         # and it runs at least the tests the plan quotes.
         commands = commands_for_tests(
-            sorted({test.split("::", 1)[0] for test in shown}), packages=facts.js_packages
+            sorted({test.split("::", 1)[0] for test in shown}),
+            runs=facts.test_runs,
         )
     else:
         shown = ordered_tests[:cap]
         reasons = {test: best[test][1] for test in shown}
-        commands = commands_for_tests(shown, total=aggregate_total, packages=facts.js_packages)
+        commands = commands_for_tests(
+            shown, total=aggregate_total, runs=facts.test_runs
+        )
     files = affected_files(suggestion)
     return ValidationPlan(
         basis=aggregate_basis,
@@ -921,7 +935,7 @@ def build_validation_plan(
         commands=commands,
         targets=target_rows,
         reasons=reasons if order_tests else {},
-        js_packages=plan_packages(shown, facts.js_packages),
+        test_runs=plan_runs(shown, facts.test_runs),
         # Also when tests reach the file but none reaches a function it changes.
         prerequisite=(
             _characterization_step(suggestion)

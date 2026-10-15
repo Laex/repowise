@@ -433,6 +433,55 @@ def _betweenness_commits(graph_builder: Any) -> dict[str, str | None]:
         return {"file": None, "symbol": None}
 
 
+def _stamp_betweenness_commit(
+    node_dict: dict[str, Any],
+    node_type: str,
+    bc: dict[str, float],
+    sym_bc: dict[str, float],
+    bt_commits: dict[str, str | None],
+) -> None:
+    """Set ``betweenness_commit`` on a graph-node row when its scoring is known."""
+    node_id = node_dict["node_id"]
+    # Scored → its commit; in no scoring → NULL, the unscored marker;
+    # provenance unknown → key omitted, so the stored stamp survives.
+    if node_id in bc:
+        kind, scored = "file", True
+    elif node_id in sym_bc:
+        kind, scored = "symbol", True
+    else:
+        kind, scored = ("file" if node_type == "file" else "symbol"), False
+    if bt_commits[kind] is not None:
+        node_dict["betweenness_commit"] = bt_commits[kind] if scored else None
+
+
+def _community_meta(
+    node_id: str,
+    node_type: str,
+    cd: dict[str, Any],
+    sc: dict[str, Any],
+    ci: dict[Any, Any],
+    ep_scores: dict[str, float],
+) -> dict[str, Any]:
+    """The ``community_meta_json`` payload of one graph node."""
+    community_meta: dict[str, Any] = {}
+    if node_type == "file":
+        cid = cd.get(node_id, 0)
+        comm_info = ci.get(cid)
+        if comm_info:
+            community_meta = {
+                "label": comm_info.label,
+                "cohesion": comm_info.cohesion,
+                "conductance": comm_info.conductance,
+            }
+    elif node_type == "symbol":
+        sym_cid = sc.get(node_id)
+        if sym_cid is not None:
+            community_meta = {"symbol_community_id": sym_cid}
+        if node_id in ep_scores:
+            community_meta["entry_point_score"] = ep_scores[node_id]
+    return community_meta
+
+
 async def persist_graph_nodes(
     session: Any,
     repo_id: str,
@@ -500,33 +549,9 @@ async def persist_graph_nodes(
             "community_id": stored_community_id(cd, node_id),
         }
 
-        # Scored → its commit; in no scoring → NULL, the unscored marker;
-        # provenance unknown → key omitted, so the stored stamp survives.
-        if node_id in bc:
-            kind, scored = "file", True
-        elif node_id in sym_bc:
-            kind, scored = "symbol", True
-        else:
-            kind, scored = ("file" if node_type == "file" else "symbol"), False
-        if bt_commits[kind] is not None:
-            node_dict["betweenness_commit"] = bt_commits[kind] if scored else None
+        _stamp_betweenness_commit(node_dict, node_type, bc, sym_bc, bt_commits)
 
-        community_meta: dict[str, Any] = {}
-        if node_type == "file":
-            cid = cd.get(node_id, 0)
-            comm_info = ci.get(cid)
-            if comm_info:
-                community_meta = {
-                    "label": comm_info.label,
-                    "cohesion": comm_info.cohesion,
-                    "conductance": comm_info.conductance,
-                }
-        elif node_type == "symbol":
-            sym_cid = sc.get(node_id)
-            if sym_cid is not None:
-                community_meta = {"symbol_community_id": sym_cid}
-            if node_id in ep_scores:
-                community_meta["entry_point_score"] = ep_scores[node_id]
+        community_meta = _community_meta(node_id, node_type, cd, sc, ci, ep_scores)
         node_dict["community_meta_json"] = json.dumps(community_meta)
 
         if node_type == "symbol":
@@ -759,6 +784,20 @@ async def _edges_predate_cohesion(session: Any, repo_id: str, graph_builder: Any
     return row is None
 
 
+async def has_graph_edges(session: Any, repo_id: str) -> bool:
+    """Whether this repo already has any ``graph_edges`` row."""
+    from sqlalchemy import select
+
+    from repowise.core.persistence.models import GraphEdge
+
+    row = (
+        await session.execute(
+            select(GraphEdge.repository_id).where(GraphEdge.repository_id == repo_id).limit(1)
+        )
+    ).first()
+    return row is not None
+
+
 async def _stored_edges_parser_fingerprint(session: Any, repo_id: str) -> str | None:
     """The ``parser_fingerprint()`` recorded when this repo's edges were written.
 
@@ -779,15 +818,16 @@ async def _stored_edges_parser_fingerprint(session: Any, repo_id: str) -> str | 
 async def stamp_edges_parser_fingerprint(session: Any, repo_id: str, fingerprint: str) -> None:
     """Record the parser build that just wrote this repo's ``graph_edges``.
 
-    Written only by :func:`persist_incremental_edges`, and only after a widen.
-    Deliberately *not* written by the full :func:`persist_ingestion` path, which
-    upserts edges (:func:`batch_upsert_graph_edges`) and prunes only the nodes
-    of files that vanished: a re-index over an existing store therefore adds the
-    new build's edges without removing the old build's surplus ones. Stamping
-    there would mark such a store parser-current and permanently suppress the
-    delete-then-insert reconcile that is the only thing which clears them. The
-    cost of not stamping is one widen on the first update after an index, which
-    is wasted on a fresh store and exactly the repair on a re-indexed one.
+    Written by :func:`persist_incremental_edges` after a widen, and by the full
+    :func:`persist_ingestion` path only when the store held no edges before it.
+    That path upserts edges (:func:`batch_upsert_graph_edges`) and prunes only
+    the nodes of files that vanished, so a re-index over an existing store adds
+    the new build's edges without removing the old build's surplus ones.
+    Stamping such a store would mark it parser-current and permanently suppress
+    the delete-then-insert reconcile that is the only thing which clears them;
+    it stays unstamped, and the first update widens. A fresh store has no
+    surplus, so it is stamped: unstamped, the next parser change could not be
+    told apart from "already up to date" on a quiet checkout.
     """
     from sqlalchemy import update
 
@@ -829,7 +869,9 @@ async def persist_incremental_edges(
     change; :func:`_edges_predate_cohesion` is the bespoke predecessor, kept
     until shipped stores have all been stamped.
     """
-    if graph_builder is None or not parsed_files:
+    # An empty parse still counts: a repo with no source files has nothing to
+    # widen, and it must be stamped, or a missing stamp re-parses it forever.
+    if graph_builder is None or parsed_files is None:
         return
     from repowise.core.ingestion.parse_cache import parser_fingerprint
     from repowise.core.persistence.crud import reconcile_edges_for_files
@@ -848,26 +890,28 @@ async def persist_incremental_edges(
         logger.info("graph_edges_cohesion_backfill", repo_id=repo_id, files=len(changed_paths))
 
     reconcile_paths, edges = _changed_file_edges(graph_builder, parsed_files, changed_paths)
-    if not reconcile_paths:
-        return
-    await reconcile_edges_for_files(session, repo_id, reconcile_paths, edges)
+    if reconcile_paths:
+        await reconcile_edges_for_files(session, repo_id, reconcile_paths, edges)
+        # Every reconciled file, not only a widen's: a symbol renamed or removed
+        # in a changed file otherwise keeps its node beside the new one.
+        await _prune_vanished_symbol_nodes(session, repo_id, graph_builder, reconcile_paths)
     # Only after the widen actually ran to completion. Raising here (or in any
     # caller before the commit) leaves the old stamp, so the next update retries
     # rather than stranding the files it never reached.
     if parser_changed:
-        await _prune_vanished_symbol_nodes(session, repo_id, graph_builder, parsed_files)
         await stamp_edges_parser_fingerprint(session, repo_id, fingerprint)
 
 
 async def _prune_vanished_symbol_nodes(
-    session: Any, repo_id: str, graph_builder: Any, parsed_files: list[Any]
+    session: Any, repo_id: str, graph_builder: Any, paths: list[str]
 ) -> None:
-    """Delete symbol ``graph_nodes`` a re-extraction no longer produces.
+    """Delete symbol ``graph_nodes`` of *paths* a re-extraction no longer produces.
 
     ``persist_graph_nodes`` upserts the current graph and never deletes, so a
-    symbol whose id changed under a new parser (an overload gaining its own id)
-    would otherwise keep its old row beside the new ones. Scoped to files this
-    run parsed; a file that is gone is :func:`_prune_stale_file_rows`'s job.
+    symbol whose id changed (a rename, or an overload gaining its own id under
+    a new parser) would otherwise keep its old row beside the new ones. Scoped
+    to files this run reconciled; a file that is gone is
+    :func:`_prune_stale_file_rows`'s job.
     Membership rows prune themselves on their next write, and ``graph_metrics``
     holds files only.
     """
@@ -876,7 +920,6 @@ async def _prune_vanished_symbol_nodes(
     from repowise.core.persistence.models import GraphEdge, GraphNode
 
     graph = graph_builder.graph()
-    paths = [pf.file_info.path for pf in parsed_files]
     stale: list[str] = []
     for i in range(0, len(paths), _PRUNE_CHUNK):
         rows = await session.execute(
@@ -1551,6 +1594,79 @@ async def sweep_absent_cycle_pages(session: Any, repo_id: str, graph_builder: An
     return stale
 
 
+def _symbol_names_by_file(graph_builder: Any) -> dict[str, set[str]]:
+    """``file path -> names of the symbols it defines`` in the rebuilt graph.
+
+    Empty when there is no graph to ask. The synthetic ``__module__`` symbol is
+    left out, so a file that failed to parse has no entry at all.
+    """
+    if graph_builder is None:
+        return {}
+    try:
+        graph = graph_builder.graph()
+    except Exception:  # a released graph cannot speak for any symbol
+        return {}
+    names_by_file: dict[str, set[str]] = {}
+    for _node, data in graph.nodes(data=True):
+        if data.get("node_type") != "symbol" or data.get("kind") == "module":
+            continue
+        path, name = data.get("file_path"), data.get("name")
+        if path and name:
+            names_by_file.setdefault(path, set()).add(name)
+    return names_by_file
+
+
+async def sweep_absent_symbol_spotlights(
+    session: Any, repo_id: str, graph_builder: Any
+) -> list[str]:
+    """Delete ``symbol_spotlight`` rows whose symbol left a file that still exists.
+
+    A spotlight targets ``<path>::<name>``. Deleting the file tombstones it
+    (:func:`mark_tombstone_pages`), but moving or removing the symbol while the
+    file stays left the row ``fresh``: nothing regenerates a page for a symbol
+    the parser no longer emits, so it kept serving the old body and the old
+    importer list.
+
+    Same question as :func:`sweep_absent_cycle_pages`, asked of the rebuilt
+    graph: does this file still define a symbol of that name? Only files the
+    graph holds with at least one named symbol are judged, so a file outside
+    the traversal or one that failed to parse keeps its pages.
+
+    Returns the deleted page ids so the caller can drop them from FTS and the
+    vector store after the session closes.
+    """
+    from sqlalchemy import delete, select
+
+    from repowise.core.persistence.models import Page, PageVersion
+
+    names_by_file = _symbol_names_by_file(graph_builder)
+    if not names_by_file:
+        return []
+
+    rows = (
+        await session.execute(
+            select(Page.id, Page.target_path).where(
+                Page.repository_id == repo_id,
+                Page.page_type == "symbol_spotlight",
+                Page.freshness_status != "tombstone",
+            )
+        )
+    ).all()
+    stale: list[str] = []
+    for page_id, target in rows:
+        path, sep, name = (target or "").partition("::")
+        names = names_by_file.get(path)
+        if sep and names is not None and name not in names:
+            stale.append(page_id)
+    for i in range(0, len(stale), _PRUNE_CHUNK):
+        batch = stale[i : i + _PRUNE_CHUNK]
+        await session.execute(delete(PageVersion).where(PageVersion.page_id.in_(batch)))
+        await session.execute(delete(Page).where(Page.repository_id == repo_id, Page.id.in_(batch)))
+    if stale:
+        logger.info("absent_symbol_spotlights_swept", repo_id=repo_id, count=len(stale))
+    return stale
+
+
 async def sweep_superseded_generated_pages(
     session: Any,
     repo_id: str,
@@ -1687,8 +1803,13 @@ async def persist_ingestion(result: Any, session: Any, repo_id: str) -> int:
     # ---- Graph edges ---------------------------------------------------------
     graph = result.graph_builder.graph()
     edges = [_edge_row(u, v, data) for u, v, data in graph.edges(data=True)]
+    fresh_store = not await has_graph_edges(session, repo_id)
     if edges:
         await batch_upsert_graph_edges(session, repo_id, edges)
+    if fresh_store:
+        from repowise.core.ingestion.parse_cache import parser_fingerprint
+
+        await stamp_edges_parser_fingerprint(session, repo_id, parser_fingerprint())
 
     # ---- External systems (C4 L1) -------------------------------------------
     # Persist before symbols so the FK linkage step below sees the IDs.
@@ -1731,10 +1852,39 @@ async def persist_security_findings(result: Any, session: Any, repo_id: str) -> 
     it off ``file_info`` yields empty text and a scan that can never fire.
     Resume views without a ``source_map`` degrade to the symbol-name scan.
     """
+    source_map = getattr(result, "source_map", None) or {}
+    await _replace_security_findings(session, repo_id, result.parsed_files, source_map)
+
+
+async def persist_incremental_security_findings(
+    session: Any,
+    repo_id: str,
+    parsed_files: list[Any] | None,
+    source_map: dict[str, Any] | None,
+    changed_paths: list[str],
+) -> None:
+    """Rescan the changed and added files' working-tree security findings.
+
+    Without this, update kept every finding from the last full index: new
+    secrets in changed files were missed and old rows pointed at moved lines.
+    Deleted files are dropped by ``prune_deleted_file_rows``. No source map
+    means no text to scan, and scanning empty text would wipe real findings,
+    so that case is a no-op.
+    """
+    if not parsed_files or not source_map:
+        return
+    changed = set(changed_paths)
+    targets = [pf for pf in parsed_files if pf.file_info.path in changed]
+    if targets:
+        await _replace_security_findings(session, repo_id, targets, source_map)
+
+
+async def _replace_security_findings(
+    session: Any, repo_id: str, parsed_files: Any, source_map: dict[str, Any]
+) -> None:
     from repowise.core.analysis.security_scan import SecurityScanner, scan_source_map
 
-    source_map = getattr(result, "source_map", None) or {}
-    findings_by_file, scanned_paths = scan_source_map(result.parsed_files, source_map)
+    findings_by_file, scanned_paths = scan_source_map(parsed_files, source_map)
     await SecurityScanner(session, repo_id).replace_findings(findings_by_file, scanned_paths)
 
 
@@ -1745,6 +1895,7 @@ async def persist_git(result: Any, session: Any, repo_id: str) -> None:
     ``(repo_id, sha)`` — safe to call incrementally and on resume.
     """
     from repowise.core.persistence.crud import (
+        clear_attribution_if_disabled,
         prune_fix_events_before,
         update_repo_git_totals,
         upsert_fix_events_bulk,
@@ -1766,6 +1917,9 @@ async def persist_git(result: Any, session: Any, repo_id: str) -> None:
     commit_file_rows = getattr(summary, "commit_file_rows", None)
     if commit_file_rows:
         await upsert_git_commit_files_bulk(session, repo_id, commit_file_rows)
+    await clear_attribution_if_disabled(session, repo_id)
+    if summary is not None:
+        await _rebuild_changes(session, repo_id)
 
     # Per fix-commit x file rows (with their SZZ candidates). The prune keeps a
     # re-index of an already-indexed repo from leaving behind events that have
@@ -1807,6 +1961,20 @@ async def persist_git(result: Any, session: Any, repo_id: str) -> None:
             total_lines_deleted=totals.total_lines_deleted,
             churn_anchor_sha=getattr(totals, "churn_anchor_sha", None),
         )
+
+
+async def _rebuild_changes(session: Any, repo_id: str) -> None:
+    """Change records from the same history, after the commit labels they read."""
+    from repowise.core.changes.store import refresh_changes
+    from repowise.core.persistence.models import Repository
+
+    try:
+        repo = await session.get(Repository, repo_id)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("changes_repo_lookup_failed", repo_id=repo_id, error=str(exc))
+        return
+    if repo is not None and repo.local_path:
+        await refresh_changes(session, repo_id, repo.local_path, rebuild=True)
 
 
 async def replace_git_history(
@@ -1878,6 +2046,7 @@ async def persist_git_refresh(
     from sqlalchemy import select
 
     from repowise.core.persistence.crud import (
+        clear_attribution_if_disabled,
         recompute_git_percentiles,
         upsert_git_metadata_bulk,
     )
@@ -1901,6 +2070,7 @@ async def persist_git_refresh(
         ]
     await upsert_git_metadata_bulk(session, repo_id, [*git_meta_map.values(), *decay_rows])
     await recompute_git_percentiles(session, repo_id)
+    await clear_attribution_if_disabled(session, repo_id)
 
 
 async def _analyzed_commit(session: Any, repo_id: str) -> str | None:
@@ -1937,6 +2107,7 @@ async def snapshot_health_from_store(session: Any, repo_id: str) -> None:
     """
     from sqlalchemy import select
 
+    from repowise.core.analysis.health.ranking import deduction_by_path
     from repowise.core.analysis.health.scoring import compute_kpis
     from repowise.core.analysis.health.trends import snapshot_fields
     from repowise.core.persistence.crud import get_hotspot_file_paths, save_health_snapshot
@@ -1966,7 +2137,11 @@ async def snapshot_health_from_store(session: Any, repo_id: str) -> None:
             .scalars()
             .all()
         )
-        kpis = compute_kpis(metrics, await get_hotspot_file_paths(session, repo_id))
+        kpis = compute_kpis(
+            metrics,
+            await get_hotspot_file_paths(session, repo_id),
+            deductions=deduction_by_path(findings),
+        )
         fields = snapshot_fields(kpis, metrics, findings)
         if fields is not None:
             await save_health_snapshot(session, repo_id, **fields)

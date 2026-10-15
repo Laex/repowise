@@ -21,7 +21,6 @@ from repowise.server.schemas import (
     OwnerProfileResponse,
     Paginated,
 )
-from repowise.server.schemas.ownership import OwnerAgentCollab
 from repowise.server.services.owner_profile import (
     _OwnerAccumulator,
     aggregate_owners,
@@ -52,6 +51,7 @@ def _to_list_entry(acc: _OwnerAccumulator, module_totals: dict[str, int]) -> Own
         dead_code_files_owned=len(acc.dead_code_files),
         dead_code_lines_owned=acc.dead_code_lines,
         commit_count_90d=acc.commit_count_90d,
+        commit_count_90d_at_least=acc.commit_count_90d_at_least,
         last_commit_at=acc.last_commit_at,
         bus_factor_risk_files=acc.bus_factor_risk_files,
     )
@@ -111,19 +111,6 @@ def _to_profile(acc: _OwnerAccumulator, module_totals: dict[str, int]) -> OwnerP
             )
         )
 
-    agent_collab: OwnerAgentCollab | None = None
-    if acc.owned_attributed_commits > 0 or acc.owned_agent_commits > 0:
-        agent_collab = OwnerAgentCollab(
-            files_with_agent_commits=acc.owned_files_with_agents,
-            agent_commit_count=acc.owned_agent_commits,
-            agent_share_pct=(
-                acc.owned_agent_commits / acc.owned_attributed_commits * 100.0
-                if acc.owned_attributed_commits
-                else None
-            ),
-            tier_counts=dict(acc.owned_agent_tier_counts),
-        )
-
     return OwnerProfileResponse(
         key=acc.key,
         name=acc.name,
@@ -134,6 +121,7 @@ def _to_profile(acc: _OwnerAccumulator, module_totals: dict[str, int]) -> OwnerP
         dead_code_files_owned=len(acc.dead_code_files),
         dead_code_lines_owned=acc.dead_code_lines,
         commit_count_90d=acc.commit_count_90d,
+        commit_count_90d_at_least=acc.commit_count_90d_at_least,
         last_commit_at=acc.last_commit_at,
         first_commit_at=acc.first_commit_at,
         bus_factor_risk_files=acc.bus_factor_risk_files,
@@ -145,7 +133,6 @@ def _to_profile(acc: _OwnerAccumulator, module_totals: dict[str, int]) -> OwnerP
         co_authors=co_authors,
         co_authors_total=len(acc.coauthor_shared),
         commit_categories=dict(acc.commit_categories),
-        agent_collab=agent_collab,
     )
 
 

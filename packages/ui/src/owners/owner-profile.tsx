@@ -11,6 +11,7 @@ import { ReadsColumn, type ReadItem } from "../overview/reads-column";
 import { StatRibbon, type RibbonStat } from "../stats/stat-ribbon";
 import { EmptyState } from "../shared/empty-state";
 import { ProportionBar } from "../shared/proportion-bar";
+import { commitCategoryColor } from "../shared/series";
 import { formatCompact, formatRelativeTimeOrNull } from "../lib/format";
 import { OwnerAvatar } from "./owner-avatar";
 
@@ -138,28 +139,18 @@ export function OwnerProfileView({
       href: `${base}/owners`,
     });
   }
-  if (owner.agent_collab && owner.agent_collab.agent_commit_count > 0) {
-    const a = owner.agent_collab;
-    reads.push({
-      key: "agent",
-      label: "Agent-assisted",
-      value: a.agent_commit_count.toLocaleString(),
-      unit: "commits",
-      why:
-        (a.agent_share_pct != null
-          ? `${a.agent_share_pct.toFixed(2)}% of the commits on their owned files carry a coding-agent trailer. `
-          : "Read from commit trailers, so it counts what was declared. ") +
-        `${a.files_with_agent_commits.toLocaleString()} owned ${a.files_with_agent_commits === 1 ? "file has" : "files have"} one.`,
-      href: `${base}/commits`,
-    });
-  }
-
   // Volume figures, none of which appear in the lede, the reads column or a
   // section below. The two line counts are the payload's `_est` fields, so an
   // exact six-digit figure would claim a precision the number does not have.
   const ribbon: RibbonStat[] = [
     // Null when the indexed commits do not reach back 90 days: not a zero.
-    { label: "Commits, 90d", value: owner.commit_count_90d?.toLocaleString() ?? "—" },
+    {
+      label: "Commits, 90d",
+      // A floor when the indexed commits stop inside the window.
+      value:
+        owner.commit_count_90d?.toLocaleString() ??
+        (owner.commit_count_90d_at_least ? `≥${owner.commit_count_90d_at_least.toLocaleString()}` : "—"),
+    },
     {
       label: "Lines added",
       value: formatCompact(owner.lines_added_90d_est),
@@ -264,8 +255,8 @@ export function OwnerProfileView({
  * reader to compare bars that are all measuring different denominators. One
  * bar shows the split, and the key carries the share.
  *
- * The share steps, not a hue per directory: these are ordered shares of one
- * whole, so position is the encoding.
+ * The share steps, the series colours by rank: these are ordered shares of
+ * one whole, so position is the encoding.
  */
 function OwnershipFootprint({
   modules,
@@ -553,8 +544,8 @@ function LeadPartner({
  * `perf`. The endpoint returns `feature`, `fix`, `refactor` and `dependency`,
  * so four of the five colours were unreachable and the largest category fell
  * through to the default — a palette that had never once rendered as designed.
- * Ordered shares of one whole want the share steps, where position is the
- * magnitude, not a hue per category.
+ * Each category keeps its fixed colour (commitCategoryColor), the same as on
+ * every other chart of commit types.
  *
  * Zero-count categories are dropped rather than rendered as an empty track:
  * the endpoint returns the full key set, so a contributor who has never
@@ -590,6 +581,7 @@ function CommitMix({ categories }: { categories: Record<string, number> }) {
             label: category.charAt(0).toUpperCase() + category.slice(1),
             value: n,
             detail: `${n.toLocaleString()} · ${pct(n, total)}%`,
+            color: commitCategoryColor(category),
           }))}
         />
       )}

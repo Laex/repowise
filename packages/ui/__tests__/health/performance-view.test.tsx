@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { describe, expect, it, vi } from "vitest";
 import type { RefactoringPlan } from "@repowise-dev/types/refactoring";
 
+import { ScopeLine } from "../../src/health/performance/filters";
 import { PerformanceView } from "../../src/health/performance-view";
 import {
   adapter,
@@ -1047,3 +1048,27 @@ describe("PerformanceView drawer, the fix itself", () => {
   });
 });
 
+describe("ScopeLine", () => {
+  it.each([
+    ["all", 1, "1 opportunity"],
+    ["all", 2, "2 opportunities"],
+    ["production", 1, "1 production opportunity"],
+    ["production", 0, "0 production opportunities"],
+  ] as const)("names %s with %s as %s", (context, total, expected) => {
+    render(
+      <ScopeLine filteredTotal={total} repositoryTotal={total} context={context} narrowed={0} />,
+    );
+    expect(screen.getByRole("status").textContent).toContain(expected);
+  });
+});
+
+describe("performance drawer preview", () => {
+  it("marks the cause when the detail response carries a preview note", async () => {
+    const note = "preview, measured 40% precision on 30 judged causes, 2026-10-15";
+    const getDetail = vi.fn(async () => resolvedDetail({ preview: note }));
+    render(<PerformanceView adapter={adapter({ getPerformanceOpportunity: getDetail })} />);
+    await openFirstRow();
+    const panel = await screen.findByRole("dialog");
+    expect(await within(panel).findByRole("button", { name: `Preview: ${note}` })).toBeTruthy();
+  });
+});

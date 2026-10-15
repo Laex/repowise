@@ -48,6 +48,7 @@ from repowise.core.analysis.health import HEALTH_ANALYZER_VERSION
 from repowise.core.docs_mode import docs_mode_state_fields
 from repowise.core.index_scope import file_page_scope, stamp_index_scope
 from repowise.core.ingestion.git_indexer import GIT_HISTORY_VERSION, GIT_HISTORY_VERSION_KEY
+from repowise.core.ingestion.git_indexer._constants import _DEFAULT_COMMIT_LIMIT
 from repowise.core.update_lock import release_update_lock, try_acquire_update_lock
 
 
@@ -143,6 +144,7 @@ async def _backfill_git(
     )
     from repowise.core.persistence import get_session
     from repowise.core.persistence.crud import (
+        clear_attribution_if_disabled,
         recompute_git_percentiles,
         upsert_git_commits_bulk,
         upsert_git_metadata_bulk,
@@ -172,6 +174,7 @@ async def _backfill_git(
         # (Foundation 1 only wrote them on the full orchestrator index).
         if summary.commit_rows:
             await upsert_git_commits_bulk(session, repo_id, summary.commit_rows)
+        await clear_attribution_if_disabled(session, repo_id)
 
     console.print(
         f"Git tier upgraded to FULL: [cyan]{summary.files_indexed}[/cyan] files "
@@ -268,7 +271,9 @@ async def _run_upgrade(
     # wiring: pipeline_jobs.repository_id is an FK to repositories.id, so the
     # row must exist before the backfill creates its checkpoint job.
     async with get_session(sf) as session:
-        repo = await upsert_repository(session, name=repo_path.name, local_path=str(repo_path))
+        repo = await upsert_repository(
+            session, name=repo_path.name, local_path=str(repo_path), stamp_head=True
+        )
         repo_id = repo.id
 
     # 2. Backfill the git tier ESSENTIAL -> FULL (resumable via JobStore).
@@ -839,7 +844,9 @@ def upgrade_to_full(
             run_mode="standard",
             content_provenance="model",
             git_tier="full",
-            git_commit_cap=commit_limit if isinstance(commit_limit, int) else 500,
+            git_commit_cap=(
+                commit_limit if isinstance(commit_limit, int) else _DEFAULT_COMMIT_LIMIT
+            ),
             git_history_coverage=outcome["git_history_coverage"],
             file_pages=outcome["file_pages"],
             analysis={"unavailable": [], "skipped": []},
