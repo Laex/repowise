@@ -149,7 +149,7 @@ from __future__ import annotations
 
 import json
 from collections import OrderedDict
-from collections.abc import Collection, Iterator, Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any, Literal, NamedTuple, TypeAlias
@@ -962,9 +962,9 @@ async def _imported_names(
     shared: dict[str, Any] = {"repo_id": repo_id}
     ets = _in_clause("e", sorted(FILE_DEPENDENCY_EDGE_TYPES), shared)
     out = []
-    for batch in _batches(targets):
+    for start in range(0, len(targets), _IN_BATCH):
         params = dict(shared)
-        tgt = _in_clause("p", batch, params)
+        tgt = _in_clause("p", targets[start : start + _IN_BATCH], params)
         rows = await session.execute(
             text(
                 "SELECT source_node_id, target_node_id, imported_names_json FROM graph_edges "
@@ -973,13 +973,17 @@ async def _imported_names(
             ),
             params,
         )
-        for source, target, names_json in rows:
-            try:
-                names = json.loads(names_json or "[]")
-            except (TypeError, ValueError):
-                names = []
-            out.append((source, target, frozenset(n for n in names if isinstance(n, str))))
+        out.extend((source, target, _names_of(names_json)) for source, target, names_json in rows)
     return out
+
+
+def _names_of(names_json: str | None) -> frozenset[str]:
+    """The names an import edge records; unreadable JSON records none."""
+    try:
+        names = json.loads(names_json or "[]")
+    except (TypeError, ValueError):
+        return frozenset()
+    return frozenset(n for n in names if isinstance(n, str))
 
 
 @dataclass(frozen=True)
@@ -1153,11 +1157,6 @@ def _in_clause(prefix: str, values: list[str], params: dict[str, Any]) -> str:
 _IN_BATCH = 500
 
 
-def _batches(values: list[str]) -> Iterator[list[str]]:
-    for i in range(0, len(values), _IN_BATCH):
-        yield values[i : i + _IN_BATCH]
-
-
 async def _edges_from(
     session: AsyncSession, repo_id: str, sources: list[str], edge_types: list[str]
 ) -> list[tuple[str, str]]:
@@ -1166,9 +1165,9 @@ async def _edges_from(
     ets = _in_clause("e", edge_types, shared)
     out: list[tuple[str, str]] = []
     # A batch holds whole sources, so a pair is distinct across batches too.
-    for batch in _batches(sources):
+    for start in range(0, len(sources), _IN_BATCH):
         params = dict(shared)
-        src = _in_clause("s", batch, params)
+        src = _in_clause("s", sources[start : start + _IN_BATCH], params)
         rows = await session.execute(
             text(
                 "SELECT DISTINCT source_node_id, target_node_id FROM graph_edges "
@@ -1205,9 +1204,9 @@ async def _edges_into(
         origin_filter = f" AND (resolution_origin IS NULL OR resolution_origin NOT IN ({bad}))"
     out: list[tuple[str, str]] = []
     # A batch holds whole targets, so a pair is distinct across batches too.
-    for batch in _batches(targets):
+    for start in range(0, len(targets), _IN_BATCH):
         params = dict(shared)
-        tgt = _in_clause("p", batch, params)
+        tgt = _in_clause("p", targets[start : start + _IN_BATCH], params)
         rows = await session.execute(
             text(
                 "SELECT DISTINCT source_node_id, target_node_id FROM graph_edges "
