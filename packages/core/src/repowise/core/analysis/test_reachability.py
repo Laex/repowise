@@ -944,6 +944,7 @@ async def _imported_names(
     """``(importer, imported file, names)`` for every import edge into *targets*."""
     shared: dict[str, Any] = {"repo_id": repo_id}
     ets = _in_clause("e", sorted(FILE_DEPENDENCY_EDGE_TYPES), shared)
+    targets = list(dict.fromkeys(targets))
     out = []
     for start in range(0, len(targets), _IN_BATCH):
         params = dict(shared)
@@ -1147,7 +1148,8 @@ async def _edges_from(
     shared: dict[str, Any] = {"repo_id": repo_id}
     ets = _in_clause("e", edge_types, shared)
     out: list[tuple[str, str]] = []
-    # A batch holds whole sources, so a pair is distinct across batches too.
+    # Each source is in one batch only, so a pair is distinct across batches too.
+    sources = list(dict.fromkeys(sources))
     for start in range(0, len(sources), _IN_BATCH):
         params = dict(shared)
         src = _in_clause("s", sources[start : start + _IN_BATCH], params)
@@ -1186,7 +1188,8 @@ async def _edges_into(
         bad = _in_clause("o", sorted(excluded_origins), shared)
         origin_filter = f" AND (resolution_origin IS NULL OR resolution_origin NOT IN ({bad}))"
     out: list[tuple[str, str]] = []
-    # A batch holds whole targets, so a pair is distinct across batches too.
+    # Each target is in one batch only, so a pair is distinct across batches too.
+    targets = list(dict.fromkeys(targets))
     for start in range(0, len(targets), _IN_BATCH):
         params = dict(shared)
         tgt = _in_clause("p", targets[start : start + _IN_BATCH], params)

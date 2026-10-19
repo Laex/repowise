@@ -778,3 +778,33 @@ async def test_reads_over_more_files_than_one_statement_can_bind(async_session):
     }
     names = await imported_names_by_test(async_session, repo.id, files, {"tests/test_a.py"})
     assert names == {"src/a.py": {"tests/test_a.py": frozenset()}}
+
+
+async def test_a_node_listed_twice_across_batches_reads_its_edges_once(async_session):
+    """A repeated input landing in two batches must not repeat its pairs: one
+    ``IN`` list matches a node once however often it is listed."""
+    from repowise.core.analysis.test_reachability import (
+        _IN_BATCH,
+        _edges_from,
+        _edges_into,
+        _imported_names,
+    )
+
+    repo = await insert_repo(async_session)
+    await _seed(
+        async_session,
+        repo.id,
+        nodes={"tests/test_a.py": True, "src/a.py": False},
+        edges=[("tests/test_a.py", "src/a.py", "imports")],
+    )
+    padding = [f"src/gone_{i}.py" for i in range(_IN_BATCH)]
+    into = await _edges_into(
+        async_session, repo.id, ["src/a.py", *padding, "src/a.py"], ["imports"], frozenset()
+    )
+    assert into == [("tests/test_a.py", "src/a.py")]
+    out = await _edges_from(
+        async_session, repo.id, ["tests/test_a.py", *padding, "tests/test_a.py"], ["imports"]
+    )
+    assert out == [("tests/test_a.py", "src/a.py")]
+    names = await _imported_names(async_session, repo.id, ["src/a.py", *padding, "src/a.py"])
+    assert names == [("tests/test_a.py", "src/a.py", frozenset())]
