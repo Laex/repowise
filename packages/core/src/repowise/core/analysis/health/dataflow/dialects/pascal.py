@@ -70,6 +70,12 @@ class PascalDefUseDialect(BaseDefUseDialect):
 
     # -- names ----------------------------------------------------------------
 
+    def __init__(self) -> None:
+        # The last routine's spellings: a function's statements are read one
+        # after another, so one entry answers nearly every name. Read once into
+        # a local below, so a concurrent analysis replacing it is harmless.
+        self._last_spellings: tuple[Node, dict[str, str]] | None = None
+
     def _spelled(self, node: Node, name: str) -> str:
         folded = name.lower()
         if folded == "result":  # declared by the function header, never written out
@@ -77,7 +83,11 @@ class PascalDefUseDialect(BaseDefUseDialect):
         routine = _enclosing_routine(node)
         if routine is None:
             return name
-        return _declared_spellings(routine).get(folded, name)
+        last = self._last_spellings
+        if last is None or last[0] != routine:
+            last = (routine, _declared_spellings(routine))
+            self._last_spellings = last
+        return last[1].get(folded, name)
 
     def _name(self, node: Node | None) -> str | None:
         name = super()._name(node)

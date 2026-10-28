@@ -5,9 +5,13 @@ from __future__ import annotations
 import textwrap
 
 import pytest
+import tree_sitter
 
 from repowise.core.analysis.health.complexity.languages import get_language_map
 from repowise.core.analysis.health.dataflow import analyze_file, find_extractions
+from repowise.core.analysis.health.dataflow.dialects import pascal as dialect
+from repowise.core.analysis.health.dataflow.slice_writes import _writes_var
+from repowise.core.ingestion.parser import _get_language
 
 pytest.importorskip("tree_sitter_pascal", reason="run `uv sync --all-packages`")
 
@@ -185,3 +189,71 @@ def test_a_span_holding_exit_is_never_extracted() -> None:
     assert plans, "the loops before the exit still extract"
     assert not any(p.start_line <= exit_line <= p.end_line for p in plans)
 
+
+
+# A span storing into fields of a parameter, never into the parameter.
+_FIELD_STORE = """unit Demo;
+interface
+implementation
+procedure Fill(Stats: TStats; const Records: TArray<Integer>; Threshold: Integer);
+var
+  V, Total: Integer;
+begin
+  Stats.Count := 0;
+  Total := 0;
+  for V in Records do
+  begin
+    if V > Threshold then
+    begin
+      Total := Total + V;
+      Stats.Count := Stats.Count + 1;
+    end
+    else
+      Total := Total - V;
+  end;
+  if Total > Threshold then
+    Stats.Flag := True
+  else
+    Stats.Flag := False;
+  Log(Total);
+end;
+end.
+"""
+
+
+def test_a_field_target_writes_no_local() -> None:
+    tree = tree_sitter.Parser(_get_language("pascal")).parse(_FIELD_STORE.encode())
+    stores = []
+    stack = [tree.root_node]
+    while stack:
+        node = stack.pop()
+        if node.type == "assignment" and node.text.startswith(b"Stats.Flag"):
+            stores.append(node)
+        stack.extend(node.children)
+    assert stores
+    assert not any(_writes_var(store, "Stats") for store in stores)
+
+
+def test_a_span_storing_into_fields_takes_their_base_as_a_parameter() -> None:
+    flag = _FIELD_STORE.splitlines().index("    Stats.Flag := True") + 1
+    plans = [
+        p
+        for p in find_extractions(_first(_FIELD_STORE), get_language_map("pascal"))
+        if p.start_line <= flag <= p.end_line
+    ]
+    assert plans, "expected a plan over the field stores"
+    assert all("Stats" in p.params and "Stats" not in p.returns for p in plans)
+
+
+def test_declared_spellings_are_read_once_per_routine(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[int] = []
+    real = dialect._declared_spellings
+
+    def counting(routine):
+        calls.append(routine.start_byte)
+        return real(routine)
+
+    monkeypatch.setattr(dialect, "_declared_spellings", counting)
+    monkeypatch.setattr(dialect.DIALECT, "_last_spellings", None)
+    _first(_PROCESS)
+    assert len(calls) == 1
