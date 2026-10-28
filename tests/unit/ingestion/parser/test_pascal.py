@@ -255,6 +255,36 @@ end.
         assert matches[0].kind == "method"
         assert matches[0].visibility == "public"
 
+    def test_an_orphaned_member_with_two_matching_bodies_stays(self, parser: ASTParser) -> None:
+        # Two classes implement ``Run`` with the orphan's signature, so its
+        # class cannot be told: the parentless declaration is kept beside both
+        # bodies instead of being paired with either.
+        src = b"""\
+unit Foo;
+interface
+type
+  TFoo = class
+    FTotals: array[TSide] of record
+      Valid: Boolean;
+    end;
+    procedure Run;
+  end;
+  TBar = class
+    procedure Run;
+  end;
+implementation
+procedure TFoo.Run;
+begin
+end;
+procedure TBar.Run;
+begin
+end;
+end.
+"""
+        result = parser.parse_file(_pas(), src)
+        runs = sorted((s.parent_name or "", s.kind) for s in result.symbols if s.name == "Run")
+        assert runs == [("", "function"), ("TBar", "method"), ("TFoo", "method")]
+
 
 class TestPascalImports:
     def test_multi_unit_uses_clause_extracts_every_unit(self, parser: ASTParser) -> None:

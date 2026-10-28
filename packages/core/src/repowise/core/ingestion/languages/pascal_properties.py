@@ -24,26 +24,29 @@ def pascal_property_accessors(
 ) -> Iterator[tuple[str, str, int]]:
     """``(property id, accessor id, line)`` for every accessor a Pascal property names."""
     for path, parsed in parsed_files.items():
-        if parsed.file_info.language != "pascal":
-            continue
-        properties = [s for s in parsed.symbols if s.kind == "variable" and s.parent_name]
-        if not properties:
-            continue
-        raw = source_map.get(path)
-        if raw is None:
-            try:
-                raw = Path(parsed.file_info.abs_path).read_bytes()
-            except OSError:
-                continue
-        lines = raw.decode("utf-8", errors="replace").splitlines()
-        methods = {
-            (s.parent_name.lower(), s.name.lower()): s.id
-            for s in parsed.symbols
-            if s.kind in ("method", "function") and s.parent_name
-        }
-        for prop in properties:
-            text = " ".join(lines[prop.start_line - 1 : prop.end_line])
-            for match in _ACCESSOR.finditer(text):
-                accessor = methods.get((prop.parent_name.lower(), match.group(1).lower()))
-                if accessor is not None and accessor != prop.id:
-                    yield prop.id, accessor, prop.start_line
+        if parsed.file_info.language == "pascal":
+            yield from _file_accessors(parsed, source_map.get(path))
+
+
+def _file_accessors(parsed: ParsedFile, raw: bytes | None) -> Iterator[tuple[str, str, int]]:
+    """One file's accessor links; *raw* is its source when already read."""
+    properties = [s for s in parsed.symbols if s.kind == "variable" and s.parent_name]
+    if not properties:
+        return
+    if raw is None:
+        try:
+            raw = Path(parsed.file_info.abs_path).read_bytes()
+        except OSError:
+            return
+    lines = raw.decode("utf-8", errors="replace").splitlines()
+    methods = {
+        (s.parent_name.lower(), s.name.lower()): s.id
+        for s in parsed.symbols
+        if s.kind in ("method", "function") and s.parent_name
+    }
+    for prop in properties:
+        owner = (prop.parent_name or "").lower()
+        text = " ".join(lines[prop.start_line - 1 : prop.end_line])
+        accessors = {methods.get((owner, m.group(1).lower())) for m in _ACCESSOR.finditer(text)}
+        for accessor in sorted(a for a in accessors if a is not None and a != prop.id):
+            yield prop.id, accessor, prop.start_line

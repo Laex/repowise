@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from .context import ResolverContext
 
 PROJECT_EXTENSIONS = (".dpr", ".dpk", ".lpr")
+_INDEX_KEY = "_pascal_index"
 _UNIT_EXTENSIONS = (".pas", ".pp")
 
 _COMMENT_RE = re.compile(r"\{[^}]*\}|\(\*.*?\*\)|//[^\r\n]*", re.DOTALL)
@@ -51,15 +52,16 @@ class PascalProject:
     members: frozenset[str]
 
     def lookup(self, candidates: dict[str, list[str]], names: list[str]) -> str | None:
+        """The file *names* (the unit name, then its scoped spellings) means here."""
+        named = next((self.unit_map[name] for name in names if name in self.unit_map), None)
+        if named is not None:
+            return named
+        # The first candidate per directory, in name order, answers for it.
+        by_dir: dict[str, str] = {}
         for name in names:
-            if name in self.unit_map:
-                return self.unit_map[name]
-        for directory in self.search_dirs:
-            for name in names:
-                for path in candidates.get(name, ()):
-                    if posixpath.dirname(path).lower() == directory:
-                        return path
-        return None
+            for path in candidates.get(name, ()):
+                by_dir.setdefault(posixpath.dirname(path).lower(), path)
+        return next((by_dir[d] for d in self.search_dirs if d in by_dir), None)
 
 
 @dataclass(frozen=True)
@@ -141,7 +143,7 @@ def _build_project(project: str, ctx: ResolverContext, by_lower: dict[str, str])
 
 
 def get_pascal_index(ctx: ResolverContext) -> PascalProjectIndex:
-    index = getattr(ctx, "_pascal_index", None)
+    index = getattr(ctx, _INDEX_KEY, None)
     if index is None:
         by_lower = {path.lower(): path for path in ctx.sorted_paths}
         projects = tuple(
@@ -152,7 +154,7 @@ def get_pascal_index(ctx: ResolverContext) -> PascalProjectIndex:
         namespaces = tuple(dict.fromkeys(ns for p in projects for ns in p.namespaces))
         claimed = frozenset(path for p in projects for path in p.members)
         index = PascalProjectIndex(projects=projects, namespaces=namespaces, claimed=claimed)
-        ctx._pascal_index = index  # type: ignore[attr-defined]
+        setattr(ctx, _INDEX_KEY, index)
     return index
 
 
@@ -171,6 +173,45 @@ def _unit_candidates(
     return out
 
 
+def _resolved_by_projects(
+    name: str, importer_path: str, ctx: ResolverContext, index: PascalProjectIndex
+) -> tuple[str, ...]:
+    """The file each project compiling *importer_path* means, then the
+    same-named variants no project compiles: a build outside the project
+    files (a script passing ``-U``) chooses those, so they stay reachable."""
+    resolved: set[str] = set()
+    for project in index.projects:
+        if importer_path not in project.members:
+            continue
+        names = [name, *(f"{ns}.{name}" for ns in project.namespaces)]
+        hit = project.lookup(_unit_candidates(names, importer_path, ctx), names)
+        if hit:
+            resolved.add(hit)
+    if not resolved:
+        return ()
+    orphans = sorted(
+        path
+        for paths in _unit_candidates([name], importer_path, ctx).values()
+        for path in paths
+        if path not in resolved and not index.claims(path)
+    )
+    return (*sorted(resolved), *orphans)
+
+
+def _resolved_outside_projects(
+    name: str, importer_path: str, ctx: ResolverContext, index: PascalProjectIndex
+) -> tuple[str, ...]:
+    """The same-directory unit, else every candidate: picking one would make
+    the others look unreachable."""
+    names = [name, *(f"{ns}.{name}" for ns in index.namespaces)]
+    candidates = sorted(
+        {path for paths in _unit_candidates(names, importer_path, ctx).values() for path in paths}
+    )
+    importer_dir = posixpath.dirname(importer_path).lower()
+    local = [path for path in candidates if posixpath.dirname(path).lower() == importer_dir]
+    return (local[0],) if local else tuple(candidates)
+
+
 def resolve_pascal_import_all(
     module_path: str, importer_path: str, ctx: ResolverContext
 ) -> tuple[str, ...]:
@@ -183,37 +224,9 @@ def resolve_pascal_import_all(
         # The project file's own ``Name in 'path'`` is the compiler's answer.
         if project.path == importer_path and name in project.unit_map:
             return (project.unit_map[name],)
-    projects = [p for p in index.projects if importer_path in p.members]
-
-    resolved: set[str] = set()
-    for project in projects:
-        names = [name, *(f"{ns}.{name}" for ns in project.namespaces)]
-        hit = project.lookup(_unit_candidates(names, importer_path, ctx), names)
-        if hit:
-            resolved.add(hit)
-    if resolved:
-        # A same-named variant no project compiles is chosen by a build
-        # outside the project files (a script passing -U), so it stays
-        # reachable; the projects' choices come first.
-        orphans = sorted(
-            path
-            for paths in _unit_candidates([name], importer_path, ctx).values()
-            for path in paths
-            if path not in resolved and not index.claims(path)
-        )
-        return (*sorted(resolved), *orphans)
-
-    names = [name, *(f"{ns}.{name}" for ns in index.namespaces)]
-    candidates = [
-        path for paths in _unit_candidates(names, importer_path, ctx).values() for path in paths
-    ]
-    if not candidates:
-        return ()
-    importer_dir = posixpath.dirname(importer_path).lower()
-    local = [path for path in candidates if posixpath.dirname(path).lower() == importer_dir]
-    if local:
-        return (local[0],)
-    return tuple(sorted(set(candidates)))
+    return _resolved_by_projects(name, importer_path, ctx, index) or _resolved_outside_projects(
+        name, importer_path, ctx, index
+    )
 
 
 def resolve_pascal_import(module_path: str, importer_path: str, ctx: ResolverContext) -> str | None:

@@ -662,6 +662,25 @@ class _CFGBuilder:
         self._edge(body_out, join)
         return join
 
+    def _try_finally(self, try_node: Node) -> tuple[Node | None, Node | None]:
+        """A ``try``'s ``finally`` clause and the container of its statements.
+
+        Pascal has no clause node: its ``finally`` field holds the keyword,
+        then the statements, which are both.
+        """
+        clause = next((c for c in try_node.children if c.type == "finally_clause"), None)
+        if clause is None and self.lmap.single_statement_bodies:
+            statements = self._field_statements(try_node, "finally")
+            return statements, statements
+        return clause, self._block_of(clause)
+
+    def _try_body(self, try_node: Node) -> Node | None:
+        """The protected region: the ``body`` field, Pascal's ``try`` field."""
+        body = try_node.child_by_field_name("body")
+        if body is None and self.lmap.single_statement_bodies:
+            return self._field_statements(try_node, "try")
+        return body
+
     def _build_try(self, try_node: Node, cur: BasicBlock) -> BasicBlock:
         # try-with-resources (Java) binds locals in its resource clause; record
         # a head so the def/use dialect sees those bindings. A plain ``try``
@@ -672,11 +691,7 @@ class _CFGBuilder:
 
         # ``finally`` is the convergence point everything funnels through; with
         # no ``finally`` the join itself is that point.
-        finally_clause = next((c for c in try_node.children if c.type == "finally_clause"), None)
-        finally_body = self._block_of(finally_clause)
-        if finally_clause is None and self.lmap.single_statement_bodies:
-            # Pascal: the ``finally`` field holds the keyword, then the statements.
-            finally_clause = finally_body = self._field_statements(try_node, "finally")
+        finally_clause, finally_body = self._try_finally(try_node)
         normal_join: BasicBlock = join
         if finally_clause is not None:
             fin_entry = self._new()
@@ -696,9 +711,7 @@ class _CFGBuilder:
         first = len(self.blocks)
         body_entry = self._new()
         self._edge(cur, body_entry)
-        body = try_node.child_by_field_name("body")
-        if body is None and self.lmap.single_statement_bodies:
-            body = self._field_statements(try_node, "try")
+        body = self._try_body(try_node)
         self._guards.append(tuple(heads))
         body_out = self._process_seq(self._body_stmts(body), body_entry)
         self._guards.pop()
