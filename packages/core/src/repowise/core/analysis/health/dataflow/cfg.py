@@ -340,10 +340,26 @@ class _CFGBuilder:
         # (``if (x) throw e;``): its children are not statements.
         if block.type in self._jump_kinds:
             return [block]
-        kids = [c for c in block.named_children if "comment" not in c.type]
+        if self.lmap.single_statement_bodies and block.type not in self.lmap.block_kinds:
+            return [block]
+        kids = self._statements_in(block)
         while len(kids) == 1 and kids[0].type in self.lmap.block_kinds:
-            kids = [c for c in kids[0].named_children if "comment" not in c.type]
+            kids = self._statements_in(kids[0])
         return kids
+
+    def _field_statements(self, node: Node, field: str) -> Node | None:
+        """The first named, non-keyword node of *node*'s *field*."""
+        tokens = self.lmap.structure_token_kinds
+        return next(
+            (c for c in node.children_by_field_name(field) if c.is_named and c.type not in tokens),
+            None,
+        )
+
+    def _statements_in(self, container: Node) -> list[Node]:
+        tokens = self.lmap.structure_token_kinds
+        return [
+            c for c in container.named_children if "comment" not in c.type and c.type not in tokens
+        ]
 
     # -- the recursive walk ---------------------------------------------------
 
@@ -489,6 +505,8 @@ class _CFGBuilder:
         then_entry = self._new()
         self._edge(cur, then_entry)
         then_block = if_node.child_by_field_name("consequence") or if_node.child_by_field_name("body")
+        if then_block is None and self.lmap.single_statement_bodies:
+            then_block = if_node.child_by_field_name("then")
         then_out = self._process_seq(self._body_stmts(then_block), then_entry)
         if then_out is not None:
             self._edge(then_out, join)
@@ -558,6 +576,16 @@ class _CFGBuilder:
         alt = if_node.child_by_field_name("alternative")
         if alt is None:  # Python's else arm is an ``else_clause`` child, no field
             alt = next((c for c in if_node.children if c.type == "else_clause"), None)
+        if alt is None and self.lmap.single_statement_bodies:
+            # Pascal's ``else`` field holds the keyword token, then the arm.
+            alt = next(
+                (
+                    c
+                    for c in if_node.children_by_field_name("else")
+                    if c.is_named and c.type not in self.lmap.structure_token_kinds
+                ),
+                None,
+            )
         if alt is None:
             self._edge(cur, join)
             return
@@ -645,10 +673,14 @@ class _CFGBuilder:
         # ``finally`` is the convergence point everything funnels through; with
         # no ``finally`` the join itself is that point.
         finally_clause = next((c for c in try_node.children if c.type == "finally_clause"), None)
+        finally_body = self._block_of(finally_clause)
+        if finally_clause is None and self.lmap.single_statement_bodies:
+            # Pascal: the ``finally`` field holds the keyword, then the statements.
+            finally_clause = finally_body = self._field_statements(try_node, "finally")
         normal_join: BasicBlock = join
         if finally_clause is not None:
             fin_entry = self._new()
-            fin_out = self._process_seq(self._body_stmts(self._block_of(finally_clause)), fin_entry)
+            fin_out = self._process_seq(self._body_stmts(finally_body), fin_entry)
             if fin_out is not None:
                 self._edge(fin_out, join)
             normal_join = fin_entry
@@ -665,6 +697,8 @@ class _CFGBuilder:
         body_entry = self._new()
         self._edge(cur, body_entry)
         body = try_node.child_by_field_name("body")
+        if body is None and self.lmap.single_statement_bodies:
+            body = self._field_statements(try_node, "try")
         self._guards.append(tuple(heads))
         body_out = self._process_seq(self._body_stmts(body), body_entry)
         self._guards.pop()

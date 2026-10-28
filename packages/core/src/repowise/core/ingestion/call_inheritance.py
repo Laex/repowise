@@ -19,8 +19,12 @@ _MAX_ANCESTOR_EXPAND_DEPTH = 3
 
 
 def _is_super_call(call: CallSite, language: str) -> bool:
-    """Python's ``super().m()`` (a chained call), or Java's and Apex's ``super.m()``."""
-    if language in ("java", "apex"):
+    """Python's ``super().m()`` (a chained call), or Java's and Apex's ``super.m()``.
+
+    Pascal's ``inherited m`` arrives with ``super`` as its receiver
+    (languages/pascal_names.py).
+    """
+    if language in ("java", "apex", "pascal"):
         return call.receiver_name == "super"
     receiver = call.receiver_call
     return (

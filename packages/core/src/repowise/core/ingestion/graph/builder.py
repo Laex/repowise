@@ -22,6 +22,7 @@ from ..cohesion import (
     withdraw_declaration_hint,
 )
 from ..languages.apex_namespace import spell_apex_names
+from ..languages.pascal_names import spell_pascal_names
 from ..languages.python_modules import dotted_module_for
 from ..models import Import, ParsedFile, Symbol, combine_load_kinds
 from ..resolvers import ResolverContext, resolve_import
@@ -404,8 +405,10 @@ class GraphBuilder(MetricsMixin, ResolveMixin, EdgesMixin, SerializeMixin, Rehyd
         """
         self._invalidate_metric_caches()
         self._qualify_python_symbols()
-        # Apex names are case-insensitive; every resolver keys on the declared spelling.
+        # Apex and Pascal names are case-insensitive; every resolver keys on
+        # the declared spelling.
         spell_apex_names(self._parsed_files.values())
+        spell_pascal_names(self._parsed_files.values())
 
         # Clear import/call edges but keep structural edges (defines, has_method)
         edges_to_remove = [
@@ -522,6 +525,11 @@ class GraphBuilder(MetricsMixin, ResolveMixin, EdgesMixin, SerializeMixin, Rehyd
                     from ..resolvers.typescript import resolve_ts_js_import_all
 
                     targets = resolve_ts_js_import_all(imp.module_path, path, ctx)
+                elif _lang == "pascal":
+                    # Same-named platform units: one edge per project variant.
+                    from ..resolvers.pascal import resolve_pascal_import_all
+
+                    targets = resolve_pascal_import_all(imp.module_path, path, ctx)
                 else:
                     single = resolve_import(imp.module_path, path, _lang, ctx)
                     targets = (single,) if single else ()
@@ -611,6 +619,9 @@ class GraphBuilder(MetricsMixin, ResolveMixin, EdgesMixin, SerializeMixin, Rehyd
 
         # --- Phase 3: Resolve symbol-level calls ---
         self._resolve_calls(import_targets, progress=progress)
+
+        # --- Pascal property -> the read/write methods it runs ---
+        self._resolve_pascal_property_accessors()
 
         # --- Salesforce objects and fields named by Apex and lookup fields ---
         self._resolve_salesforce_schema()
@@ -742,6 +753,27 @@ class GraphBuilder(MetricsMixin, ResolveMixin, EdgesMixin, SerializeMixin, Rehyd
 
         added = add_schema_edges(self._graph, self._parsed_files, self._repo_path)
         log.info("Salesforce schema edges resolved", total=added)
+
+    def _resolve_pascal_property_accessors(self) -> None:
+        """A property runs the methods its ``read``/``write`` clauses name."""
+        from ..languages.pascal_properties import pascal_property_accessors
+
+        for prop_id, accessor_id, line in pascal_property_accessors(
+            self._parsed_files, self._source_map
+        ):
+            if (
+                prop_id in self._graph
+                and accessor_id in self._graph
+                and not self._graph.has_edge(prop_id, accessor_id)
+            ):
+                self._graph.add_edge(
+                    prop_id,
+                    accessor_id,
+                    edge_type="calls",
+                    call_lines=[line],
+                    confidence=1.0,
+                    resolution_origin="pascal_property_accessor",
+                )
 
     def graph(self) -> nx.DiGraph:
         """Return the graph (building it first if necessary)."""

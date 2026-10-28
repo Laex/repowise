@@ -91,7 +91,7 @@ def _unconditional_write(st: Node, var: str, lmap: LanguageNodeMap) -> bool:
 
 def _writes_var(node: Node, var: str) -> bool:
     """True when *var* is on the binding side of this write node."""
-    for field in ("left", "pattern", "declarator", "name"):
+    for field in ("left", "pattern", "declarator", "name", "lhs"):
         target = node.child_by_field_name(field)
         if target is not None:
             return var in _identifiers(target)
